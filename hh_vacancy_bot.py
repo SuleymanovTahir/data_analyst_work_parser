@@ -8,12 +8,12 @@ HH.ru Smart Vacancy Bot v2
 Команды:
   /menu      — главное меню
   /start     — приветствие и помощь
-  /new       — создать новый поиск (wizard)
-  /templates — список сохранённых поисков, выбор/редактирование/удаление
-  /current   — показать текущий поиск
+  /new       — создать новый сценарий (wizard)
+  /templates — список сохранённых сценариев, выбор/редактирование/удаление
+  /current   — показать активный сценарий
   /run       — запустить поиск прямо сейчас (не ждать таймер)
   /preview   — предпросмотр без сохранения истории
-  /reset_sent — сброс истории отправок текущего поиска
+  /reset_sent — сброс истории отправок активного сценария
   /toggle    — включить/выключить автопоиск
   /status    — текущий статус и статистика
 
@@ -403,7 +403,7 @@ def _normalize_template(template):
     tmpl["sort"] = tmpl.get("sort", "publication_time")
     tmpl["interval"] = int(tmpl.get("interval", 30) or 30)
     tmpl["max_pages"] = int(tmpl.get("max_pages", 5) or 5)
-    tmpl["name"] = (tmpl.get("name") or "Новый поиск")[:50]
+    tmpl["name"] = (tmpl.get("name") or "Новый сценарий")[:50]
     tmpl["id"] = str(tmpl.get("id") or str(uuid.uuid4())[:8])
 
     if tmpl["id"] == "default01":
@@ -709,7 +709,7 @@ def _build_template_from_payload(payload):
 
     template = {
         "id": str(payload.get("id") or str(uuid.uuid4())[:8]),
-        "name": str(payload.get("name") or "Новый поиск").strip()[:50] or "Новый поиск",
+        "name": str(payload.get("name") or "Новый сценарий").strip()[:50] or "Новый сценарий",
         "queries": queries,
         "search_fields": search_fields,
         "experience": experience,
@@ -1504,7 +1504,7 @@ def _format_template_summary(template, detailed=False):
         exclude_kw_preview += f" ... (+{len(exclude_kw) - 6})"
 
     lines = [
-        f"<b>{_esc(template.get('name', 'Новый поиск'))}</b>",
+        f"<b>{_esc(template.get('name', 'Новый сценарий'))}</b>",
         f"Запросов: <b>{len(template.get('queries', []))}</b>",
         f"Поля поиска: {_esc(', '.join(search_fields) or '—')}",
         f"Опыт: {_esc(', '.join(exp_names) or '—')}",
@@ -1531,6 +1531,44 @@ def _format_template_summary(template, detailed=False):
             f"Исключённые работодатели: {_esc(', '.join(excluded_employers) or 'нет')}",
             f"Примеры запросов: <i>{_esc(', '.join(template.get('queries', [])[:6]))}</i>",
         ])
+
+    return "\n".join(lines)
+
+
+def _compact_preview(values, limit=2, empty_text="—"):
+    items = [str(value).strip() for value in (values or []) if str(value).strip()]
+    if not items:
+        return empty_text
+    shown = items[:limit]
+    text = ", ".join(shown)
+    if len(items) > limit:
+        text += f" +{len(items) - limit}"
+    return text
+
+
+def _format_launch_message(template, preview=False):
+    template = _normalize_template(template)
+    work_formats = [get_work_format_options().get(code, code) for code in template.get("work_formats", [])]
+    included_areas = template.get("included_area_names", [])
+    excluded_areas = template.get("excluded_area_names", [])
+
+    title = "Предпросмотр вакансий" if preview else "Проверяю вакансии"
+    query_text = _compact_preview(template.get("queries", []), limit=2, empty_text="без уточнения")
+    format_text = _compact_preview(work_formats, limit=2, empty_text="любой формат работы")
+
+    lines = [
+        f"<b>{title}</b>",
+        f"Запрос: <b>{_esc(query_text)}</b>",
+        f"Формат: <b>{_esc(format_text)}</b>",
+    ]
+
+    if included_areas:
+        lines.append(f"География: <b>{_esc(_compact_preview(included_areas, limit=2))}</b>")
+    else:
+        lines.append("География: <b>все регионы</b>")
+
+    if excluded_areas:
+        lines.append(f"Исключения: <b>{_esc(_compact_preview(excluded_areas, limit=2))}</b>")
 
     return "\n".join(lines)
 
@@ -1564,7 +1602,7 @@ def wizard_start(chat_id, data, template_id=None):
 def _new_draft():
     return _normalize_template({
         "id":               str(uuid.uuid4())[:8],
-        "name":             "Новый поиск",
+        "name":             "Новый сценарий",
         "queries":          DEFAULT_QUERIES[:],
         "search_fields":    ["name", "company_name", "description"],
         "experience":       [ANY_EXPERIENCE],
@@ -1976,23 +2014,23 @@ def _send_confirm(chat_id, draft):
 
 def _menu_reply_markup():
     return {"inline_keyboard": [
-        [{"text": "Новый поиск", "callback_data": "tmpl_new"},
-         {"text": "Мои поиски", "callback_data": "menu_templates"}],
-        [{"text": "Текущий поиск", "callback_data": "menu_current"},
-         {"text": "Поиск сейчас", "callback_data": "run_now"}],
-        [{"text": "Статус", "callback_data": "menu_status"},
-         {"text": "Справка", "callback_data": "menu_help"}],
+        [{"text": "Создать сценарий", "callback_data": "tmpl_new"},
+         {"text": "Сценарии", "callback_data": "menu_templates"}],
+        [{"text": "Активный сценарий", "callback_data": "menu_current"},
+         {"text": "Проверить вакансии", "callback_data": "run_now"}],
+        [{"text": "Автопоиск", "callback_data": "menu_status"},
+         {"text": "Помощь", "callback_data": "menu_help"}],
     ]}
 
 
 def _current_search_keyboard(data):
     return {"inline_keyboard": [
-        [{"text": "Поиск сейчас", "callback_data": "run_now"},
+        [{"text": "Проверить вакансии", "callback_data": "run_now"},
          {"text": "Предпросмотр", "callback_data": "preview_now"}],
-        [{"text": "Изменить", "callback_data": f"tmpl_edit_{data.get('active_template_id') or ''}"},
-         {"text": "Пауза / запуск", "callback_data": "toggle"}],
-        [{"text": "Сбросить историю", "callback_data": "reset_sent"}],
-        [{"text": "Мои поиски", "callback_data": "menu_templates"},
+        [{"text": "Редактировать", "callback_data": f"tmpl_edit_{data.get('active_template_id') or ''}"},
+         {"text": "Автопоиск", "callback_data": "toggle"}],
+        [{"text": "Очистить отправленные", "callback_data": "reset_sent"}],
+        [{"text": "Сценарии", "callback_data": "menu_templates"},
          {"text": "Главное меню", "callback_data": "menu_home"}],
     ]}
 
@@ -2003,10 +2041,11 @@ def cmd_menu(chat_id, data):
     send_msg(
         chat_id,
         "<b>Главное меню</b>\n"
-        "1. Создать новый поиск\n"
-        "2. Открыть список сохранённых поисков\n"
-        "3. Посмотреть текущий поиск\n"
-        "4. Запустить поиск прямо сейчас",
+        "Выберите действие:\n"
+        "• создать новый сценарий\n"
+        "• открыть сохранённые сценарии\n"
+        "• посмотреть активный сценарий\n"
+        "• проверить вакансии прямо сейчас",
         reply_markup=_menu_reply_markup(),
     )
 
@@ -2019,12 +2058,12 @@ def cmd_start(chat_id, data):
         "Отслеживаю вакансии на hh.ru и присылаю новые по вашим критериям.\n\n"
         "<b>Команды:</b>\n"
         "/menu      — главное меню\n"
-        "/new       — создать новый поиск\n"
-        "/templates — сохранённые поиски\n"
-        "/current   — показать текущий поиск\n"
-        "/run       — запустить поиск прямо сейчас\n"
+        "/new       — создать новый сценарий\n"
+        "/templates — открыть сохранённые сценарии\n"
+        "/current   — показать активный сценарий\n"
+        "/run       — проверить вакансии прямо сейчас\n"
         "/preview   — предпросмотр без сохранения в историю\n"
-        "/reset_sent — очистить историю отправок текущего поиска\n"
+        "/reset_sent — очистить историю отправок активного сценария\n"
         "/toggle    — включить/выключить автопоиск\n"
         "/status    — статус и статистика\n"
         "/help      — подробная справка"
@@ -2035,13 +2074,13 @@ def cmd_start(chat_id, data):
 def cmd_help(chat_id):
     send_msg(chat_id,
         "<b>Как пользоваться</b>\n\n"
-        "1. <b>/new</b> — создайте поиск через мастер\n"
-        "2. <b>/templates</b> — выберите или отредактируйте сохранённый поиск\n"
-        "3. <b>/run</b> — немедленно пришлю новые вакансии\n"
+        "1. <b>/new</b> — создайте сценарий через мастер\n"
+        "2. <b>/templates</b> — выберите или отредактируйте сохранённый сценарий\n"
+        "3. <b>/run</b> — немедленно проверю новые вакансии\n"
         "4. <b>/preview</b> — покажу результат без записи в историю\n"
         "5. <b>/toggle</b> — пауза или запуск автопоиска\n"
-        "6. <b>/current</b> — полная сводка текущего поиска\n"
-        "7. <b>/reset_sent</b> — очистка истории отправок текущего поиска\n\n"
+        "6. <b>/current</b> — полная сводка активного сценария\n"
+        "7. <b>/reset_sent</b> — очистка истории отправок активного сценария\n\n"
         "<b>Доступные фильтры:</b>\n"
         "• География: страны и города на включение и исключение\n"
         "• Опыт: любые HH-варианты, можно несколько\n"
@@ -2060,7 +2099,7 @@ def cmd_current(chat_id, data):
     save_data(data)
     tmpl = _active_template(data)
     if not tmpl:
-        send_msg(chat_id, "Нет текущего поиска. Создайте его через /new", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
+        send_msg(chat_id, "Активный сценарий ещё не выбран. Создайте его через /new.", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
         return
     send_msg(chat_id, _format_template_summary(tmpl, detailed=True), reply_markup=_current_search_keyboard(data))
 
@@ -2070,18 +2109,18 @@ def cmd_reset_sent(chat_id, data):
     tmpl = _active_template(data)
     if not tmpl:
         save_data(data)
-        send_msg(chat_id, "Нет текущего поиска. Нечего очищать.")
+        send_msg(chat_id, "Нет активного сценария. Очищать пока нечего.")
         return
 
     _set_template_sent_ids(data, tmpl["id"], [])
     save_data(data)
-    send_msg(chat_id, f"История отправок для поиска <b>{_esc(tmpl['name'])}</b> очищена.", reply_markup=_current_search_keyboard(data))
+    send_msg(chat_id, f"История отправок для сценария <b>{_esc(tmpl['name'])}</b> очищена.", reply_markup=_current_search_keyboard(data))
 
 def cmd_toggle(chat_id, data):
     data["chat_id"] = chat_id
     if not _active_template(data):
         save_data(data)
-        send_msg(chat_id, "Нет текущего поиска. Сначала создайте или выберите его.", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
+        send_msg(chat_id, "Нет активного сценария. Сначала создайте или выберите его.", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
         return
 
     data["searching"] = not data.get("searching", False)
@@ -2105,9 +2144,9 @@ def cmd_status(chat_id, data):
 
     text = (
         f"{icon} <b>Статус: {st_text}</b>\n\n"
-        f"Поиск: <b>{_esc(tmpl['name']) if tmpl else 'не выбран'}</b>\n"
+        f"Активный сценарий: <b>{_esc(tmpl['name']) if tmpl else 'не выбран'}</b>\n"
         f"Последняя проверка: {last_str}\n"
-        f"Отправлено по текущему поиску: {current_sent}\n"
+        f"Отправлено по активному сценарию: {current_sent}\n"
         f"Отправлено всего: {total_sent}\n"
     )
 
@@ -2120,9 +2159,9 @@ def cmd_status(chat_id, data):
     kb = {"inline_keyboard": [
         [{"text": "Пауза" if data.get("searching") else "Включить",
           "callback_data": "toggle"},
-         {"text": "Поиск сейчас", "callback_data": "run_now"}],
-        [{"text": "Текущий поиск", "callback_data": "menu_current"},
-         {"text": "Мои поиски", "callback_data": "menu_templates"}],
+         {"text": "Проверить вакансии", "callback_data": "run_now"}],
+        [{"text": "Активный сценарий", "callback_data": "menu_current"},
+         {"text": "Сценарии", "callback_data": "menu_templates"}],
         [{"text": "Главное меню", "callback_data": "menu_home"}],
     ]}
     send_msg(chat_id, text, reply_markup=kb)
@@ -2132,7 +2171,7 @@ def cmd_templates(chat_id, data, page=0):
     save_data(data)
     tmpls = data.get("templates", [])
     if not tmpls:
-        send_msg(chat_id, "Сохранённых поисков пока нет. Создайте первый: /new", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
+        send_msg(chat_id, "Сохранённых сценариев пока нет. Создайте первый через /new.", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
         return
 
     per_page = 4
@@ -2141,10 +2180,10 @@ def cmd_templates(chat_id, data, page=0):
     start = page * per_page
     current_items = tmpls[start:start + per_page]
 
-    text = f"<b>Сохранённые поиски</b>\nСтраница <b>{page + 1}/{total_pages}</b>\n\n"
+    text = f"<b>Сценарии поиска</b>\nСтраница <b>{page + 1}/{total_pages}</b>\n\n"
     buttons = []
     for index, t in enumerate(current_items, start=start + 1):
-        mark = "Текущий" if t["id"] == data.get("active_template_id") else "Сохранён"
+        mark = "Активный" if t["id"] == data.get("active_template_id") else "Сохранён"
         text += (
             f"<b>{index}. {_esc(t['name'])}</b>\n"
             f"Статус: {mark}\n"
@@ -2163,7 +2202,7 @@ def cmd_templates(chat_id, data, page=0):
         nav_row.append({"text": "Далее", "callback_data": f"tmpl_page_{page + 1}"})
     if nav_row:
         buttons.append(nav_row)
-    buttons.append([{"text": "Новый поиск", "callback_data": "tmpl_new"}])
+    buttons.append([{"text": "Создать сценарий", "callback_data": "tmpl_new"}])
     buttons.extend(_back_home_row("menu_home"))
     send_msg(chat_id, text, reply_markup={"inline_keyboard": buttons})
 
@@ -2172,9 +2211,9 @@ def cmd_run(chat_id, data):
     save_data(data)
     tmpl = _active_template(data)
     if not tmpl:
-        send_msg(chat_id, "Нет текущего поиска. Создайте его через /new", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
+        send_msg(chat_id, "Нет активного сценария. Создайте его через /new.", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
         return
-    send_msg(chat_id, f"Запускаю поиск: <b>{_esc(tmpl['name'])}</b>")
+    send_msg(chat_id, _format_launch_message(tmpl, preview=False))
     _run_search(chat_id, data, tmpl, persist=True)
 
 
@@ -2183,9 +2222,9 @@ def cmd_preview(chat_id, data):
     save_data(data)
     tmpl = _active_template(data)
     if not tmpl:
-        send_msg(chat_id, "Нет текущего поиска. Создайте его через /new", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
+        send_msg(chat_id, "Нет активного сценария. Создайте его через /new.", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
         return
-    send_msg(chat_id, f"Предпросмотр поиска: <b>{_esc(tmpl['name'])}</b>")
+    send_msg(chat_id, _format_launch_message(tmpl, preview=True))
     _run_search(chat_id, data, tmpl, persist=False)
 
 
@@ -2396,7 +2435,7 @@ def _show_wizard_step(chat_id, state):
         send_msg(
             chat_id,
             "<b>Название поиска</b>\n"
-            f"Текущее: <code>{_esc(draft.get('name', 'Новый поиск'))}</code>\n\n"
+            f"Текущее название: <code>{_esc(draft.get('name', 'Новый сценарий'))}</code>\n\n"
             "Введите новое название или <code>ok</code>, чтобы оставить текущее.",
             reply_markup={"inline_keyboard": _back_home_row("wiz_back")},
         )
@@ -2506,7 +2545,7 @@ def handle_callback(cb, data):
         tmpl = next((t for t in data["templates"] if t["id"] == tmpl_id), None)
         send_msg(
             chat_id,
-            f"Текущий поиск: <b>{_esc(tmpl['name'])}</b>\nАвтопоиск включён.",
+            f"Активный сценарий: <b>{_esc(tmpl['name'])}</b>\nАвтопоиск включён.",
             reply_markup=_current_search_keyboard(data),
         )
         return
@@ -2758,7 +2797,7 @@ def handle_callback(cb, data):
         save_data(data)
         send_msg(chat_id,
             "<b>Название поиска</b>\n"
-            f"Текущее: <code>{_esc(draft.get('name', 'Новый поиск'))}</code>\n\n"
+            f"Текущее название: <code>{_esc(draft.get('name', 'Новый сценарий'))}</code>\n\n"
             "Введите новое название или <code>ok</code> чтобы оставить текущее.",
             reply_markup={"inline_keyboard": _back_home_row("wiz_back")}
         )
@@ -2870,7 +2909,7 @@ def process_update(upd):
     state = data["user_states"].get(str(chat_id))
     if state and not text.startswith("/"):
         if state["step"] == "name" and text.lower() in ("ok", "ок"):
-            text = state["draft"].get("name", "Новый поиск")
+            text = state["draft"].get("name", "Новый сценарий")
         try:
             wizard_handle_text(chat_id, text, data)
         except Exception as e:
@@ -3010,109 +3049,154 @@ def _web_ui_html():
   <title>HH Vacancy Bot</title>
   <style>
     :root {
-      --bg: #f5f1e8;
-      --panel: #fffdf8;
-      --panel-2: #f3ede0;
-      --line: #d8ceb9;
-      --text: #27211b;
-      --muted: #6b6257;
-      --accent: #275dad;
-      --accent-2: #d97342;
-      --good: #2e7d32;
-      --warn: #b26a00;
-      --bad: #b42318;
-      --shadow: 0 18px 40px rgba(39, 33, 27, 0.08);
-      --radius: 18px;
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --panel-soft: #f8fafc;
+      --line: #e0e6ef;
+      --line-strong: #cfd8e6;
+      --text: #172033;
+      --muted: #5f6f86;
+      --accent: #356dff;
+      --accent-2: #1f4ecf;
+      --accent-soft: #eef3ff;
+      --danger-soft: #fff0ec;
+      --danger: #bc4f2f;
+      --success-soft: #eaf8ef;
+      --success: #217346;
+      --shadow: 0 18px 44px rgba(27, 43, 80, 0.08);
+      --radius: 20px;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       background:
-        radial-gradient(circle at top left, rgba(217, 115, 66, 0.12), transparent 28%),
-        radial-gradient(circle at top right, rgba(39, 93, 173, 0.10), transparent 26%),
-        linear-gradient(180deg, #f7f2ea 0%, #efe7d8 100%);
+        radial-gradient(circle at top left, rgba(53, 109, 255, 0.12), transparent 24%),
+        radial-gradient(circle at top right, rgba(56, 189, 248, 0.10), transparent 22%),
+        linear-gradient(180deg, #f8fbff 0%, #f4f7fb 100%);
       color: var(--text);
-      font: 15px/1.45 "Segoe UI", "Helvetica Neue", sans-serif;
+      font: 15px/1.5 "Segoe UI", "Helvetica Neue", sans-serif;
     }
     .page {
-      max-width: 1480px;
+      max-width: 1500px;
       margin: 0 auto;
-      padding: 24px 18px 40px;
+      padding: 24px 18px 44px;
     }
-    .hero {
-      display: grid;
-      gap: 16px;
-      grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.7fr);
-      margin-bottom: 18px;
-    }
-    .hero-card, .panel {
-      background: rgba(255, 253, 248, 0.92);
-      border: 1px solid rgba(216, 206, 185, 0.88);
+    .panel, .topbar, .stat-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
       border-radius: var(--radius);
       box-shadow: var(--shadow);
-      backdrop-filter: blur(8px);
     }
-    .hero-card {
-      padding: 22px;
+    .topbar {
+      padding: 24px 26px;
+      margin-bottom: 18px;
+      display: grid;
+      gap: 14px;
     }
-    .hero h1 {
-      margin: 0 0 8px;
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      width: fit-content;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent-2);
+      font-size: 12px;
+      font-weight: 700;
+      padding: 6px 10px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .topbar h1 {
+      margin: 0;
       font-size: 34px;
-      line-height: 1.05;
+      line-height: 1.08;
       letter-spacing: -0.03em;
     }
-    .hero p {
+    .topbar p {
       margin: 0;
+      max-width: 920px;
       color: var(--muted);
-      max-width: 760px;
     }
-    .status-board {
+    .status-strip {
       display: grid;
-      gap: 12px;
+      gap: 14px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      margin-bottom: 14px;
     }
-    .status-lines {
-      display: grid;
-      gap: 10px;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      font-size: 14px;
+    .stat-card {
+      padding: 16px 18px;
+      min-height: 108px;
     }
-    .status-item {
-      background: var(--panel-2);
-      border-radius: 14px;
-      padding: 12px 14px;
-      min-height: 72px;
-    }
-    .status-item strong {
+    .stat-card strong {
       display: block;
-      font-size: 12px;
-      text-transform: uppercase;
+      margin-bottom: 10px;
       color: var(--muted);
-      margin-bottom: 6px;
+      font-size: 12px;
+      font-weight: 700;
       letter-spacing: 0.05em;
+      text-transform: uppercase;
     }
-    .toolbar {
+    .stat-value {
+      font-size: 18px;
+      font-weight: 700;
+      line-height: 1.3;
+      word-break: break-word;
+    }
+    .quick-actions {
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
-      margin-top: 14px;
+      margin-bottom: 18px;
+    }
+    .token-box {
+      display: none;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      padding-top: 10px;
+      border-top: 1px dashed var(--line-strong);
+    }
+    .token-box.visible {
+      display: flex;
     }
     .layout {
       display: grid;
       gap: 18px;
-      grid-template-columns: 330px minmax(0, 1fr);
+      grid-template-columns: 340px minmax(0, 1fr);
       align-items: start;
     }
     .panel {
-      padding: 18px;
+      padding: 20px;
     }
+    .sidebar {
+      position: sticky;
+      top: 18px;
+    }
+    .sidebar-head,
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .section-head h2,
+    .sidebar-head h2,
     .panel h2 {
-      margin: 0 0 14px;
-      font-size: 18px;
+      margin: 0;
+      font-size: 20px;
       letter-spacing: -0.02em;
     }
+    .section-head p,
+    .sidebar-head p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
     .panel h3 {
-      margin: 0 0 10px;
-      font-size: 15px;
+      margin: 0 0 12px;
+      font-size: 13px;
       color: var(--muted);
       text-transform: uppercase;
       letter-spacing: 0.05em;
@@ -3126,10 +3210,10 @@ def _web_ui_html():
       gap: 14px;
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
-    .grid-3 {
+    .grid-4 {
       display: grid;
       gap: 14px;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(4, minmax(0, 1fr));
     }
     label.field {
       display: grid;
@@ -3146,8 +3230,8 @@ def _web_ui_html():
     textarea,
     select {
       width: 100%;
-      border: 1px solid var(--line);
-      border-radius: 12px;
+      border: 1px solid var(--line-strong);
+      border-radius: 14px;
       background: #fff;
       padding: 11px 12px;
       color: var(--text);
@@ -3169,8 +3253,8 @@ def _web_ui_html():
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      padding: 8px 12px;
-      border: 1px solid var(--line);
+      padding: 9px 13px;
+      border: 1px solid var(--line-strong);
       border-radius: 999px;
       background: #fff;
       color: var(--text);
@@ -3189,10 +3273,10 @@ def _web_ui_html():
     }
     button {
       border: 0;
-      border-radius: 12px;
-      background: #e6ddcd;
+      border-radius: 14px;
+      background: #ecf1f7;
       color: var(--text);
-      padding: 11px 14px;
+      padding: 11px 15px;
       font: inherit;
       font-weight: 700;
       cursor: pointer;
@@ -3200,10 +3284,10 @@ def _web_ui_html():
     }
     button:hover { transform: translateY(-1px); }
     button.primary { background: var(--accent); color: #fff; }
-    button.secondary { background: var(--accent-2); color: #fff; }
-    button.ghost { background: transparent; border: 1px solid var(--line); }
-    button.danger { background: #f8d8d3; color: #7a1f16; }
-    button.success { background: #d7eed7; color: #1d5e20; }
+    button.secondary { background: var(--accent-soft); color: var(--accent-2); }
+    button.ghost { background: transparent; border: 1px solid var(--line-strong); }
+    button.danger { background: var(--danger-soft); color: var(--danger); }
+    button.success { background: var(--success-soft); color: var(--success); }
     button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
     .template-list {
       display: grid;
@@ -3212,14 +3296,15 @@ def _web_ui_html():
     .template-card {
       border: 1px solid var(--line);
       border-radius: 16px;
-      background: #fff;
-      padding: 14px;
+      background: var(--panel-soft);
+      padding: 15px;
       display: grid;
       gap: 10px;
     }
     .template-card.active {
       border-color: var(--accent);
-      box-shadow: inset 0 0 0 1px rgba(39, 93, 173, 0.2);
+      background: #fff;
+      box-shadow: inset 0 0 0 1px rgba(53, 109, 255, 0.18);
     }
     .template-card h4 {
       margin: 0;
@@ -3261,7 +3346,7 @@ def _web_ui_html():
     .result-card {
       border: 1px solid var(--line);
       border-radius: 16px;
-      padding: 14px;
+      padding: 16px;
       background: #fff;
       display: grid;
       gap: 7px;
@@ -3274,6 +3359,10 @@ def _web_ui_html():
       color: var(--muted);
       font-size: 14px;
     }
+    .filters-grid {
+      display: grid;
+      gap: 18px;
+    }
     .pager {
       display: flex;
       gap: 10px;
@@ -3282,220 +3371,249 @@ def _web_ui_html():
       flex-wrap: wrap;
       margin-top: 16px;
     }
-    .token-box {
-      display: none;
-      gap: 10px;
-      align-items: center;
-      flex-wrap: wrap;
-      margin-top: 14px;
-      padding-top: 14px;
-      border-top: 1px dashed var(--line);
-    }
-    .token-box.visible {
-      display: flex;
-    }
     .summary-box {
-      background: var(--panel-2);
-      border-radius: 14px;
-      padding: 14px;
+      background: var(--panel-soft);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 15px;
       font-size: 14px;
       white-space: pre-line;
       word-break: break-word;
     }
+    .empty-sidebar {
+      color: var(--muted);
+      font-size: 14px;
+      padding: 10px 2px 0;
+    }
     @media (max-width: 1180px) {
+      .status-strip {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
       .layout { grid-template-columns: 1fr; }
-      .hero { grid-template-columns: 1fr; }
+      .sidebar { position: static; }
     }
     @media (max-width: 780px) {
-      .grid-2, .grid-3, .status-lines { grid-template-columns: 1fr; }
+      .grid-2, .grid-4, .status-strip { grid-template-columns: 1fr; }
       .page { padding: 16px 12px 28px; }
-      .hero h1 { font-size: 28px; }
+      .topbar { padding: 18px; }
+      .topbar h1 { font-size: 28px; }
+      .panel { padding: 16px; }
     }
   </style>
 </head>
 <body>
   <div class="page">
-    <section class="hero">
-      <div class="hero-card">
-        <h1>Панель управления HH Vacancy Bot</h1>
+    <section class="topbar">
+      <span class="eyebrow">HH.ru</span>
+      <div>
+        <h1>Поиск вакансий</h1>
         <p>
-          Здесь можно полностью управлять поисками вакансий без Telegram:
-          создавать, редактировать, удалять, сохранять, выбирать текущий поиск,
-          запускать поиск вручную, смотреть предпросмотр и включать или ставить на паузу автопоиск.
+          Управляйте сохранёнными сценариями поиска без Telegram: настраивайте фильтры,
+          включайте автопроверку, делайте ручную проверку и просматривайте найденные вакансии в одном месте.
         </p>
-        <div id="tokenBox" class="token-box">
-          <input id="authToken" type="text" placeholder="Токен доступа для панели">
-          <button id="saveTokenBtn" class="primary" type="button">Сохранить токен</button>
-          <span class="hint">Нужен только если на сервере задан HH_WEB_ADMIN_TOKEN.</span>
-        </div>
       </div>
-      <div class="hero-card status-board">
-        <div class="status-lines">
-          <div class="status-item"><strong>Статус</strong><div id="statusSearch">Загрузка...</div></div>
-          <div class="status-item"><strong>Текущий поиск</strong><div id="statusTemplate">Загрузка...</div></div>
-          <div class="status-item"><strong>Telegram чат</strong><div id="statusChat">Загрузка...</div></div>
-          <div class="status-item"><strong>Последняя проверка</strong><div id="statusLastCheck">Загрузка...</div></div>
-        </div>
-        <div class="toolbar">
-          <button id="refreshBtn" class="ghost" type="button">Обновить</button>
-          <button id="toggleBtn" class="secondary" type="button">Пауза</button>
-          <button id="runBtn" class="primary" type="button">Поиск сейчас</button>
-          <button id="previewBtn" class="ghost" type="button">Предпросмотр</button>
-        </div>
+      <div id="tokenBox" class="token-box">
+        <input id="authToken" type="text" placeholder="Токен доступа для панели">
+        <button id="saveTokenBtn" class="primary" type="button">Сохранить токен</button>
+        <span class="hint">Нужен только если на сервере задан HH_WEB_ADMIN_TOKEN.</span>
       </div>
     </section>
 
     <div id="messageBox" class="message"></div>
 
+    <section class="status-strip">
+      <article class="stat-card">
+        <strong>Автопоиск</strong>
+        <div id="statusSearch" class="stat-value">Загрузка...</div>
+      </article>
+      <article class="stat-card">
+        <strong>Активный сценарий</strong>
+        <div id="statusTemplate" class="stat-value">Загрузка...</div>
+      </article>
+      <article class="stat-card">
+        <strong>Telegram</strong>
+        <div id="statusChat" class="stat-value">Загрузка...</div>
+      </article>
+      <article class="stat-card">
+        <strong>Последняя проверка</strong>
+        <div id="statusLastCheck" class="stat-value">Загрузка...</div>
+      </article>
+    </section>
+
+    <section class="quick-actions">
+      <button id="refreshBtn" class="ghost" type="button">Обновить данные</button>
+      <button id="toggleBtn" class="secondary" type="button">Пауза автопоиска</button>
+      <button id="runBtn" class="primary" type="button">Проверить вакансии</button>
+      <button id="previewBtn" class="ghost" type="button">Предпросмотр выдачи</button>
+    </section>
+
     <section class="layout">
-      <aside class="panel">
-        <div class="field-row" style="justify-content: space-between; margin-bottom: 14px;">
-          <h2 style="margin:0;">Мои поиски</h2>
-          <button id="newSearchBtn" class="primary" type="button">Новый поиск</button>
+      <aside class="panel sidebar">
+        <div class="sidebar-head">
+          <div>
+            <h2>Сценарии поиска</h2>
+            <p>Выберите существующий или создайте новый.</p>
+          </div>
+          <button id="newSearchBtn" class="primary" type="button">Создать сценарий</button>
         </div>
         <div id="templateList" class="template-list"></div>
       </aside>
 
       <div class="stack">
         <section class="panel">
-          <h2>Основное</h2>
-          <div class="grid-2">
-            <label class="field">
-              Название поиска
-              <input id="name" type="text" maxlength="50" placeholder="Например: Product/Data Analyst">
-            </label>
-            <label class="field">
-              Где искать слова
-              <select id="searchFields" multiple></select>
-              <small>Можно выбрать сразу несколько полей.</small>
-            </label>
+          <div class="section-head">
+            <div>
+              <h2>Редактор сценария</h2>
+              <p>Настройте, какие вакансии искать, где искать и как показывать результаты.</p>
+            </div>
           </div>
-          <label class="field" style="margin-top: 14px;">
-            Названия вакансий и синонимы
-            <textarea id="queries" placeholder="По одному на строке или через запятую"></textarea>
-          </label>
-          <div class="field" style="margin-top: 14px;">
-            Опыт работы
-            <div id="experienceGroup" class="check-grid"></div>
+          <div class="filters-grid">
+            <div>
+              <h3>Что ищем</h3>
+              <div class="grid-2">
+                <label class="field">
+                  Название сценария
+                  <input id="name" type="text" maxlength="50" placeholder="Например: Product / Data Analyst">
+                </label>
+                <label class="field">
+                  Где искать совпадения
+                  <select id="searchFields" multiple></select>
+                  <small>Можно выбрать название, компанию и описание одновременно.</small>
+                </label>
+              </div>
+              <label class="field" style="margin-top: 14px;">
+                Запросы и синонимы
+                <textarea id="queries" placeholder="По одному на строке или через запятую"></textarea>
+              </label>
+              <div class="field" style="margin-top: 14px;">
+                Опыт работы
+                <div id="experienceGroup" class="check-grid"></div>
+              </div>
+            </div>
+
+            <div>
+              <h3>Где ищем</h3>
+              <div class="grid-2">
+                <label class="field">
+                  Включить регионы
+                  <textarea id="includedAreas" placeholder="Например: Грузия, Казахстан, Тбилиси"></textarea>
+                  <small>Если оставить пустым, поиск идёт по всем регионам.</small>
+                </label>
+                <label class="field">
+                  Исключить регионы
+                  <textarea id="excludedAreas" placeholder="Например: Россия, Москва"></textarea>
+                  <small>Если исключаете страну, её города тоже исключаются автоматически.</small>
+                </label>
+              </div>
+              <div class="summary-box" id="areaHint"></div>
+            </div>
+
+            <div>
+              <h3>Фильтры</h3>
+              <div class="grid-2">
+                <label class="field">
+                  Обязательные слова
+                  <textarea id="includeKeywords" placeholder="Например: sql, python, retention"></textarea>
+                </label>
+                <label class="field">
+                  Исключающие слова
+                  <textarea id="excludeKeywords" placeholder="Например: casino, betting, sportsbook"></textarea>
+                </label>
+              </div>
+              <div class="grid-2" style="margin-top: 14px;">
+                <label class="field">
+                  Где искать обязательные слова
+                  <select id="includeIn">
+                    <option value="both">И в названии, и в описании</option>
+                    <option value="title">Только в названии</option>
+                    <option value="description">Только в описании</option>
+                  </select>
+                </label>
+                <label class="field">
+                  Где применять исключения
+                  <select id="excludeIn">
+                    <option value="both">И в названии, и в описании</option>
+                    <option value="title">Только в названии</option>
+                    <option value="description">Только в описании</option>
+                  </select>
+                </label>
+              </div>
+              <label class="field" style="margin-top: 14px;">
+                Исключить работодателей
+                <textarea id="excludedEmployers" placeholder="Например: lenkep recruitment"></textarea>
+              </label>
+            </div>
+
+            <div>
+              <h3>Формат и деньги</h3>
+              <div class="field">
+                Формат работы
+                <div id="workFormatsGroup" class="check-grid"></div>
+              </div>
+              <div class="field" style="margin-top: 14px;">
+                Тип занятости
+                <div id="employmentGroup" class="check-grid"></div>
+              </div>
+              <div class="grid-2" style="margin-top: 14px;">
+                <label class="field">
+                  Минимальная зарплата
+                  <input id="salaryMin" type="number" min="0" step="1000" placeholder="0">
+                </label>
+                <label class="field">
+                  Отбор по зарплате
+                  <span class="check-pill">
+                    <input id="onlyWithSalary" type="checkbox">
+                    Показывать только вакансии с указанной зарплатой
+                  </span>
+                </label>
+              </div>
+            </div>
+
+            <div>
+              <h3>Как показывать результаты</h3>
+              <div class="grid-4">
+                <label class="field">
+                  Сортировка
+                  <select id="sort"></select>
+                </label>
+                <label class="field">
+                  Период поиска
+                  <select id="periodDays"></select>
+                </label>
+                <label class="field">
+                  Страниц на запрос
+                  <input id="maxPages" type="number" min="1" max="20">
+                </label>
+                <label class="field">
+                  Лимит результатов
+                  <input id="maxResults" type="number" min="1" max="500">
+                </label>
+                <label class="field">
+                  На одной странице
+                  <input id="deliveryPageSize" type="number" min="1" max="50">
+                </label>
+                <label class="field">
+                  Интервал автопроверки, минут
+                  <input id="interval" type="number" min="5" max="1440">
+                </label>
+              </div>
+            </div>
           </div>
         </section>
 
         <section class="panel">
-          <h2>География</h2>
-          <div class="grid-2">
-            <label class="field">
-              Включить страны и города
-              <textarea id="includedAreas" placeholder="Например: Грузия, Казахстан, Тбилиси"></textarea>
-              <small>Если поле пустое, поиск идёт по всем регионам.</small>
-            </label>
-            <label class="field">
-              Исключить страны и города
-              <textarea id="excludedAreas" placeholder="Например: Россия, Москва"></textarea>
-              <small>Исключение страны автоматически исключает и её города.</small>
-            </label>
+          <div class="section-head">
+            <div>
+              <h2>Сохранение и управление</h2>
+              <p>Сохраняйте изменения, делайте сценарий активным и очищайте историю отправок.</p>
+            </div>
           </div>
-          <div class="summary-box" id="areaHint"></div>
-        </section>
-
-        <section class="panel">
-          <h2>Слова и исключения</h2>
-          <div class="grid-2">
-            <label class="field">
-              Включающие слова
-              <textarea id="includeKeywords" placeholder="Например: sql, product, retention"></textarea>
-            </label>
-            <label class="field">
-              Исключающие слова
-              <textarea id="excludeKeywords" placeholder="Например: casino, betting, sportsbook"></textarea>
-            </label>
-          </div>
-          <div class="grid-3" style="margin-top: 14px;">
-            <label class="field">
-              Где искать включающие слова
-              <select id="includeIn">
-                <option value="both">И в названии, и в описании</option>
-                <option value="title">Только в названии</option>
-                <option value="description">Только в описании</option>
-              </select>
-            </label>
-            <label class="field">
-              Где применять исключения
-              <select id="excludeIn">
-                <option value="both">И в названии, и в описании</option>
-                <option value="title">Только в названии</option>
-                <option value="description">Только в описании</option>
-              </select>
-            </label>
-            <label class="field">
-              Исключить работодателей
-              <textarea id="excludedEmployers" placeholder="Например: lenkep recruitment"></textarea>
-            </label>
-          </div>
-        </section>
-
-        <section class="panel">
-          <h2>Формат работы и зарплата</h2>
-          <div class="field">
-            Формат работы
-            <div id="workFormatsGroup" class="check-grid"></div>
-          </div>
-          <div class="field" style="margin-top: 14px;">
-            Тип занятости
-            <div id="employmentGroup" class="check-grid"></div>
-          </div>
-          <div class="grid-3" style="margin-top: 14px;">
-            <label class="field">
-              Минимальная зарплата
-              <input id="salaryMin" type="number" min="0" step="1000" placeholder="0">
-            </label>
-            <label class="field" style="justify-content: end;">
-              Только вакансии с зарплатой
-              <span class="check-pill" style="margin-top: 7px;">
-                <input id="onlyWithSalary" type="checkbox">
-                Показывать только вакансии с указанной зарплатой
-              </span>
-            </label>
-          </div>
-        </section>
-
-        <section class="panel">
-          <h2>Выдача и расписание</h2>
-          <div class="grid-3">
-            <label class="field">
-              Сортировка
-              <select id="sort"></select>
-            </label>
-            <label class="field">
-              Период поиска
-              <select id="periodDays"></select>
-            </label>
-            <label class="field">
-              Страниц на один запрос
-              <input id="maxPages" type="number" min="1" max="20">
-            </label>
-            <label class="field">
-              Лимит результатов
-              <input id="maxResults" type="number" min="1" max="500">
-            </label>
-            <label class="field">
-              В одной странице выдачи
-              <input id="deliveryPageSize" type="number" min="1" max="50">
-            </label>
-            <label class="field">
-              Интервал автопоиска, минут
-              <input id="interval" type="number" min="5" max="1440">
-            </label>
-          </div>
-        </section>
-
-        <section class="panel">
-          <h2>Действия</h2>
           <div class="actions">
-            <button id="saveBtn" class="primary" type="button">Сохранить</button>
-            <button id="saveActivateBtn" class="secondary" type="button">Сохранить и сделать текущим</button>
-            <button id="activateBtn" class="ghost" type="button">Сделать текущим</button>
-            <button id="resetSentBtn" class="ghost" type="button">Сбросить историю отправок</button>
-            <button id="deleteBtn" class="danger" type="button">Удалить</button>
+            <button id="saveBtn" class="primary" type="button">Сохранить изменения</button>
+            <button id="saveActivateBtn" class="secondary" type="button">Сохранить и включить</button>
+            <button id="activateBtn" class="ghost" type="button">Сделать активным</button>
+            <button id="resetSentBtn" class="ghost" type="button">Очистить отправленные</button>
+            <button id="deleteBtn" class="danger" type="button">Удалить сценарий</button>
           </div>
           <div id="currentSummary" class="summary-box" style="margin-top: 14px;"></div>
         </section>
@@ -3503,8 +3621,8 @@ def _web_ui_html():
         <section class="panel">
           <div class="results-head">
             <div>
-              <h2 style="margin-bottom: 6px;">Результаты</h2>
-              <div id="resultsMeta" class="hint">Запустите поиск или предпросмотр.</div>
+              <h2 style="margin-bottom: 6px;">Найденные вакансии</h2>
+              <div id="resultsMeta" class="hint">Сначала запустите проверку или предпросмотр.</div>
             </div>
             <div class="actions">
               <button id="resultsPrev" class="ghost" type="button">Назад</button>
@@ -3637,20 +3755,37 @@ def _web_ui_html():
       return currentTemplates().find((item) => item.id === state.selectedTemplateId) || null;
     }
 
+    function renderLoadError(error) {
+      const errorText = error && error.message ? error.message : 'Не удалось загрузить данные';
+      els.statusSearch.textContent = 'Ошибка загрузки';
+      els.statusTemplate.textContent = 'Проверьте соединение';
+      els.statusChat.textContent = 'Данные недоступны';
+      els.statusLastCheck.textContent = 'Данные недоступны';
+      els.areaHint.textContent = 'Если страница открылась, а данные не подгрузились, значит не ответил API панели.';
+      els.templateList.innerHTML = '<div class="empty-sidebar">Не удалось загрузить список сценариев.</div>';
+      els.currentSummary.innerHTML = '';
+      els.resultsMeta.textContent = 'Данные не загружены.';
+      els.resultsList.innerHTML = '<div class="hint">После исправления ошибки нажмите «Обновить данные».</div>';
+      els.resultsPage.textContent = '';
+      els.resultsPrev.disabled = true;
+      els.resultsNext.disabled = true;
+      showMessage(errorText, 'error');
+    }
+
     function renderStatus() {
       const status = state.data.status;
       els.statusSearch.textContent = status.searching ? 'Автопоиск включён' : 'Автопоиск на паузе';
       els.statusTemplate.textContent = status.active_template_name || 'не выбран';
-      els.statusChat.textContent = status.chat_configured ? 'Подключён' : 'Telegram ещё не писал боту';
+      els.statusChat.textContent = status.chat_configured ? 'Чат подключён' : 'Чат ещё не подключён';
       els.statusLastCheck.textContent = formatDate(status.last_check);
-      els.toggleBtn.textContent = status.searching ? 'Пауза' : 'Включить';
+      els.toggleBtn.textContent = status.searching ? 'Поставить на паузу' : 'Включить автопоиск';
       els.areaHint.textContent = 'Подсказка: популярные регионы для быстрого ввода — ' + state.data.options.popular_areas.join(', ');
     }
 
     function renderTemplateList() {
       const templates = currentTemplates();
       if (!templates.length) {
-        els.templateList.innerHTML = '<div class="hint">Сохранённых поисков пока нет.</div>';
+        els.templateList.innerHTML = '<div class="empty-sidebar">Сохранённых сценариев пока нет.</div>';
         return;
       }
       els.templateList.innerHTML = templates.map((template) => {
@@ -3664,7 +3799,8 @@ def _web_ui_html():
           'Запросов: ' + template.queries.length,
           'Интервал: ' + template.interval + ' мин',
           'Страниц: ' + template.max_pages,
-          'В выдаче: ' + template.delivery_page_size
+          'На странице: ' + template.delivery_page_size,
+          isActive ? 'Сейчас автопоиск использует этот сценарий' : 'Сохранён для ручного запуска'
         ].join('\\n');
         return (
           '<div class="' + classes.join(' ') + '">' +
@@ -3674,7 +3810,7 @@ def _web_ui_html():
             '</div>' +
             '<div class="actions">' +
               '<button class="ghost" type="button" onclick="selectTemplate(\\'' + template.id + '\\')">Открыть</button>' +
-              '<button class="ghost" type="button" onclick="activateTemplate(\\'' + template.id + '\\')">' + (isActive ? 'Текущий' : 'Сделать текущим') + '</button>' +
+              '<button class="ghost" type="button" onclick="activateTemplate(\\'' + template.id + '\\')">' + (isActive ? 'Активен' : 'Сделать активным') + '</button>' +
               '<button class="danger" type="button" onclick="deleteTemplate(\\'' + template.id + '\\')">Удалить</button>' +
             '</div>' +
           '</div>'
@@ -3741,7 +3877,7 @@ def _web_ui_html():
     function renderResults() {
       const result = state.result;
       if (!result) {
-        els.resultsMeta.textContent = 'Запустите поиск или предпросмотр.';
+        els.resultsMeta.textContent = 'Нажмите «Проверить вакансии» или «Предпросмотр выдачи».';
         els.resultsList.innerHTML = '';
         els.resultsPage.textContent = '';
         els.resultsPrev.disabled = true;
@@ -3761,7 +3897,7 @@ def _web_ui_html():
       const start = state.resultPage * pageSize;
       const pageItems = vacancies.slice(start, start + pageSize);
       const parts = [
-        (result.persist ? 'Поиск' : 'Предпросмотр') + ': ' + result.template_name,
+        (result.persist ? 'Проверка' : 'Предпросмотр') + ': ' + result.template_name,
         'Показано: ' + result.shown_count,
         'Всего найдено: ' + result.total_found
       ];
@@ -3845,7 +3981,7 @@ def _web_ui_html():
       if (payload.warnings && payload.warnings.length) {
         messages.push(payload.warnings.join('\\n'));
       }
-      messages.unshift('Поиск сохранён.');
+      messages.unshift('Сценарий сохранён.');
       showMessage(messages.join('\\n'), payload.warnings && payload.warnings.length ? 'info' : 'success');
     }
 
@@ -3859,7 +3995,7 @@ def _web_ui_html():
       state.result = null;
       state.resultPage = 0;
       await loadState(targetId);
-      showMessage('Текущий поиск обновлён.', 'success');
+      showMessage('Активный сценарий обновлён.', 'success');
     }
 
     async function deleteTemplate(id) {
@@ -3875,7 +4011,7 @@ def _web_ui_html():
       state.result = null;
       state.resultPage = 0;
       await loadState();
-      showMessage('Поиск удалён.', 'success');
+      showMessage('Сценарий удалён.', 'success');
     }
 
     async function resetSent() {
@@ -3886,7 +4022,7 @@ def _web_ui_html():
       }
       await api('/api/web-template-reset-sent?template_id=' + encodeURIComponent(targetId), { method: 'POST' });
       await loadState(targetId);
-      showMessage('История отправок очищена.', 'success');
+      showMessage('История отправленных вакансий очищена.', 'success');
     }
 
     async function toggleSearching() {
@@ -3923,7 +4059,7 @@ def _web_ui_html():
       if (payload.result.reason) {
         showMessage(payload.result.reason, payload.result.errors && payload.result.errors.length ? 'error' : 'info');
       } else {
-        showMessage((persist ? 'Поиск' : 'Предпросмотр') + ' завершён. Найдено к показу: ' + payload.result.shown_count, 'success');
+        showMessage((persist ? 'Проверка' : 'Предпросмотр') + ' завершена. Найдено к показу: ' + payload.result.shown_count, 'success');
       }
     }
 
@@ -3942,7 +4078,7 @@ def _web_ui_html():
       fillForm(state.data.new_template);
       renderTemplateList();
       renderResults();
-      showMessage('Форма очищена. Заполните поля и сохраните новый поиск.', 'info');
+      showMessage('Открыт чистый сценарий. Заполните поля и сохраните его.', 'info');
     }
 
     function bindEvents() {
@@ -4037,7 +4173,7 @@ def _web_ui_html():
         await loadState();
         showMessage('Панель готова к работе.', 'success');
       } catch (error) {
-        showMessage(error.message, 'error');
+        renderLoadError(error);
       }
     }
 
@@ -4164,7 +4300,7 @@ if FastAPI is not None:
         payload = await _read_request_json(request)
         data = load_data()
         if not _active_template(data):
-            return JSONResponse({"ok": False, "error": "Нет текущего поиска"}, status_code=400)
+            return JSONResponse({"ok": False, "error": "Нет активного сценария"}, status_code=400)
         data["searching"] = _coerce_bool(payload.get("searching"))
         save_data(data)
         return {"ok": True, "state": _build_web_state(data)}
