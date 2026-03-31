@@ -150,6 +150,12 @@ MAX_RESULTS_OPTIONS = {
     200: "200 вакансий",
 }
 
+PAGE_SIZE_OPTIONS = {
+    5:  "5 вакансий",
+    10: "10 вакансий",
+    15: "15 вакансий",
+}
+
 SKIP_WORDS = {"нет", "no", "none", "-", "skip"}
 
 RUSSIA_AREA_ID = 113
@@ -290,6 +296,7 @@ def load_data():
             "sent_ids_by_template": {},
             "last_check":         0,
             "user_states":        {},
+            "result_sessions":    {},
         }
     normalized = _normalize_data(data)
     if _ensure_templates_ready(normalized):
@@ -391,11 +398,19 @@ def _normalize_template(template):
     tmpl["salary_min"] = max(0, int(tmpl.get("salary_min", 0) or 0))
     tmpl["excluded_employers"] = [k.strip().lower() for k in tmpl.get("excluded_employers", []) if k and k.strip()]
     tmpl["max_results"] = max(1, int(tmpl.get("max_results", 50) or 50))
+    tmpl["delivery_page_size"] = max(1, int(tmpl.get("delivery_page_size", 5) or 5))
     tmpl["sort"] = tmpl.get("sort", "publication_time")
     tmpl["interval"] = int(tmpl.get("interval", 30) or 30)
     tmpl["max_pages"] = int(tmpl.get("max_pages", 5) or 5)
     tmpl["name"] = (tmpl.get("name") or "Новый шаблон")[:50]
     tmpl["id"] = str(tmpl.get("id") or str(uuid.uuid4())[:8])
+
+    if tmpl["id"] == "default01":
+        excluded_ids = tmpl.get("excluded_area_ids", [])
+        if excluded_ids == [str(MOSCOW_AREA_ID)]:
+            tmpl["name"] = "Аналитик — все страны кроме России"
+            tmpl["excluded_area_ids"] = [str(RUSSIA_AREA_ID)]
+            tmpl["excluded_area_names"] = ["Россия"]
 
     return tmpl
 
@@ -420,6 +435,7 @@ def _normalize_data(data):
         "sent_ids_by_template": normalized_sent_map,
         "last_check":         data.get("last_check", 0),
         "user_states":        data.get("user_states", {}),
+        "result_sessions":    data.get("result_sessions", {}) or {},
     }
 
     state_map = normalized["user_states"]
@@ -429,6 +445,24 @@ def _normalize_data(data):
             continue
         if "draft" in state:
             state["draft"] = _normalize_template(state.get("draft", {}))
+        history = state.get("history")
+        if not isinstance(history, list):
+            state["history"] = []
+
+    result_sessions = normalized["result_sessions"]
+    for session_id, session in list(result_sessions.items()):
+        if not isinstance(session, dict):
+            result_sessions.pop(session_id, None)
+            continue
+        vacancies = session.get("vacancies")
+        if not isinstance(vacancies, list):
+            result_sessions.pop(session_id, None)
+            continue
+        session["page_size"] = max(1, int(session.get("page_size", 5) or 5))
+        session["current_page"] = max(0, int(session.get("current_page", 0) or 0))
+        session["template_name"] = str(session.get("template_name") or "Поиск")
+        session["mode"] = "preview" if session.get("mode") == "preview" else "run"
+        session["errors"] = [str(item) for item in (session.get("errors") or []) if str(item).strip()]
 
     return normalized
 
@@ -463,6 +497,48 @@ def _ensure_templates_ready(data):
 
 def _esc(value):
     return html.escape(str(value or ""), quote=True)
+
+
+def _short_label(text, max_len=22):
+    clean = " ".join(str(text or "").split())
+    if len(clean) <= max_len:
+        return clean
+    return clean[: max_len - 1].rstrip() + "…"
+
+
+def _back_home_row(back_callback=None):
+    row = []
+    if back_callback:
+        row.append({"text": "Назад", "callback_data": back_callback})
+    row.append({"text": "Главное меню", "callback_data": "menu_home"})
+    return [row]
+
+
+def _wizard_move_to(state, next_step):
+    current_step = state.get("step")
+    if current_step and current_step != next_step:
+        history = state.setdefault("history", [])
+        history.append(current_step)
+    state["step"] = next_step
+
+
+def _result_session_page_count(session):
+    vacancies = session.get("vacancies", [])
+    page_size = max(1, int(session.get("page_size", 5) or 5))
+    return max(1, (len(vacancies) + page_size - 1) // page_size)
+
+
+def _trim_result_sessions(data):
+    sessions = data.setdefault("result_sessions", {})
+    ordered = sorted(
+        sessions.items(),
+        key=lambda item: float((item[1] or {}).get("created_at", 0) or 0),
+        reverse=True,
+    )
+    keep_ids = {session_id for session_id, _ in ordered[:6]}
+    for session_id in list(sessions.keys()):
+        if session_id not in keep_ids:
+            sessions.pop(session_id, None)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -511,6 +587,19 @@ def edit_reply_markup(chat_id, message_id, reply_markup):
     tg_call("editMessageReplyMarkup",
             chat_id=chat_id, message_id=message_id,
             reply_markup=reply_markup)
+
+
+def edit_msg(chat_id, message_id, text, reply_markup=None, parse_mode="HTML"):
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return tg_call("editMessageText", **payload)
 
 def answer_cb(cb_id, text=""):
     tg_call("answerCallbackQuery", callback_query_id=cb_id, text=text)
@@ -819,6 +908,8 @@ def fetch_vacancies(template):
 
     results = []
     seen_ids = set()
+    errors = []
+    requests_made = 0
 
     for query in queries:
         for exp in exp_filters:
@@ -841,9 +932,14 @@ def fetch_vacancies(template):
 
                 try:
                     r = requests.get(f"{HH_API}/vacancies", params=params, timeout=20)
+                    requests_made += 1
+                    r.raise_for_status()
                     data = r.json()
                 except Exception as e:
-                    print(f"❌ Ошибка запроса hh.ru: {e}")
+                    exp_label = EXPERIENCE_OPTIONS.get(exp, "любой опыт") if exp else "любой опыт"
+                    error_text = f"{query} / {exp_label}: {e}"
+                    print(f"❌ Ошибка запроса hh.ru: {error_text}")
+                    errors.append(error_text)
                     break
 
                 items = data.get("items", [])
@@ -917,7 +1013,12 @@ def fetch_vacancies(template):
             final.append(v)
 
     sorted_final = _sort_vacancies(final, sort_by, queries)
-    return sorted_final[:max_results]
+    return {
+        "vacancies": sorted_final[:max_results],
+        "errors": _unique_list(errors),
+        "requests_made": requests_made,
+        "queries_count": len(queries),
+    }
 
 
 def _normalize_text(text):
@@ -1063,6 +1164,105 @@ def format_vacancy(v):
     return "\n".join(lines)
 
 
+def _vacancy_salary_text(vacancy):
+    salary = vacancy.get("salary") or {}
+    lo, hi, cur = salary.get("from"), salary.get("to"), salary.get("currency", "")
+    if lo and hi:
+        return f"{lo:,}–{hi:,} {cur}".replace(",", " ")
+    if lo:
+        return f"от {lo:,} {cur}".replace(",", " ")
+    if hi:
+        return f"до {hi:,} {cur}".replace(",", " ")
+    return "не указана"
+
+
+def format_vacancy_brief(index, vacancy):
+    name = _esc(vacancy.get("name") or "Без названия")
+    employer = _esc((vacancy.get("employer") or {}).get("name") or "Компания не указана")
+    area = _esc((vacancy.get("area") or {}).get("name") or "Локация не указана")
+    exp = _esc((vacancy.get("experience") or {}).get("name") or "Не указан")
+    salary = _esc(_vacancy_salary_text(vacancy))
+    url = vacancy.get("alternate_url") or ""
+    work_formats = ", ".join(
+        _esc((item or {}).get("name") or "")
+        for item in (vacancy.get("work_format") or [])
+        if (item or {}).get("name")
+    )
+
+    lines = [
+        f"<b>{index}. {name}</b>",
+        f"{employer} · {area}",
+        f"Опыт: {exp}",
+        f"Зарплата: {salary}",
+    ]
+    if work_formats:
+        lines.append(f"Формат: {work_formats}")
+    if url:
+        lines.append(f"<a href='{url}'>Открыть на hh.ru</a>")
+    return "\n".join(lines)
+
+
+def _store_result_session(data, tmpl, vacancies, persist, errors):
+    session_id = str(uuid.uuid4())[:8]
+    data.setdefault("result_sessions", {})[session_id] = {
+        "template_id": tmpl["id"],
+        "template_name": tmpl["name"],
+        "created_at": time.time(),
+        "page_size": tmpl.get("delivery_page_size", 5),
+        "current_page": 0,
+        "vacancies": vacancies,
+        "mode": "run" if persist else "preview",
+        "errors": list(errors or []),
+    }
+    _trim_result_sessions(data)
+    return session_id
+
+
+def _render_result_page(data, session_id, page):
+    session = (data.get("result_sessions", {}) or {}).get(session_id)
+    if not session:
+        return None, None
+
+    vacancies = session.get("vacancies", [])
+    page_size = max(1, int(session.get("page_size", 5) or 5))
+    page_count = _result_session_page_count(session)
+    page = max(0, min(page, page_count - 1))
+    session["current_page"] = page
+
+    start = page * page_size
+    end = start + page_size
+    items = vacancies[start:end]
+    mode_label = "Поиск" if session.get("mode") == "run" else "Предпросмотр"
+
+    lines = [
+        f"<b>{_esc(mode_label)}: {_esc(session.get('template_name', 'Поиск'))}</b>",
+        f"Найдено: <b>{len(vacancies)}</b>",
+        f"Страница: <b>{page + 1}/{page_count}</b>",
+    ]
+
+    if session.get("errors"):
+        lines.append(f"Ошибки: <code>{_esc('; '.join(session['errors'][:2]))}</code>")
+
+    if not items:
+        lines.append("\nНечего показать на этой странице.")
+    else:
+        lines.append("")
+        for index, vacancy in enumerate(items, start=start + 1):
+            lines.append(format_vacancy_brief(index, vacancy))
+            lines.append("")
+
+    buttons = []
+    nav_row = []
+    if page > 0:
+        nav_row.append({"text": "Назад", "callback_data": f"res_{session_id}_{page - 1}"})
+    if page < page_count - 1:
+        nav_row.append({"text": "Далее", "callback_data": f"res_{session_id}_{page + 1}"})
+    if nav_row:
+        buttons.append(nav_row)
+    buttons.extend(_back_home_row("menu_current"))
+    return "\n".join(lines).strip(), {"inline_keyboard": buttons}
+
+
 # ═══════════════════════════════════════════════════════════
 #  WIZARD — МАСТЕР СОЗДАНИЯ ШАБЛОНА
 # ═══════════════════════════════════════════════════════════
@@ -1079,7 +1279,12 @@ def _format_template_summary(template, detailed=False):
     employment_types = [get_employment_options().get(code, code) for code in template.get("employment_types", [])]
     excluded_employers = template.get("excluded_employers", [])
 
-    include_text = ", ".join(_esc(name) for name in include_names) if include_names else "Все страны и города"
+    if not include_names and exclude_names == ["Россия"]:
+        include_text = "Все страны, кроме России"
+    elif not include_names:
+        include_text = "Все страны и города"
+    else:
+        include_text = ", ".join(_esc(name) for name in include_names)
     exclude_text = ", ".join(_esc(name) for name in exclude_names) if exclude_names else "Без исключений"
     include_kw_preview = ", ".join(_esc(word) for word in include_kw[:6]) or "нет"
     exclude_kw_preview = ", ".join(_esc(word) for word in exclude_kw[:6]) or "нет"
@@ -1103,6 +1308,7 @@ def _format_template_summary(template, detailed=False):
         f"Период: {_esc(PERIOD_OPTIONS.get(template.get('period_days', 1), 'За 1 день'))}",
         f"Страниц на запрос: {template.get('max_pages', 5)}",
         f"Лимит результатов: {template.get('max_results', 50)}",
+        f"В одной странице выдачи: {template.get('delivery_page_size', 5)}",
         f"Интервал: {template.get('interval', 30)} мин",
     ]
 
@@ -1130,6 +1336,7 @@ def wizard_start(chat_id, data, template_id=None):
     data["user_states"][str(chat_id)] = {
         "step":  "queries",
         "draft": draft,
+        "history": [],
     }
     save_data(data)
 
@@ -1140,7 +1347,8 @@ def wizard_start(chat_id, data, template_id=None):
         "Введите названия вакансий через запятую.\n"
         "Или напишите <code>default</code> для полного набора аналитических должностей и синонимов.\n\n"
         "Пример: <code>data analyst, product analyst, business analyst</code>\n\n"
-        "Дальше я пошагово спрошу опыт, географию, слова, формат работы, зарплату и другие фильтры."
+        "Дальше я пошагово спрошу опыт, географию, слова, формат работы, зарплату и другие фильтры.",
+        reply_markup={"inline_keyboard": _back_home_row()}
     )
 
 def _new_draft():
@@ -1165,6 +1373,7 @@ def _new_draft():
         "salary_min":       0,
         "excluded_employers": [],
         "max_results":      50,
+        "delivery_page_size": 5,
         "sort":             "publication_time",
         "interval":         30,
         "max_pages":        5,
@@ -1321,6 +1530,7 @@ def _send_search_fields_kb(chat_id, selected):
         mark = "[x] " if code in selected else "[ ] "
         buttons.append([{"text": mark + label, "callback_data": f"sf_{code}"}])
     buttons.append([{"text": "Далее", "callback_data": "sf_done"}])
+    buttons.extend(_back_home_row("wiz_back"))
     send_msg(chat_id, "<b>Где искать совпадения</b>\nВыберите одно или несколько полей:", reply_markup={"inline_keyboard": buttons})
 
 def _send_experience_kb(chat_id, selected):
@@ -1329,6 +1539,7 @@ def _send_experience_kb(chat_id, selected):
         mark = "[x] " if code in selected else "[ ] "
         buttons.append([{"text": mark + label, "callback_data": f"exp_{code}"}])
     buttons.append([{"text": "Далее", "callback_data": "exp_done"}])
+    buttons.extend(_back_home_row("wiz_back"))
     send_msg(chat_id, "<b>Опыт работы</b>\nВыберите один или несколько вариантов:",
              reply_markup={"inline_keyboard": buttons})
 
@@ -1336,6 +1547,7 @@ def _send_area_scope_kb(chat_id):
     kb = {"inline_keyboard": [
         [{"text": "Искать везде", "callback_data": "scope_all"}],
         [{"text": "Искать только в выбранных странах/городах", "callback_data": "scope_selected"}],
+        *_back_home_row("wiz_back"),
     ]}
     send_msg(chat_id, "<b>География поиска</b>\nСначала выберите общий режим:", reply_markup=kb)
 
@@ -1346,7 +1558,8 @@ def _send_include_area_prompt(chat_id):
         "<b>Страны / города для включения</b>\n"
         "Введите через запятую.\n\n"
         f"Примеры: {examples}\n\n"
-        "Пример: <code>Грузия, Тбилиси, Беларусь</code>"
+        "Пример: <code>Грузия, Тбилиси, Беларусь</code>",
+        reply_markup={"inline_keyboard": _back_home_row("wiz_back")}
     )
 
 def _send_exclude_area_prompt(chat_id):
@@ -1357,7 +1570,8 @@ def _send_exclude_area_prompt(chat_id):
         "Примеры:\n"
         "<code>Москва</code>\n"
         "<code>Москва, Минск</code>\n"
-        "<code>Россия</code>"
+        "<code>Россия</code>",
+        reply_markup={"inline_keyboard": _back_home_row("wiz_back")}
     )
 
 def _send_include_kw_prompt(chat_id):
@@ -1365,7 +1579,8 @@ def _send_include_kw_prompt(chat_id):
         chat_id,
         "<b>Слова, которые должны присутствовать</b>\n"
         "Введите через запятую или <code>нет</code>, если такой фильтр не нужен.\n\n"
-        "Пример: <code>sql, python, product</code>"
+        "Пример: <code>sql, python, product</code>",
+        reply_markup={"inline_keyboard": _back_home_row("wiz_back")}
     )
 
 def _send_include_in_kb(chat_id):
@@ -1373,6 +1588,7 @@ def _send_include_in_kb(chat_id):
         [{"text": "Искать только в названии", "callback_data": "ii_title"}],
         [{"text": "Искать только в описании", "callback_data": "ii_description"}],
         [{"text": "Искать и в названии, и в описании", "callback_data": "ii_both"}],
+        *_back_home_row("wiz_back"),
     ]}
     send_msg(chat_id, "<b>Где должны встречаться включающие слова</b>", reply_markup=kb)
 
@@ -1383,7 +1599,8 @@ def _send_exclude_kw_prompt(chat_id):
         "• <code>default</code> — стандартный список (гемблинг, казино, беттинг и т.д.)\n"
         "• <code>нет</code>     — не фильтровать\n"
         "• Или введите свои слова через запятую\n\n"
-        f"В дефолтном списке: <b>{len(DEFAULT_EXCLUDE_KEYWORDS)}</b> слов"
+        f"В дефолтном списке: <b>{len(DEFAULT_EXCLUDE_KEYWORDS)}</b> слов",
+        reply_markup={"inline_keyboard": _back_home_row("wiz_back")}
     )
 
 def _send_exclude_in_kb(chat_id):
@@ -1391,6 +1608,7 @@ def _send_exclude_in_kb(chat_id):
         [{"text": "Только в названии", "callback_data": "ei_title"}],
         [{"text": "Только в описании", "callback_data": "ei_description"}],
         [{"text": "И в названии, и в описании", "callback_data": "ei_both"}],
+        *_back_home_row("wiz_back"),
     ]}
     send_msg(chat_id, "<b>Где применять фильтр слов</b>", reply_markup=kb)
 
@@ -1400,10 +1618,21 @@ def _work_formats_keyboard(selected):
         mark = "[x] " if code in selected else "[ ] "
         buttons.append([{"text": mark + label.replace("\xa0", " "), "callback_data": f"wf_{code}"}])
     buttons.append([{"text": "Далее", "callback_data": "wf_done"}])
+    buttons.extend(_back_home_row("wiz_back"))
     return buttons
 
 def _send_work_formats_kb(chat_id, selected):
-    send_msg(chat_id, "<b>Формат работы</b>\nВыберите один или несколько вариантов. Если ничего не выбрано, подойдут любые.", reply_markup={"inline_keyboard": _work_formats_keyboard(selected)})
+    numbered_lines = []
+    for index, (_, label) in enumerate(get_work_format_options().items(), start=1):
+        numbered_lines.append(f"{index}. {label.replace(chr(160), ' ')}")
+    send_msg(
+        chat_id,
+        "<b>Формат работы</b>\n"
+        "Выберите кнопками или отправьте номера через запятую.\n"
+        "Можно несколько вариантов сразу.\n\n"
+        + "\n".join(numbered_lines),
+        reply_markup={"inline_keyboard": _work_formats_keyboard(selected)},
+    )
 
 def _employment_keyboard(selected):
     buttons = [[{"text": "Сбросить выбор (любая занятость)", "callback_data": "emp_any"}]]
@@ -1411,6 +1640,7 @@ def _employment_keyboard(selected):
         mark = "[x] " if code in selected else "[ ] "
         buttons.append([{"text": mark + label, "callback_data": f"emp_{code}"}])
     buttons.append([{"text": "Далее", "callback_data": "emp_done"}])
+    buttons.extend(_back_home_row("wiz_back"))
     return buttons
 
 def _send_employment_kb(chat_id, selected):
@@ -1421,6 +1651,7 @@ def _send_salary_mode_kb(chat_id):
         [{"text": "Без фильтра по зарплате", "callback_data": "sal_any"}],
         [{"text": "Только вакансии с зарплатой", "callback_data": "sal_only"}],
         [{"text": "Указать минимальную зарплату", "callback_data": "sal_min"}],
+        *_back_home_row("wiz_back"),
     ]}
     send_msg(chat_id, "<b>Фильтр по зарплате</b>", reply_markup=kb)
 
@@ -1429,7 +1660,8 @@ def _send_employers_prompt(chat_id):
         chat_id,
         "<b>Работодатели для исключения</b>\n"
         "Введите компании через запятую или <code>нет</code>.\n\n"
-        "Пример: <code>ANCOR, Lenkep recruitment</code>"
+        "Пример: <code>ANCOR, Lenkep recruitment</code>",
+        reply_markup={"inline_keyboard": _back_home_row("wiz_back")}
     )
 
 def _send_sort_kb(chat_id):
@@ -1437,6 +1669,7 @@ def _send_sort_kb(chat_id):
         [{"text": label, "callback_data": f"sort_{code}"}]
         for code, label in SORT_OPTIONS.items()
     ]}
+    kb["inline_keyboard"].extend(_back_home_row("wiz_back"))
     send_msg(chat_id, "<b>Сортировка</b>", reply_markup=kb)
 
 def _send_period_kb(chat_id):
@@ -1444,6 +1677,7 @@ def _send_period_kb(chat_id):
         [{"text": label, "callback_data": f"period_{days}"}]
         for days, label in PERIOD_OPTIONS.items()
     ]}
+    kb["inline_keyboard"].extend(_back_home_row("wiz_back"))
     send_msg(chat_id, "<b>Период поиска</b>\nЗа какой период брать вакансии с hh.ru:", reply_markup=kb)
 
 def _send_pages_kb(chat_id):
@@ -1451,6 +1685,7 @@ def _send_pages_kb(chat_id):
         [{"text": label, "callback_data": f"pages_{pages}"}]
         for pages, label in MAX_PAGES_OPTIONS.items()
     ]}
+    kb["inline_keyboard"].extend(_back_home_row("wiz_back"))
     send_msg(chat_id, "<b>Глубина поиска</b>\nСколько страниц просматривать для каждого запроса:", reply_markup=kb)
 
 def _send_max_results_kb(chat_id):
@@ -1458,21 +1693,35 @@ def _send_max_results_kb(chat_id):
         [{"text": label, "callback_data": f"limit_{limit}"}]
         for limit, label in MAX_RESULTS_OPTIONS.items()
     ]}
+    kb["inline_keyboard"].extend(_back_home_row("wiz_back"))
     send_msg(chat_id, "<b>Лимит за один запуск</b>\nСколько вакансий максимум отправлять за одну проверку:", reply_markup=kb)
+
+
+def _send_page_size_kb(chat_id):
+    kb = {"inline_keyboard": [
+        [{"text": label, "callback_data": f"psize_{size}"}]
+        for size, label in PAGE_SIZE_OPTIONS.items()
+    ]}
+    kb["inline_keyboard"].extend(_back_home_row("wiz_back"))
+    send_msg(chat_id, "<b>Размер страницы выдачи</b>\nСколько вакансий показывать за один экран:", reply_markup=kb)
 
 def _send_interval_kb(chat_id):
     kb = {"inline_keyboard": [
         [{"text": label, "callback_data": f"int_{mins}"}]
         for mins, label in INTERVAL_OPTIONS.items()
     ]}
+    kb["inline_keyboard"].extend(_back_home_row("wiz_back"))
     send_msg(chat_id, "<b>Интервал автопроверки</b>", reply_markup=kb)
 
 def _send_confirm(chat_id, draft):
     text = _format_template_summary(draft, detailed=True)
-    kb = {"inline_keyboard": [[
-        {"text": "Сохранить", "callback_data": "confirm_save"},
-        {"text": "Отмена",   "callback_data": "confirm_cancel"},
-    ]]}
+    kb = {"inline_keyboard": [
+        [
+            {"text": "Сохранить", "callback_data": "confirm_save"},
+            {"text": "Отмена",   "callback_data": "confirm_cancel"},
+        ],
+        *_back_home_row("wiz_back"),
+    ]}
     send_msg(chat_id, text, reply_markup=kb)
 
 

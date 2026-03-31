@@ -26,3 +26,9 @@
 - Подтянуты словари HH (`employment`, `work_format`) для актуальных опций прямо из API.
 - Telegram-токен вынесен из `hh_vacancy_bot.py` в локальный файл `bot_local_config.py`, а сам файл добавлен в `.gitignore`.
 - Добавлен полноценный webhook-режим: бот умеет сам регистрировать webhook в Telegram, принимать POST через встроенный HTTP-сервер и продолжать плановый поиск без polling.
+- Добавлена Vercel-совместимая serverless-обвязка через FastAPI и `api/[[...path]].py`: бот теперь можно деплоить на Vercel без отдельного локального процесса.
+- Конфиг для Vercel переведён на переменные окружения `HH_TELEGRAM_BOT_TOKEN`, `HH_TELEGRAM_WEBHOOK_URL`, `CRON_SECRET`; локальный `bot_local_config.py` на Vercel больше не используется.
+- Данные состояния на Vercel переведены на `Runtime Cache`, а тяжёлое дерево регионов HH сжимается через gzip+base64 перед записью в cache.
+- Исправлен баг serverless-режима: дефолтный шаблон теперь создаётся не только при локальном старте, но и при первой загрузке состояния на Vercel, поэтому прод не остаётся пустым (`templates_count = 0`).
+- Добавлены публичные Vercel endpoints: `/`, `/status`, `/webhook-info`, `/webhook-register`, `/telegram-webhook`, `/cron`, `/run-now`.
+- Для бесплатного Vercel Hobby зафиксирован рабочий сценарий: webhook + ручной `/run`; частый встроенный cron не считается основной логикой автопоиска.
