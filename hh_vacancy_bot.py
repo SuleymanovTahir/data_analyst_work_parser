@@ -110,6 +110,7 @@ _http_local = threading.local()
 _search_result_local_cache = {}
 _query_spec_local_cache = {}
 _web_options_cache = None
+_state_local_snapshot = None
 _hh_backoff_lock = threading.Lock()
 _hh_backoff_until = 0.0
 
@@ -140,6 +141,17 @@ SEARCH_FIELD_OPTIONS = {
     "company_name": "Компания",
     "description":  "Описание",
 }
+
+DEFAULT_ANALYST_INCLUDE_KEYWORDS = ["python"]
+
+
+def _effective_experience_codes(values):
+    selected = _unique_list(values or [])
+    if not selected:
+        return [ANY_EXPERIENCE]
+    if ANY_EXPERIENCE in selected and len(selected) > 1:
+        selected = [code for code in selected if code != ANY_EXPERIENCE]
+    return selected or [ANY_EXPERIENCE]
 
 INTERVAL_OPTIONS = {
     15:  "15 мин",
@@ -284,6 +296,23 @@ def _cache_set(key, value, ttl_seconds, tags=None):
         return False
 
 
+def _read_state_file():
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _state_saved_at(value):
+    if not isinstance(value, dict):
+        return 0.0
+    try:
+        return float(value.get("_saved_at", 0) or 0)
+    except Exception:
+        return 0.0
+
+
 def _pack_json(value):
     raw = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return base64.b64encode(gzip.compress(raw, compresslevel=6)).decode("ascii")
@@ -403,36 +432,42 @@ def _build_search_cache_key(template):
     return f"{SEARCH_CACHE_PREFIX}{digest}"
 
 def load_data():
-    cached = _cache_get(STATE_CACHE_KEY)
-    if cached is not None:
-        normalized = _normalize_data(cached)
-        if _ensure_templates_ready(normalized):
-            save_data(normalized)
-        return normalized
+    global _state_local_snapshot
 
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
+    cached = _cache_get(STATE_CACHE_KEY)
+    file_state = _read_state_file()
+    memory_state = _state_local_snapshot if isinstance(_state_local_snapshot, dict) else None
+
+    candidates = [item for item in (memory_state, file_state, cached) if isinstance(item, dict)]
+    if candidates:
+        data = max(candidates, key=_state_saved_at)
+    else:
         data = {
             "chat_id":            None,
             "templates":          [],
             "active_template_id": None,
             "searching":          False,
+            "run_in_progress":    False,
+            "run_started_at":     0,
+            "run_mode":           "",
             "sent_ids":           [],
             "sent_ids_by_template": {},
             "last_check":         0,
             "user_states":        {},
             "result_sessions":    {},
+            "_saved_at":          0,
         }
+
     normalized = _normalize_data(data)
     if _ensure_templates_ready(normalized):
         save_data(normalized)
         return normalized
+    _state_local_snapshot = json.loads(json.dumps(normalized, ensure_ascii=False))
     _cache_set(STATE_CACHE_KEY, normalized, STATE_TTL_SECONDS, tags=["bot-state"])
     return normalized
 
 def save_data(data):
+    global _state_local_snapshot
     sent_ids_by_template = {}
     for template_id, values in (data.get("sent_ids_by_template", {}) or {}).items():
         sent_ids_by_template[str(template_id)] = list(values or [])[-10000:]
@@ -449,10 +484,14 @@ def save_data(data):
 
     data["sent_ids_by_template"] = sent_ids_by_template
     data["sent_ids"] = all_sent_ids
-    if _cache_set(STATE_CACHE_KEY, data, STATE_TTL_SECONDS, tags=["bot-state"]):
-        return
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    data["_saved_at"] = time.time()
+    _state_local_snapshot = json.loads(json.dumps(data, ensure_ascii=False))
+    _cache_set(STATE_CACHE_KEY, data, STATE_TTL_SECONDS, tags=["bot-state"])
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️ Не удалось сохранить локальное состояние: {e}")
 
 
 def _unique_list(values):
@@ -508,7 +547,7 @@ def _normalize_area_work_format_rules(rules):
 
 def _default_area_work_format_rules():
     rules = []
-    for area_name in ("Россия", "Беларусь"):
+    for area_name in ("Россия", "Беларусь", "Кыргызстан", "Узбекистан"):
         area_id = find_area_id(area_name)
         if area_id:
             rules.append({
@@ -609,9 +648,7 @@ def _normalize_template(template):
     tmpl["queries"] = [q.strip() for q in tmpl.get("queries", DEFAULT_QUERIES) if q and q.strip()]
     tmpl["queries"] = tmpl["queries"] or DEFAULT_QUERIES[:]
 
-    tmpl["experience"] = _unique_list(tmpl.get("experience", [ANY_EXPERIENCE]))
-    if not tmpl["experience"]:
-        tmpl["experience"] = [ANY_EXPERIENCE]
+    tmpl["experience"] = _effective_experience_codes(tmpl.get("experience", [ANY_EXPERIENCE]))
 
     tmpl["search_fields"] = _unique_list(tmpl.get("search_fields", ["name", "company_name", "description"]))
     if not tmpl["search_fields"]:
@@ -647,10 +684,18 @@ def _normalize_template(template):
             tmpl["name"] = "Аналитик — все страны кроме России"
             tmpl["excluded_area_ids"] = [str(RUSSIA_AREA_ID)]
             tmpl["excluded_area_names"] = ["Россия"]
-        if ANY_EXPERIENCE not in tmpl["experience"]:
-            tmpl["experience"] = _unique_list(tmpl.get("experience", []) + [ANY_EXPERIENCE])
-        if not tmpl.get("area_work_format_rules"):
-            tmpl["area_work_format_rules"] = _default_area_work_format_rules()
+        tmpl["experience"] = _effective_experience_codes(tmpl.get("experience", []))
+        tmpl["include_keywords"] = _unique_list(tmpl.get("include_keywords", []) + DEFAULT_ANALYST_INCLUDE_KEYWORDS)
+        tmpl["include_in"] = "description"
+        if tmpl.get("sort") in {"", "match_desc", "relevance"}:
+            tmpl["sort"] = "publication_time"
+        existing_rules = list(tmpl.get("area_work_format_rules", []))
+        existing_rule_area_ids = {str(rule.get("area_id") or "") for rule in existing_rules}
+        for rule in _default_area_work_format_rules():
+            if str(rule.get("area_id") or "") in existing_rule_area_ids:
+                continue
+            existing_rules.append(rule)
+        tmpl["area_work_format_rules"] = _normalize_area_work_format_rules(existing_rules)
 
     return tmpl
 
@@ -671,11 +716,15 @@ def _normalize_data(data):
         "templates":          [_normalize_template(t) for t in data.get("templates", [])],
         "active_template_id": data.get("active_template_id"),
         "searching":          bool(data.get("searching", False)),
+        "run_in_progress":    bool(data.get("run_in_progress", False)),
+        "run_started_at":     int(data.get("run_started_at", 0) or 0),
+        "run_mode":           str(data.get("run_mode") or ""),
         "sent_ids":           list(data.get("sent_ids", [])),
         "sent_ids_by_template": normalized_sent_map,
         "last_check":         data.get("last_check", 0),
         "user_states":        data.get("user_states", {}),
         "result_sessions":    data.get("result_sessions", {}) or {},
+        "_saved_at":          float(data.get("_saved_at", 0) or 0),
     }
 
     state_map = normalized["user_states"]
@@ -700,6 +749,7 @@ def _normalize_data(data):
             continue
         session["page_size"] = max(1, int(session.get("page_size", 5) or 5))
         session["current_page"] = max(0, int(session.get("current_page", 0) or 0))
+        session["resume_page"] = max(0, int(session.get("resume_page", 0) or 0))
         session["template_name"] = str(session.get("template_name") or "Поиск")
         session["mode"] = "preview" if session.get("mode") == "preview" else "run"
         session["errors"] = [str(item) for item in (session.get("errors") or []) if str(item).strip()]
@@ -718,6 +768,14 @@ def _set_template_sent_ids(data, template_id, vacancy_ids):
     sent_map[template_id] = list(vacancy_ids or [])[-10000:]
 
 
+def _append_template_sent_ids(data, template_id, vacancy_ids):
+    template_id = str(template_id or "")
+    existing_ids = _template_sent_ids(data, template_id)
+    merged_ids = _unique_list(existing_ids + [str(item) for item in (vacancy_ids or []) if str(item or "").strip()])
+    _set_template_sent_ids(data, template_id, merged_ids)
+    return merged_ids
+
+
 def _ensure_templates_ready(data):
     changed = False
     templates = data.get("templates", [])
@@ -731,6 +789,37 @@ def _ensure_templates_ready(data):
     elif not data.get("active_template_id"):
         data["active_template_id"] = templates[0]["id"]
         changed = True
+
+    for template in templates:
+        if str(template.get("id") or "") != "default01":
+            continue
+
+        normalized_experience = _effective_experience_codes(template.get("experience", []))
+        if list(template.get("experience", [])) != normalized_experience:
+            template["experience"] = normalized_experience
+            changed = True
+
+        merged_include_keywords = _unique_list(template.get("include_keywords", []) + DEFAULT_ANALYST_INCLUDE_KEYWORDS)
+        if list(template.get("include_keywords", [])) != merged_include_keywords:
+            template["include_keywords"] = merged_include_keywords
+            changed = True
+
+        if template.get("include_in") != "description":
+            template["include_in"] = "description"
+            changed = True
+
+        if template.get("sort") != "publication_time":
+            template["sort"] = "publication_time"
+            changed = True
+
+        existing_rules = list(template.get("area_work_format_rules", []))
+        existing_rule_area_ids = {str(rule.get("area_id") or "") for rule in existing_rules}
+        for rule in _default_area_work_format_rules():
+            if str(rule.get("area_id") or "") in existing_rule_area_ids:
+                continue
+            existing_rules.append(rule)
+            changed = True
+        template["area_work_format_rules"] = _normalize_area_work_format_rules(existing_rules)
 
     return changed
 
@@ -766,6 +855,93 @@ def _result_session_page_count(session):
     vacancies = session.get("vacancies", [])
     page_size = max(1, int(session.get("page_size", 5) or 5))
     return max(1, (len(vacancies) + page_size - 1) // page_size)
+
+
+def _result_session_resume_page(session):
+    page_count = _result_session_page_count(session)
+    resume_page = int(session.get("resume_page", 0) or 0)
+    return max(0, min(resume_page, page_count - 1))
+
+
+def _result_session_next_page(session):
+    page_count = _result_session_page_count(session)
+    current_page = max(0, int(session.get("current_page", 0) or 0))
+    resume_page = _result_session_resume_page(session)
+    if current_page < resume_page:
+        return resume_page
+    if current_page < page_count - 1:
+        return current_page + 1
+    return None
+
+
+def _find_open_result_session(data, template_id):
+    template_id = str(template_id or "")
+    sessions = list((data.get("result_sessions", {}) or {}).items())
+    sessions.sort(key=lambda item: float((item[1] or {}).get("created_at", 0) or 0), reverse=True)
+
+    for session_id, session in sessions:
+        if not isinstance(session, dict):
+            continue
+        if str(session.get("template_id") or "") != template_id:
+            continue
+        if session.get("mode") != "run":
+            continue
+        next_page = _result_session_next_page(session)
+        if next_page is None:
+            continue
+        return session_id, session, next_page
+    return None, None, None
+
+
+RUN_STALE_SECONDS = 60 * 20
+
+
+def _is_run_in_progress(data):
+    started_at = int(data.get("run_started_at", 0) or 0)
+    in_progress = bool(data.get("run_in_progress", False))
+    if not in_progress:
+        return False
+    if started_at and (time.time() - started_at) <= RUN_STALE_SECONDS:
+        return True
+    data["run_in_progress"] = False
+    data["run_started_at"] = 0
+    data["run_mode"] = ""
+    return False
+
+
+def _set_run_in_progress(data, value, mode=""):
+    data["run_in_progress"] = bool(value)
+    data["run_started_at"] = int(time.time()) if value else 0
+    data["run_mode"] = str(mode or "") if value else ""
+
+
+def _dispatch_async_run(persist=True):
+    base_url = get_public_base_url()
+    if not (IS_VERCEL and base_url):
+        return False
+
+    run_url = f"{base_url}/run-now"
+    params = {"persist": 1 if persist else 0}
+    headers = {}
+    if CRON_SECRET:
+        params["secret"] = CRON_SECRET
+        headers["Authorization"] = f"Bearer {CRON_SECRET}"
+
+    try:
+        _get_http_session().get(
+            run_url,
+            params=params,
+            headers=headers,
+            timeout=(HTTP_CONNECT_TIMEOUT, 1),
+            allow_redirects=False,
+        )
+        return True
+    except requests.exceptions.ReadTimeout:
+        print("✅ Async-поиск запущен через self-call")
+        return True
+    except Exception as e:
+        print(f"⚠️ Не удалось запустить async-поиск: {e}")
+        return False
 
 
 def _trim_result_sessions(data):
@@ -1047,6 +1223,20 @@ def send_msg(chat_id, text, reply_markup=None, parse_mode="HTML"):
     if reply_markup:
         payload["reply_markup"] = reply_markup
     return tg_call("sendMessage", **payload)
+
+
+def _message_id_from_response(response):
+    if not isinstance(response, dict):
+        return None
+    result = response.get("result") or {}
+    message_id = result.get("message_id")
+    if message_id in (None, ""):
+        return None
+    try:
+        return int(message_id)
+    except Exception:
+        return None
+
 
 def edit_reply_markup(chat_id, message_id, reply_markup):
     tg_call("editMessageReplyMarkup",
@@ -1637,7 +1827,7 @@ def fetch_vacancies(template, on_batch=None):
     max_results = int(template.get("max_results", 50) or 50)
     search_fields = template.get("search_fields", ["name", "company_name", "description"])
 
-    exp_list = template.get("experience", [ANY_EXPERIENCE])
+    exp_list = _effective_experience_codes(template.get("experience", [ANY_EXPERIENCE]))
     if ANY_EXPERIENCE in exp_list or not exp_list:
         exp_filters = [None]
     else:
@@ -1959,6 +2149,35 @@ def format_vacancy_brief(index, vacancy):
 
 
 def _store_result_session(data, tmpl, vacancies, persist, errors):
+    return _store_result_session_with_resume(data, tmpl, vacancies, persist, errors, resume_page=0)
+
+
+def _upsert_result_session_with_resume(data, session_id, tmpl, vacancies, persist, errors, resume_page=0):
+    sessions = data.setdefault("result_sessions", {})
+    normalized_vacancies = list(vacancies or [])
+    normalized_errors = list(errors or [])
+    if session_id and session_id in sessions:
+        session = sessions[session_id]
+        session["template_id"] = tmpl["id"]
+        session["template_name"] = tmpl["name"]
+        session["page_size"] = tmpl.get("delivery_page_size", 5)
+        session["resume_page"] = max(0, int(resume_page or 0))
+        session["vacancies"] = normalized_vacancies
+        session["mode"] = "run" if persist else "preview"
+        session["errors"] = normalized_errors
+        _trim_result_sessions(data)
+        return session_id
+    return _store_result_session_with_resume(
+        data,
+        tmpl,
+        normalized_vacancies,
+        persist,
+        normalized_errors,
+        resume_page=resume_page,
+    )
+
+
+def _store_result_session_with_resume(data, tmpl, vacancies, persist, errors, resume_page=0):
     session_id = str(uuid.uuid4())[:8]
     data.setdefault("result_sessions", {})[session_id] = {
         "template_id": tmpl["id"],
@@ -1966,6 +2185,7 @@ def _store_result_session(data, tmpl, vacancies, persist, errors):
         "created_at": time.time(),
         "page_size": tmpl.get("delivery_page_size", 5),
         "current_page": 0,
+        "resume_page": max(0, int(resume_page or 0)),
         "vacancies": vacancies,
         "mode": "run" if persist else "preview",
         "errors": list(errors or []),
@@ -2013,9 +2233,14 @@ def _render_result_page(data, session_id, page):
         nav_row.append({"text": "Назад", "callback_data": f"res_{session_id}_{page - 1}"})
     if page < page_count - 1:
         nav_row.append({"text": "Далее", "callback_data": f"res_{session_id}_{page + 1}"})
+    elif page_count > 1:
+        nav_row.append({"text": "С начала", "callback_data": f"res_{session_id}_0"})
     if nav_row:
         buttons.append(nav_row)
-    buttons.extend(_back_home_row("menu_current"))
+    buttons.append([
+        {"text": "Текущий шаблон", "callback_data": "menu_current"},
+        {"text": "Главное меню", "callback_data": "menu_home"},
+    ])
     return "\n".join(lines).strip(), {"inline_keyboard": buttons}
 
 
@@ -2724,10 +2949,19 @@ def _rerun_fresh_keyboard(data):
     ]}
 
 
-def _search_summary_keyboard(data, session_id=None):
+def _search_progress_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "Текущий шаблон", "callback_data": "menu_current"},
+         {"text": "Главное меню", "callback_data": "menu_home"}],
+    ]}
+
+
+def _search_summary_keyboard(data, session_id=None, start_page=0, hidden_count=0):
     buttons = []
     if session_id:
-        buttons.append([{"text": "Открыть список", "callback_data": f"res_{session_id}_0"}])
+        open_page = max(0, int(start_page or 0))
+        page_label = "Дальше" if hidden_count > 0 and open_page > 0 else "Открыть список"
+        buttons.append([{"text": page_label, "callback_data": f"res_{session_id}_{open_page}"}])
     buttons.extend(_current_search_keyboard(data).get("inline_keyboard", []))
     return {"inline_keyboard": buttons}
 
@@ -2994,7 +3228,31 @@ def cmd_run(chat_id, data):
     if not tmpl:
         send_msg(chat_id, "Нет текущего шаблона. Создайте его через /new или выберите в разделе «Мои шаблоны».", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
         return
+
+    session_id, session, next_page = _find_open_result_session(data, tmpl["id"])
+    if session_id and session is not None and next_page is not None:
+        text, markup = _render_result_page(data, session_id, next_page)
+        save_data(data)
+        send_msg(
+            chat_id,
+            "Есть ещё непросмотренные вакансии из предыдущей проверки.\n"
+            "Продолжаю с того места, где список остановился.",
+        )
+        send_msg(chat_id, text, reply_markup=markup)
+        return
+
+    if _is_run_in_progress(data):
+        send_msg(
+            chat_id,
+            "Проверка уже идёт.\n"
+            "Если в сообщении ниже есть кнопка «Дальше», можно открыть следующие вакансии уже сейчас.",
+            reply_markup=_current_search_keyboard(data),
+        )
+        return
+
     send_msg(chat_id, _format_launch_message(tmpl, preview=False))
+    if _dispatch_async_run(persist=True):
+        return
     _run_search(chat_id, data, tmpl, persist=True)
 
 
@@ -3005,7 +3263,12 @@ def cmd_preview(chat_id, data):
     if not tmpl:
         send_msg(chat_id, "Нет текущего шаблона. Создайте его через /new или выберите в разделе «Мои шаблоны».", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
         return
+    if _is_run_in_progress(data):
+        send_msg(chat_id, "Сейчас уже выполняется другая проверка. Дождитесь её завершения или откройте продолжение списка кнопкой «Дальше».")
+        return
     send_msg(chat_id, _format_launch_message(tmpl, preview=True))
+    if _dispatch_async_run(persist=False):
+        return
     _run_search(chat_id, data, tmpl, persist=False)
 
 
@@ -3054,24 +3317,72 @@ def _run_search_live(chat_id, data, tmpl):
     instant_limit = max(1, int(tmpl.get("delivery_page_size", 5) or 5))
     instant_sent_ids = []
     instant_sent_set = set()
+    progress_message_id = None
+    live_session_id = None
+    live_visible_vacancies = []
+    live_visible_ids = set()
 
     def _on_batch(batch_vacancies):
+        nonlocal progress_message_id, live_session_id
         newly_streamed_ids = []
-        if len(instant_sent_ids) >= instant_limit:
-            return newly_streamed_ids
 
         for vacancy in batch_vacancies:
             vacancy_id = str(vacancy.get("id", ""))
             if not vacancy_id:
                 continue
-            if vacancy_id in initial_sent_set or vacancy_id in instant_sent_set:
+            if vacancy_id in initial_sent_set or vacancy_id in live_visible_ids:
                 continue
+            live_visible_ids.add(vacancy_id)
+            live_visible_vacancies.append(vacancy)
+
+            if len(instant_sent_ids) >= instant_limit:
+                continue
+
             send_msg(chat_id, format_vacancy(vacancy))
             instant_sent_set.add(vacancy_id)
             instant_sent_ids.append(vacancy_id)
             newly_streamed_ids.append(vacancy_id)
-            if len(instant_sent_ids) >= instant_limit:
-                break
+            if len(instant_sent_ids) >= instant_limit and progress_message_id is None:
+                progress_response = send_msg(
+                    chat_id,
+                    f"Показал первые <b>{len(instant_sent_ids)}</b> вакансий.\n"
+                    "Собираю продолжение списка...",
+                    reply_markup=_search_progress_keyboard(),
+                )
+                progress_message_id = _message_id_from_response(progress_response)
+
+        if newly_streamed_ids:
+            _append_template_sent_ids(data, tmpl["id"], newly_streamed_ids)
+            save_data(data)
+
+        hidden_count = max(0, len(live_visible_vacancies) - len(instant_sent_ids))
+        if hidden_count > 0:
+            sorted_live = _sort_vacancies(live_visible_vacancies, tmpl.get("sort", "publication_time"), tmpl.get("queries", []))
+            visible_snapshot = _merge_priority_vacancies(sorted_live, instant_sent_ids, len(sorted_live))
+            resume_page = len(instant_sent_ids) // instant_limit
+            live_session_id = _upsert_result_session_with_resume(
+                data,
+                live_session_id,
+                tmpl,
+                visible_snapshot,
+                True,
+                [],
+                resume_page=resume_page,
+            )
+            save_data(data)
+            if progress_message_id is not None:
+                progress_text = (
+                    f"Показал первые <b>{len(instant_sent_ids)}</b> вакансий.\n"
+                    "Следующие вакансии уже можно открыть кнопкой «Дальше».\n"
+                    "Поиск всё ещё продолжается..."
+                )
+                progress_markup = _search_summary_keyboard(
+                    data,
+                    live_session_id,
+                    start_page=resume_page,
+                    hidden_count=hidden_count,
+                )
+                edit_msg(chat_id, progress_message_id, progress_text, reply_markup=progress_markup)
 
         return newly_streamed_ids
 
@@ -3113,9 +3424,18 @@ def _run_search_live(chat_id, data, tmpl):
     _set_template_sent_ids(data, tmpl["id"], sent_ids)
 
     hidden_count = max(0, len(visible_vacancies) - len(instant_sent_ids))
-    session_id = None
+    session_id = live_session_id
     if hidden_count > 0:
-        session_id = _store_result_session(data, tmpl, visible_vacancies, True, fetch_errors)
+        resume_page = len(instant_sent_ids) // max(1, int(tmpl.get("delivery_page_size", 5) or 5))
+        session_id = _upsert_result_session_with_resume(
+            data,
+            session_id,
+            tmpl,
+            visible_vacancies,
+            True,
+            fetch_errors,
+            resume_page=resume_page,
+        )
 
     save_data(data)
 
@@ -3128,10 +3448,23 @@ def _run_search_live(chat_id, data, tmpl):
     ]
     if hidden_count > 0:
         header_lines.append(f"Осталось в списке: <b>{hidden_count}</b>")
+        header_lines.append("Нажмите «Дальше», чтобы открыть следующую страницу.")
     if fetch_errors:
         header_lines.append(_friendly_fetch_error_summary(fetch_errors))
 
-    send_msg(chat_id, "\n".join(header_lines), reply_markup=_search_summary_keyboard(data, session_id))
+    summary_text = "\n".join(header_lines)
+    summary_markup = _search_summary_keyboard(
+        data,
+        session_id,
+        start_page=resume_page if hidden_count > 0 else 0,
+        hidden_count=hidden_count,
+    )
+    if progress_message_id is not None:
+        edit_result = edit_msg(chat_id, progress_message_id, summary_text, reply_markup=summary_markup)
+        if not isinstance(edit_result, dict) or not edit_result.get("ok", False):
+            send_msg(chat_id, summary_text, reply_markup=summary_markup)
+    else:
+        send_msg(chat_id, summary_text, reply_markup=summary_markup)
 
     return {
         "total_found": len(fetched_vacancies),
@@ -3197,10 +3530,12 @@ def _run_search(chat_id, data, tmpl, persist=True):
 def _build_runtime_status(data=None):
     data = load_data() if data is None else _normalize_data(data)
     tmpl = _active_template(data)
+    run_in_progress = _is_run_in_progress(data)
     return {
         "service": "hh-vacancy-bot",
         "platform": "vercel" if IS_VERCEL else "local",
         "searching": bool(data.get("searching", False)),
+        "run_in_progress": run_in_progress,
         "chat_configured": bool(data.get("chat_id")),
         "active_template_id": tmpl.get("id") if tmpl else None,
         "active_template_name": tmpl.get("name") if tmpl else None,
@@ -3220,15 +3555,24 @@ def run_manual_search_tick(persist=True):
         return {"ok": False, "status": "skipped", "reason": "chat_not_configured"}
     if not tmpl:
         return {"ok": False, "status": "skipped", "reason": "no_active_template"}
+    if _is_run_in_progress(data):
+        return {"ok": False, "status": "skipped", "reason": "run_in_progress"}
 
-    result = _run_search(chat_id, data, tmpl, persist=persist)
-    return {
-        "ok": True,
-        "status": "done",
-        "template_id": tmpl["id"],
-        "template_name": tmpl["name"],
-        **result,
-    }
+    _set_run_in_progress(data, True, mode="run" if persist else "preview")
+    save_data(data)
+    try:
+        result = _run_search(chat_id, data, tmpl, persist=persist)
+        return {
+            "ok": True,
+            "status": "done",
+            "template_id": tmpl["id"],
+            "template_name": tmpl["name"],
+            **result,
+        }
+    finally:
+        refreshed = load_data()
+        _set_run_in_progress(refreshed, False)
+        save_data(refreshed)
 
 
 def _show_wizard_step(chat_id, state):
@@ -3768,8 +4112,8 @@ def _create_default_template():
         "included_area_names": [],
         "excluded_area_ids":  [str(RUSSIA_AREA_ID)],
         "excluded_area_names": ["Россия"],
-        "include_keywords":   [],
-        "include_in":         "both",
+        "include_keywords":   DEFAULT_ANALYST_INCLUDE_KEYWORDS[:],
+        "include_in":         "description",
         "exclude_keywords":   DEFAULT_EXCLUDE_KEYWORDS[:],
         "exclude_in":         "both",
         "work_formats":       [],
@@ -3780,7 +4124,7 @@ def _create_default_template():
         "salary_min":         0,
         "excluded_employers": [],
         "max_results":        50,
-        "sort":               "match_desc",
+        "sort":               "publication_time",
         "interval":           30,
         "max_pages":          5,
     })
