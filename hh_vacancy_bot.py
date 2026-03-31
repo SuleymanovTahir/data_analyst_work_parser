@@ -28,6 +28,7 @@ import uuid
 import re
 import html
 import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
 
 # ═══════════════════════════════════════════════════════════
@@ -35,15 +36,23 @@ from datetime import datetime
 # ═══════════════════════════════════════════════════════════
 
 try:
-    from bot_local_config import BOT_TOKEN
+    from bot_local_config import BOT_TOKEN, WEBHOOK_URL, WEBHOOK_HOST, WEBHOOK_PORT
 except Exception:
     BOT_TOKEN = os.getenv("HH_TELEGRAM_BOT_TOKEN", "").strip()
+    WEBHOOK_URL = os.getenv("HH_TELEGRAM_WEBHOOK_URL", "").strip()
+    WEBHOOK_HOST = os.getenv("HH_TELEGRAM_WEBHOOK_HOST", "0.0.0.0").strip() or "0.0.0.0"
+    WEBHOOK_PORT = int(os.getenv("HH_TELEGRAM_WEBHOOK_PORT", "8080") or 8080)
 
 if not BOT_TOKEN:
     raise RuntimeError(
         "Не найден BOT_TOKEN. Укажите его в файле bot_local_config.py "
         "или в переменной окружения HH_TELEGRAM_BOT_TOKEN."
     )
+
+WEBHOOK_URL = (WEBHOOK_URL or "").strip().rstrip("/")
+WEBHOOK_HOST = (WEBHOOK_HOST or "0.0.0.0").strip() or "0.0.0.0"
+WEBHOOK_PORT = int(WEBHOOK_PORT or 8080)
+USE_WEBHOOK = bool(WEBHOOK_URL)
 
 DATA_FILE   = "bot_data.json"
 AREAS_CACHE = "areas_cache.json"
@@ -382,6 +391,23 @@ def get_updates(offset=0):
         return r.json().get("result", [])
     except Exception:
         return []
+
+
+def set_webhook(url):
+    payload = {
+        "url": url,
+        "allowed_updates": ["message", "callback_query"],
+        "drop_pending_updates": False,
+    }
+    return tg_call("setWebhook", **payload)
+
+
+def delete_webhook(drop_pending_updates=False):
+    return tg_call("deleteWebhook", drop_pending_updates=drop_pending_updates)
+
+
+def get_webhook_info():
+    return tg_call("getWebhookInfo")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1939,15 +1965,13 @@ def _create_default_template():
 #  ГЛАВНЫЙ ЦИКЛ
 # ═══════════════════════════════════════════════════════════
 
-def main():
+def bootstrap_bot():
     print("🤖 HH.ru Vacancy Bot запускается...")
-    data   = load_data()
-    offset = 0
+    data = load_data()
 
-    # Создаём дефолтный шаблон при первом запуске
     if not data.get("templates"):
         tmpl = _create_default_template()
-        data["templates"]          = [tmpl]
+        data["templates"] = [tmpl]
         data["active_template_id"] = tmpl["id"]
         save_data(data)
         print("✅ Создан дефолтный шаблон поиска")
@@ -1955,7 +1979,136 @@ def main():
     print("📡 Загружаю дерево регионов HH...")
     _index_areas()
     get_hh_dictionaries()
+
+
+def process_update(upd):
+    data = load_data()
+
+    if "callback_query" in upd:
+        try:
+            handle_callback(upd["callback_query"], data)
+        except Exception as e:
+            print(f"❌ Ошибка callback: {e}")
+        return
+
+    msg = upd.get("message", {})
+    if not msg:
+        return
+
+    chat_id = msg["chat"]["id"]
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return
+
+    if data.get("chat_id") != chat_id:
+        data["chat_id"] = chat_id
+        save_data(data)
+
+    state = data["user_states"].get(str(chat_id))
+    if state and not text.startswith("/"):
+        if state["step"] == "name" and text.lower() in ("ok", "ок"):
+            text = state["draft"].get("name", "Новый шаблон")
+        try:
+            wizard_handle_text(chat_id, text, data)
+        except Exception as e:
+            print(f"❌ Ошибка wizard: {e}")
+        return
+
+    cmd = text.split()[0].split("@")[0].lower()
+    try:
+        if cmd == "/start":
+            cmd_start(chat_id, data)
+        elif cmd == "/menu":
+            cmd_menu(chat_id, data)
+        elif cmd == "/help":
+            cmd_help(chat_id)
+        elif cmd == "/new":
+            cmd_start(chat_id, data)
+            wizard_start(chat_id, data)
+        elif cmd == "/templates":
+            cmd_templates(chat_id, data)
+        elif cmd == "/current":
+            cmd_current(chat_id, data)
+        elif cmd == "/run":
+            cmd_run(chat_id, data)
+        elif cmd == "/preview":
+            cmd_preview(chat_id, data)
+        elif cmd == "/clone":
+            cmd_clone(chat_id, data)
+        elif cmd == "/reset_sent":
+            cmd_reset_sent(chat_id, data)
+        elif cmd == "/toggle":
+            cmd_toggle(chat_id, data)
+        elif cmd == "/status":
+            cmd_status(chat_id, data)
+        else:
+            send_msg(chat_id, "Неизвестная команда. /menu — быстрое меню, /help — список команд.")
+    except Exception as e:
+        print(f"❌ Ошибка команды {cmd}: {e}")
+
+
+def run_scheduled_search_tick():
+    data = load_data()
+    chat_id = data.get("chat_id")
+
+    if not (data.get("searching") and data.get("active_template_id") and chat_id):
+        return
+
+    tmpl = _active_template(data)
+    if not tmpl:
+        return
+
+    interval = tmpl.get("interval", 30) * 60
+    last_chk = data.get("last_check", 0)
+    if time.time() - last_chk < interval:
+        return
+
+    print(f"🔍 Плановый поиск: {tmpl['name']}")
+    try:
+        _run_search(chat_id, data, tmpl)
+    except Exception as e:
+        print(f"❌ Ошибка планового поиска: {e}")
+        data["last_check"] = time.time()
+        save_data(data)
+
+
+class TelegramWebhookHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"HH bot webhook is alive")
+
+    def do_POST(self):
+        content_length = int(self.headers.get("Content-Length", "0") or 0)
+        raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+
+        try:
+            update = json.loads(raw_body.decode("utf-8"))
+        except Exception as e:
+            print(f"❌ Некорректный webhook payload: {e}")
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b"bad request")
+            return
+
+        try:
+            process_update(update)
+        except Exception as e:
+            print(f"❌ Ошибка обработки webhook update: {e}")
+
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, format, *args):
+        return
+
+
+def run_polling():
+    print("✅ Режим: polling")
     print("✅ Готов. Отправьте /start боту в Telegram.")
+    delete_webhook(drop_pending_updates=False)
+    offset = 0
 
     while True:
         try:
@@ -1967,96 +2120,34 @@ def main():
 
         for upd in updates:
             offset = upd["update_id"] + 1
-            data   = load_data()
+            process_update(upd)
 
-            # ── Callback query (кнопки) ──────────────────
-            if "callback_query" in upd:
-                try:
-                    handle_callback(upd["callback_query"], data)
-                except Exception as e:
-                    print(f"❌ Ошибка callback: {e}")
-                continue
-
-            # ── Текстовые сообщения ──────────────────────
-            msg = upd.get("message", {})
-            if not msg:
-                continue
-
-            chat_id = msg["chat"]["id"]
-            text    = (msg.get("text") or "").strip()
-            if not text:
-                continue
-
-            # Сохраняем chat_id при любом сообщении
-            if data.get("chat_id") != chat_id:
-                data["chat_id"] = chat_id
-                save_data(data)
-
-            # Wizard перехватывает текстовый ввод
-            state = data["user_states"].get(str(chat_id))
-            if state and not text.startswith("/"):
-                # Для шага "name" поддерживаем "ok"
-                if state["step"] == "name" and text.lower() in ("ok", "ок"):
-                    text = state["draft"].get("name", "Новый шаблон")
-                try:
-                    wizard_handle_text(chat_id, text, data)
-                except Exception as e:
-                    print(f"❌ Ошибка wizard: {e}")
-                continue
-
-            # Команды
-            cmd = text.split()[0].split("@")[0].lower()
-            try:
-                if cmd == "/start":
-                    cmd_start(chat_id, data)
-                elif cmd == "/menu":
-                    cmd_menu(chat_id, data)
-                elif cmd == "/help":
-                    cmd_help(chat_id)
-                elif cmd == "/new":
-                    cmd_start(chat_id, data)   # регистрируем chat_id
-                    wizard_start(chat_id, data)
-                elif cmd == "/templates":
-                    cmd_templates(chat_id, data)
-                elif cmd == "/current":
-                    cmd_current(chat_id, data)
-                elif cmd == "/run":
-                    cmd_run(chat_id, data)
-                elif cmd == "/preview":
-                    cmd_preview(chat_id, data)
-                elif cmd == "/clone":
-                    cmd_clone(chat_id, data)
-                elif cmd == "/reset_sent":
-                    cmd_reset_sent(chat_id, data)
-                elif cmd == "/toggle":
-                    cmd_toggle(chat_id, data)
-                elif cmd == "/status":
-                    cmd_status(chat_id, data)
-                else:
-                    send_msg(chat_id,
-                        "Неизвестная команда. /menu — быстрое меню, /help — список команд.")
-            except Exception as e:
-                print(f"❌ Ошибка команды {cmd}: {e}")
-
-        # ── Плановый автопоиск ───────────────────────────
-        data  = load_data()
-        chat_id = data.get("chat_id")
-
-        if data.get("searching") and data.get("active_template_id") and chat_id:
-            tmpl = _active_template(data)
-            if tmpl:
-                interval  = tmpl.get("interval", 30) * 60
-                last_chk  = data.get("last_check", 0)
-                if time.time() - last_chk >= interval:
-                    print(f"🔍 Плановый поиск: {tmpl['name']}")
-                    try:
-                        _run_search(chat_id, data, tmpl)
-                    except Exception as e:
-                        print(f"❌ Ошибка планового поиска: {e}")
-                        data["last_check"] = time.time()
-                        save_data(data)
-
+        run_scheduled_search_tick()
         time.sleep(1)
+
+
+def run_webhook():
+    print("✅ Режим: webhook")
+    response = set_webhook(WEBHOOK_URL)
+    if not response.get("ok"):
+        print(f"❌ Не удалось зарегистрировать webhook: {response}")
+    else:
+        print(f"✅ Webhook зарегистрирован: {WEBHOOK_URL}")
+
+    server = ThreadingHTTPServer((WEBHOOK_HOST, WEBHOOK_PORT), TelegramWebhookHandler)
+    server.timeout = 1
+    print(f"✅ Локальный webhook-сервер слушает {WEBHOOK_HOST}:{WEBHOOK_PORT}")
+
+    while True:
+        server.handle_request()
+        run_scheduled_search_tick()
+
+
+def main():
+    bootstrap_bot()
+    if USE_WEBHOOK:
+        run_webhook()
+    run_polling()
 
 
 if __name__ == "__main__":

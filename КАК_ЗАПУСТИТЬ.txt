@@ -26,8 +26,13 @@
 
    Формат:
    BOT_TOKEN = "ваш_токен_бота"
+   WEBHOOK_URL = "https://ваш-публичный-url"
+   WEBHOOK_HOST = "0.0.0.0"
+   WEBHOOK_PORT = 8080
 
    Этот файл добавлен в .gitignore и не должен попадать в git.
+   Если WEBHOOK_URL заполнен, бот стартует в webhook-режиме.
+   Если WEBHOOK_URL пустой, бот работает через polling.
 
 4. Запустите бот:
    python hh_vacancy_bot.py
