@@ -51,19 +51,26 @@ except Exception:
 #  КОНФИГ
 # ═══════════════════════════════════════════════════════════
 
-try:
-    from bot_local_config import BOT_TOKEN, WEBHOOK_URL, WEBHOOK_HOST, WEBHOOK_PORT
-except Exception:
+IS_VERCEL = bool(os.getenv("VERCEL") or os.getenv("VERCEL_ENV"))
+
+if IS_VERCEL:
     BOT_TOKEN = os.getenv("HH_TELEGRAM_BOT_TOKEN", "").strip()
     WEBHOOK_URL = os.getenv("HH_TELEGRAM_WEBHOOK_URL", "").strip()
     WEBHOOK_HOST = os.getenv("HH_TELEGRAM_WEBHOOK_HOST", "0.0.0.0").strip() or "0.0.0.0"
     WEBHOOK_PORT = int(os.getenv("HH_TELEGRAM_WEBHOOK_PORT", "8080") or 8080)
+else:
+    try:
+        from bot_local_config import BOT_TOKEN, WEBHOOK_URL, WEBHOOK_HOST, WEBHOOK_PORT
+    except Exception:
+        BOT_TOKEN = os.getenv("HH_TELEGRAM_BOT_TOKEN", "").strip()
+        WEBHOOK_URL = os.getenv("HH_TELEGRAM_WEBHOOK_URL", "").strip()
+        WEBHOOK_HOST = os.getenv("HH_TELEGRAM_WEBHOOK_HOST", "0.0.0.0").strip() or "0.0.0.0"
+        WEBHOOK_PORT = int(os.getenv("HH_TELEGRAM_WEBHOOK_PORT", "8080") or 8080)
 
 WEBHOOK_URL = (WEBHOOK_URL or "").strip().rstrip("/")
 WEBHOOK_HOST = (WEBHOOK_HOST or "0.0.0.0").strip() or "0.0.0.0"
 WEBHOOK_PORT = int(WEBHOOK_PORT or 8080)
 USE_WEBHOOK = bool(WEBHOOK_URL)
-IS_VERCEL = bool(os.getenv("VERCEL") or os.getenv("VERCEL_ENV"))
 CRON_SECRET = (os.getenv("CRON_SECRET") or os.getenv("HH_CRON_SECRET") or "").strip()
 STATE_TTL_SECONDS = int(os.getenv("HH_STATE_TTL_SECONDS", str(60 * 60 * 24 * 30)) or (60 * 60 * 24 * 30))
 AREAS_TTL_SECONDS = int(os.getenv("HH_AREAS_TTL_SECONDS", str(60 * 60 * 24 * 30)) or (60 * 60 * 24 * 30))
@@ -452,7 +459,8 @@ def get_telegram_webhook_target(request=None):
     base_url = get_public_base_url(request)
     if not base_url:
         return ""
-    return f"{base_url}/api/telegram/webhook"
+    webhook_path = "/telegram/webhook" if IS_VERCEL else "/api/telegram/webhook"
+    return f"{base_url}{webhook_path}"
 
 def tg_call(method, **kwargs):
     if not TG_API:
@@ -2278,10 +2286,12 @@ if FastAPI is not None:
             "hobby_note": "На Vercel Hobby cron ограничен. Для частого автопоиска используйте ручной /run или внешний scheduler на /api/cron.",
         }
 
+    @app.get("/status")
     @app.get("/api/status")
     def api_status():
         return _build_runtime_status()
 
+    @app.get("/webhook/info")
     @app.get("/api/webhook/info")
     def api_webhook_info(request: Request):
         if not TG_API:
@@ -2296,6 +2306,7 @@ if FastAPI is not None:
             "status": _build_runtime_status(),
         }
 
+    @app.get("/webhook/register")
     @app.get("/api/webhook/register")
     def api_register_webhook(request: Request):
         if not TG_API:
@@ -2320,6 +2331,7 @@ if FastAPI is not None:
             status_code=status_code,
         )
 
+    @app.post("/telegram/webhook")
     @app.post("/api/telegram/webhook")
     async def api_telegram_webhook(request: Request):
         try:
@@ -2336,6 +2348,7 @@ if FastAPI is not None:
 
         return {"ok": True}
 
+    @app.get("/cron")
     @app.get("/api/cron")
     def api_cron(request: Request, force: int = 0, secret: str = ""):
         auth_header = request.headers.get("authorization", "")
@@ -2343,6 +2356,7 @@ if FastAPI is not None:
             return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
         return run_scheduled_search_tick(force=bool(force))
 
+    @app.get("/run-now")
     @app.get("/api/run-now")
     def api_run_now(request: Request, persist: int = 1, secret: str = ""):
         auth_header = request.headers.get("authorization", "")

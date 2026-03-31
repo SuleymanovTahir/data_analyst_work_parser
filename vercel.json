@@ -1,5 +1,36 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    {
+      "source": "/",
+      "destination": "/api"
+    },
+    {
+      "source": "/status",
+      "destination": "/api/status"
+    },
+    {
+      "source": "/webhook/:path*",
+      "destination": "/api/webhook/:path*"
+    },
+    {
+      "source": "/telegram/:path*",
+      "destination": "/api/telegram/:path*"
+    },
+    {
+      "source": "/cron",
+      "destination": "/api/cron"
+    },
+    {
+      "source": "/run-now",
+      "destination": "/api/run-now"
+    }
+  ],
+  "functions": {
+    "api/**/*.py": {
+      "excludeFiles": "{__pycache__/**,areas_cache.json,bot_data.json,bot_local_config.py,.git/**,.vercel/**}"
+    }
+  },
   "crons": [
     {
       "path": "/api/cron",
