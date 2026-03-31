@@ -272,7 +272,10 @@ def _unpack_json(payload):
 def load_data():
     cached = _cache_get(STATE_CACHE_KEY)
     if cached is not None:
-        return _normalize_data(cached)
+        normalized = _normalize_data(cached)
+        if _ensure_templates_ready(normalized):
+            save_data(normalized)
+        return normalized
 
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -289,6 +292,9 @@ def load_data():
             "user_states":        {},
         }
     normalized = _normalize_data(data)
+    if _ensure_templates_ready(normalized):
+        save_data(normalized)
+        return normalized
     _cache_set(STATE_CACHE_KEY, normalized, STATE_TTL_SECONDS, tags=["bot-state"])
     return normalized
 
@@ -438,6 +444,23 @@ def _set_template_sent_ids(data, template_id, vacancy_ids):
     sent_map[template_id] = list(vacancy_ids or [])[-10000:]
 
 
+def _ensure_templates_ready(data):
+    changed = False
+    templates = data.get("templates", [])
+
+    if not templates:
+        tmpl = _create_default_template()
+        data["templates"] = [tmpl]
+        data["active_template_id"] = tmpl["id"]
+        _set_template_sent_ids(data, tmpl["id"], [])
+        changed = True
+    elif not data.get("active_template_id"):
+        data["active_template_id"] = templates[0]["id"]
+        changed = True
+
+    return changed
+
+
 def _esc(value):
     return html.escape(str(value or ""), quote=True)
 
@@ -459,7 +482,7 @@ def get_telegram_webhook_target(request=None):
     base_url = get_public_base_url(request)
     if not base_url:
         return ""
-    webhook_path = "/telegram/webhook" if IS_VERCEL else "/api/telegram/webhook"
+    webhook_path = "/telegram-webhook" if IS_VERCEL else "/api/telegram/webhook"
     return f"{base_url}{webhook_path}"
 
 def tg_call(method, **kwargs):
@@ -2291,7 +2314,9 @@ if FastAPI is not None:
     def api_status():
         return _build_runtime_status()
 
+    @app.get("/webhook-info")
     @app.get("/webhook/info")
+    @app.get("/api/webhook-info")
     @app.get("/api/webhook/info")
     def api_webhook_info(request: Request):
         if not TG_API:
@@ -2306,7 +2331,9 @@ if FastAPI is not None:
             "status": _build_runtime_status(),
         }
 
+    @app.get("/webhook-register")
     @app.get("/webhook/register")
+    @app.get("/api/webhook-register")
     @app.get("/api/webhook/register")
     def api_register_webhook(request: Request):
         if not TG_API:
@@ -2331,7 +2358,9 @@ if FastAPI is not None:
             status_code=status_code,
         )
 
+    @app.post("/telegram-webhook")
     @app.post("/telegram/webhook")
+    @app.post("/api/telegram-webhook")
     @app.post("/api/telegram/webhook")
     async def api_telegram_webhook(request: Request):
         try:

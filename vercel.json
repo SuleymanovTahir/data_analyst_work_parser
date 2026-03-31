@@ -3,19 +3,23 @@
   "rewrites": [
     {
       "source": "/",
-      "destination": "/api"
+      "destination": "/api/status"
     },
     {
       "source": "/status",
       "destination": "/api/status"
     },
     {
-      "source": "/webhook/:path*",
-      "destination": "/api/webhook/:path*"
+      "source": "/webhook-info",
+      "destination": "/api/webhook-info"
     },
     {
-      "source": "/telegram/:path*",
-      "destination": "/api/telegram/:path*"
+      "source": "/webhook-register",
+      "destination": "/api/webhook-register"
+    },
+    {
+      "source": "/telegram-webhook",
+      "destination": "/api/telegram-webhook"
     },
     {
       "source": "/cron",
