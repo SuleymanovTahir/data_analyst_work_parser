@@ -542,6 +542,215 @@ def _trim_result_sessions(data):
             sessions.pop(session_id, None)
 
 
+def _split_text_values(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        raw_values = value
+    else:
+        raw_values = re.split(r"[\n,;]+", str(value))
+    return [str(item).strip() for item in raw_values if str(item).strip()]
+
+
+def _coerce_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y", "on", "да", "вкл"}
+
+
+def _coerce_int(value, default=0, min_value=None, max_value=None):
+    try:
+        result = int(value)
+    except Exception:
+        result = int(default)
+    if min_value is not None:
+        result = max(min_value, result)
+    if max_value is not None:
+        result = min(max_value, result)
+    return result
+
+
+def _strip_hh_highlight(text):
+    clean = re.sub(r"</?highlighttext>", "", str(text or ""), flags=re.IGNORECASE)
+    return " ".join(clean.split())
+
+
+def _option_list(options_map):
+    return [{"id": str(code), "label": str(label)} for code, label in options_map.items()]
+
+
+def _vacancy_to_web_item(vacancy):
+    return {
+        "id": str(vacancy.get("id") or ""),
+        "name": str(vacancy.get("name") or "Без названия"),
+        "employer": str((vacancy.get("employer") or {}).get("name") or "Компания не указана"),
+        "area": str((vacancy.get("area") or {}).get("name") or "Локация не указана"),
+        "experience": str((vacancy.get("experience") or {}).get("name") or "Не указан"),
+        "salary": _vacancy_salary_text(vacancy),
+        "schedule": str((vacancy.get("schedule") or {}).get("name") or ""),
+        "work_formats": [
+            str((item or {}).get("name") or "")
+            for item in (vacancy.get("work_format") or [])
+            if (item or {}).get("name")
+        ],
+        "url": str(vacancy.get("alternate_url") or ""),
+        "published_at": str(_publication_key(vacancy) or ""),
+        "snippet": _strip_hh_highlight((vacancy.get("snippet") or {}).get("requirement") or ""),
+    }
+
+
+def _template_to_web_payload(template):
+    tmpl = _normalize_template(template)
+    return {
+        "id": tmpl["id"],
+        "name": tmpl["name"],
+        "queries": list(tmpl.get("queries", [])),
+        "search_fields": list(tmpl.get("search_fields", [])),
+        "experience": list(tmpl.get("experience", [])),
+        "included_area_names": list(tmpl.get("included_area_names", [])),
+        "excluded_area_names": list(tmpl.get("excluded_area_names", [])),
+        "include_keywords": list(tmpl.get("include_keywords", [])),
+        "include_in": tmpl.get("include_in", "both"),
+        "exclude_keywords": list(tmpl.get("exclude_keywords", [])),
+        "exclude_in": tmpl.get("exclude_in", "both"),
+        "work_formats": list(tmpl.get("work_formats", [])),
+        "employment_types": list(tmpl.get("employment_types", [])),
+        "only_with_salary": bool(tmpl.get("only_with_salary", False)),
+        "salary_min": int(tmpl.get("salary_min", 0) or 0),
+        "excluded_employers": list(tmpl.get("excluded_employers", [])),
+        "sort": tmpl.get("sort", "publication_time"),
+        "period_days": int(tmpl.get("period_days", 1) or 1),
+        "max_pages": int(tmpl.get("max_pages", 5) or 5),
+        "max_results": int(tmpl.get("max_results", 50) or 50),
+        "delivery_page_size": int(tmpl.get("delivery_page_size", 5) or 5),
+        "interval": int(tmpl.get("interval", 30) or 30),
+        "summary_html": _format_template_summary(tmpl, detailed=True),
+    }
+
+
+def _web_options_payload():
+    return {
+        "search_fields": _option_list(SEARCH_FIELD_OPTIONS),
+        "experience": _option_list(EXPERIENCE_OPTIONS),
+        "work_formats": _option_list(get_work_format_options()),
+        "employment_types": _option_list(get_employment_options()),
+        "sort": _option_list(SORT_OPTIONS),
+        "period_days": _option_list(PERIOD_OPTIONS),
+        "max_pages": _option_list(MAX_PAGES_OPTIONS),
+        "max_results": _option_list(MAX_RESULTS_OPTIONS),
+        "page_size": _option_list(PAGE_SIZE_OPTIONS),
+        "interval": _option_list(INTERVAL_OPTIONS),
+        "popular_areas": list(POPULAR_AREA_NAMES),
+    }
+
+
+def _upsert_template(data, template, activate=False):
+    normalized = _normalize_template(template)
+    templates = data.setdefault("templates", [])
+    replaced = False
+    for index, item in enumerate(templates):
+        if str(item.get("id")) == normalized["id"]:
+            templates[index] = normalized
+            replaced = True
+            break
+    if not replaced:
+        templates.append(normalized)
+    data.setdefault("sent_ids_by_template", {}).setdefault(normalized["id"], [])
+    if activate:
+        data["active_template_id"] = normalized["id"]
+    return normalized
+
+
+def _build_template_from_payload(payload):
+    payload = dict(payload or {})
+    warnings = []
+
+    search_fields_allowed = set(SEARCH_FIELD_OPTIONS.keys())
+    experience_allowed = set(EXPERIENCE_OPTIONS.keys())
+    work_formats_allowed = set(get_work_format_options().keys())
+    employment_allowed = set(get_employment_options().keys())
+
+    queries = _split_text_values(payload.get("queries")) or DEFAULT_QUERIES[:]
+    search_fields = [item for item in _unique_list(payload.get("search_fields", [])) if item in search_fields_allowed]
+    if not search_fields:
+        search_fields = ["name", "company_name", "description"]
+
+    experience = [item for item in _unique_list(payload.get("experience", [])) if item in experience_allowed]
+    if ANY_EXPERIENCE in experience or not experience:
+        experience = [ANY_EXPERIENCE]
+
+    included_area_names = _split_text_values(payload.get("included_area_names"))
+    included_area_ids, included_area_names, not_found_include = _resolve_area_names(included_area_names)
+    if not_found_include:
+        warnings.append(f"Не распознаны регионы для включения: {', '.join(not_found_include)}")
+
+    excluded_area_names = _split_text_values(payload.get("excluded_area_names"))
+    excluded_area_ids, excluded_area_names, not_found_exclude = _resolve_area_names(excluded_area_names)
+    if not_found_exclude:
+        warnings.append(f"Не распознаны регионы для исключения: {', '.join(not_found_exclude)}")
+
+    work_formats = [item for item in _unique_list(payload.get("work_formats", [])) if item in work_formats_allowed]
+    employment_types = [item for item in _unique_list(payload.get("employment_types", [])) if item in employment_allowed]
+
+    sort_code = str(payload.get("sort") or "publication_time")
+    if sort_code not in SORT_OPTIONS:
+        sort_code = "publication_time"
+
+    include_in = str(payload.get("include_in") or "both")
+    if include_in not in {"title", "description", "both"}:
+        include_in = "both"
+
+    exclude_in = str(payload.get("exclude_in") or "both")
+    if exclude_in not in {"title", "description", "both"}:
+        exclude_in = "both"
+
+    template = {
+        "id": str(payload.get("id") or str(uuid.uuid4())[:8]),
+        "name": str(payload.get("name") or "Новый поиск").strip()[:50] or "Новый поиск",
+        "queries": queries,
+        "search_fields": search_fields,
+        "experience": experience,
+        "included_area_ids": included_area_ids,
+        "included_area_names": included_area_names,
+        "excluded_area_ids": excluded_area_ids,
+        "excluded_area_names": excluded_area_names,
+        "include_keywords": [item.lower() for item in _split_text_values(payload.get("include_keywords"))],
+        "include_in": include_in,
+        "exclude_keywords": [item.lower() for item in _split_text_values(payload.get("exclude_keywords"))],
+        "exclude_in": exclude_in,
+        "work_formats": work_formats,
+        "employment_types": employment_types,
+        "only_with_salary": _coerce_bool(payload.get("only_with_salary")),
+        "salary_min": _coerce_int(payload.get("salary_min"), default=0, min_value=0),
+        "excluded_employers": [item.lower() for item in _split_text_values(payload.get("excluded_employers"))],
+        "sort": sort_code,
+        "period_days": _coerce_int(payload.get("period_days"), default=1, min_value=1, max_value=30),
+        "max_pages": _coerce_int(payload.get("max_pages"), default=5, min_value=1, max_value=20),
+        "max_results": _coerce_int(payload.get("max_results"), default=50, min_value=1, max_value=500),
+        "delivery_page_size": _coerce_int(payload.get("delivery_page_size"), default=5, min_value=1, max_value=50),
+        "interval": _coerce_int(payload.get("interval"), default=30, min_value=5, max_value=1440),
+    }
+
+    return _normalize_template(template), warnings
+
+
+def _build_web_state(data=None):
+    data = load_data() if data is None else _normalize_data(data)
+    active = _active_template(data)
+    return {
+        "status": _build_runtime_status(data),
+        "searching": bool(data.get("searching", False)),
+        "active_template_id": data.get("active_template_id"),
+        "templates": [_template_to_web_payload(item) for item in data.get("templates", [])],
+        "active_template": _template_to_web_payload(active) if active else None,
+        "new_template": _template_to_web_payload(_new_draft()),
+        "options": _web_options_payload(),
+    }
+
+
 # ═══════════════════════════════════════════════════════════
 #  TELEGRAM API
 # ═══════════════════════════════════════════════════════════
@@ -1990,7 +2199,7 @@ def _active_template(data):
         return None
     return next((t for t in data.get("templates", []) if t["id"] == aid), None)
 
-def _run_search(chat_id, data, tmpl, persist=True):
+def _execute_search_result(data, tmpl, persist=True):
     result = fetch_vacancies(tmpl)
     fetched_vacancies = result.get("vacancies", [])
     fetch_errors = result.get("errors", [])
@@ -2006,14 +2215,24 @@ def _run_search(chat_id, data, tmpl, persist=True):
             visible_vacancies.append(vacancy)
             sent_set.add(vacancy_id)
             sent_ids.append(vacancy_id)
+        data["last_check"] = time.time()
+        _set_template_sent_ids(data, tmpl["id"], sent_ids)
+        save_data(data)
     else:
         visible_vacancies = list(fetched_vacancies)
 
-    if persist:
-        data["last_check"] = time.time()
-        _set_template_sent_ids(data, tmpl["id"], sent_ids)
+    return {
+        "fetched_vacancies": fetched_vacancies,
+        "visible_vacancies": visible_vacancies,
+        "errors": fetch_errors,
+    }
 
-    save_data(data)
+
+def _run_search(chat_id, data, tmpl, persist=True):
+    result = _execute_search_result(data, tmpl, persist=persist)
+    fetched_vacancies = result["fetched_vacancies"]
+    visible_vacancies = result["visible_vacancies"]
+    fetch_errors = result["errors"]
 
     if not visible_vacancies:
         reason_lines = []
@@ -2057,8 +2276,8 @@ def _run_search(chat_id, data, tmpl, persist=True):
     }
 
 
-def _build_runtime_status():
-    data = load_data()
+def _build_runtime_status(data=None):
+    data = load_data() if data is None else _normalize_data(data)
     tmpl = _active_template(data)
     return {
         "service": "hh-vacancy-bot",
@@ -2739,21 +2958,1255 @@ def _cron_request_authorized(auth_header="", query_secret=""):
     return False
 
 
+def _web_request_authorized(request):
+    if not WEB_ADMIN_TOKEN:
+        return True
+    header_token = (request.headers.get("x-admin-token") or "").strip()
+    auth_header = (request.headers.get("authorization") or "").strip()
+    query_token = (request.query_params.get("token") or "").strip()
+    if header_token == WEB_ADMIN_TOKEN:
+        return True
+    if auth_header == f"Bearer {WEB_ADMIN_TOKEN}":
+        return True
+    if query_token == WEB_ADMIN_TOKEN:
+        return True
+    return False
+
+
+def _web_search_response(data, tmpl, persist):
+    result = _execute_search_result(data, tmpl, persist=persist)
+    fetched_vacancies = result["fetched_vacancies"]
+    visible_vacancies = result["visible_vacancies"]
+    fetch_errors = result["errors"]
+
+    if not visible_vacancies:
+        if fetched_vacancies and persist:
+            reason = "По фильтрам вакансии есть, но они уже были отправлены раньше."
+        else:
+            reason = "По текущим фильтрам ничего не найдено."
+    else:
+        reason = ""
+
+    return {
+        "template_id": tmpl["id"],
+        "template_name": tmpl["name"],
+        "persist": bool(persist),
+        "total_found": len(fetched_vacancies),
+        "shown_count": len(visible_vacancies),
+        "page_size": int(tmpl.get("delivery_page_size", 5) or 5),
+        "reason": reason,
+        "errors": list(fetch_errors or []),
+        "vacancies": [_vacancy_to_web_item(vacancy) for vacancy in visible_vacancies],
+    }
+
+
+def _web_ui_html():
+    token_required = "true" if WEB_ADMIN_TOKEN else "false"
+    return '''<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HH Vacancy Bot</title>
+  <style>
+    :root {
+      --bg: #f5f1e8;
+      --panel: #fffdf8;
+      --panel-2: #f3ede0;
+      --line: #d8ceb9;
+      --text: #27211b;
+      --muted: #6b6257;
+      --accent: #275dad;
+      --accent-2: #d97342;
+      --good: #2e7d32;
+      --warn: #b26a00;
+      --bad: #b42318;
+      --shadow: 0 18px 40px rgba(39, 33, 27, 0.08);
+      --radius: 18px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at top left, rgba(217, 115, 66, 0.12), transparent 28%),
+        radial-gradient(circle at top right, rgba(39, 93, 173, 0.10), transparent 26%),
+        linear-gradient(180deg, #f7f2ea 0%, #efe7d8 100%);
+      color: var(--text);
+      font: 15px/1.45 "Segoe UI", "Helvetica Neue", sans-serif;
+    }
+    .page {
+      max-width: 1480px;
+      margin: 0 auto;
+      padding: 24px 18px 40px;
+    }
+    .hero {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.7fr);
+      margin-bottom: 18px;
+    }
+    .hero-card, .panel {
+      background: rgba(255, 253, 248, 0.92);
+      border: 1px solid rgba(216, 206, 185, 0.88);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(8px);
+    }
+    .hero-card {
+      padding: 22px;
+    }
+    .hero h1 {
+      margin: 0 0 8px;
+      font-size: 34px;
+      line-height: 1.05;
+      letter-spacing: -0.03em;
+    }
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      max-width: 760px;
+    }
+    .status-board {
+      display: grid;
+      gap: 12px;
+    }
+    .status-lines {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      font-size: 14px;
+    }
+    .status-item {
+      background: var(--panel-2);
+      border-radius: 14px;
+      padding: 12px 14px;
+      min-height: 72px;
+    }
+    .status-item strong {
+      display: block;
+      font-size: 12px;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 6px;
+      letter-spacing: 0.05em;
+    }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .layout {
+      display: grid;
+      gap: 18px;
+      grid-template-columns: 330px minmax(0, 1fr);
+      align-items: start;
+    }
+    .panel {
+      padding: 18px;
+    }
+    .panel h2 {
+      margin: 0 0 14px;
+      font-size: 18px;
+      letter-spacing: -0.02em;
+    }
+    .panel h3 {
+      margin: 0 0 10px;
+      font-size: 15px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .stack {
+      display: grid;
+      gap: 18px;
+    }
+    .grid-2 {
+      display: grid;
+      gap: 14px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .grid-3 {
+      display: grid;
+      gap: 14px;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    label.field {
+      display: grid;
+      gap: 7px;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .field small {
+      color: var(--muted);
+      font-weight: 400;
+    }
+    input[type="text"],
+    input[type="number"],
+    textarea,
+    select {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+      padding: 11px 12px;
+      color: var(--text);
+      font: inherit;
+    }
+    textarea {
+      min-height: 96px;
+      resize: vertical;
+    }
+    select[multiple] {
+      min-height: 128px;
+    }
+    .check-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .check-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #fff;
+      color: var(--text);
+      font-weight: 500;
+    }
+    .field-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    button {
+      border: 0;
+      border-radius: 12px;
+      background: #e6ddcd;
+      color: var(--text);
+      padding: 11px 14px;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.12s ease, background 0.12s ease, opacity 0.12s ease;
+    }
+    button:hover { transform: translateY(-1px); }
+    button.primary { background: var(--accent); color: #fff; }
+    button.secondary { background: var(--accent-2); color: #fff; }
+    button.ghost { background: transparent; border: 1px solid var(--line); }
+    button.danger { background: #f8d8d3; color: #7a1f16; }
+    button.success { background: #d7eed7; color: #1d5e20; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    .template-list {
+      display: grid;
+      gap: 10px;
+    }
+    .template-card {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #fff;
+      padding: 14px;
+      display: grid;
+      gap: 10px;
+    }
+    .template-card.active {
+      border-color: var(--accent);
+      box-shadow: inset 0 0 0 1px rgba(39, 93, 173, 0.2);
+    }
+    .template-card h4 {
+      margin: 0;
+      font-size: 16px;
+    }
+    .template-meta {
+      color: var(--muted);
+      font-size: 13px;
+      white-space: pre-line;
+      word-break: break-word;
+    }
+    .message {
+      display: none;
+      padding: 12px 14px;
+      border-radius: 14px;
+      font-weight: 600;
+      white-space: pre-line;
+      word-break: break-word;
+    }
+    .message.info { display: block; background: #e6effc; color: #214d8e; }
+    .message.success { display: block; background: #dbf0dc; color: #1c5d22; }
+    .message.error { display: block; background: #f8d8d3; color: #7a1f16; }
+    .hint {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .results-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .results-list {
+      display: grid;
+      gap: 12px;
+      margin-top: 14px;
+    }
+    .result-card {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 14px;
+      background: #fff;
+      display: grid;
+      gap: 7px;
+    }
+    .result-card h4 {
+      margin: 0;
+      font-size: 17px;
+    }
+    .result-meta {
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .pager {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      margin-top: 16px;
+    }
+    .token-box {
+      display: none;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px dashed var(--line);
+    }
+    .token-box.visible {
+      display: flex;
+    }
+    .summary-box {
+      background: var(--panel-2);
+      border-radius: 14px;
+      padding: 14px;
+      font-size: 14px;
+      white-space: pre-line;
+      word-break: break-word;
+    }
+    @media (max-width: 1180px) {
+      .layout { grid-template-columns: 1fr; }
+      .hero { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 780px) {
+      .grid-2, .grid-3, .status-lines { grid-template-columns: 1fr; }
+      .page { padding: 16px 12px 28px; }
+      .hero h1 { font-size: 28px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <section class="hero">
+      <div class="hero-card">
+        <h1>Панель управления HH Vacancy Bot</h1>
+        <p>
+          Здесь можно полностью управлять поисками вакансий без Telegram:
+          создавать, редактировать, удалять, сохранять, выбирать текущий поиск,
+          запускать поиск вручную, смотреть предпросмотр и включать или ставить на паузу автопоиск.
+        </p>
+        <div id="tokenBox" class="token-box">
+          <input id="authToken" type="text" placeholder="Токен доступа для панели">
+          <button id="saveTokenBtn" class="primary" type="button">Сохранить токен</button>
+          <span class="hint">Нужен только если на сервере задан HH_WEB_ADMIN_TOKEN.</span>
+        </div>
+      </div>
+      <div class="hero-card status-board">
+        <div class="status-lines">
+          <div class="status-item"><strong>Статус</strong><div id="statusSearch">Загрузка...</div></div>
+          <div class="status-item"><strong>Текущий поиск</strong><div id="statusTemplate">Загрузка...</div></div>
+          <div class="status-item"><strong>Telegram чат</strong><div id="statusChat">Загрузка...</div></div>
+          <div class="status-item"><strong>Последняя проверка</strong><div id="statusLastCheck">Загрузка...</div></div>
+        </div>
+        <div class="toolbar">
+          <button id="refreshBtn" class="ghost" type="button">Обновить</button>
+          <button id="toggleBtn" class="secondary" type="button">Пауза</button>
+          <button id="runBtn" class="primary" type="button">Поиск сейчас</button>
+          <button id="previewBtn" class="ghost" type="button">Предпросмотр</button>
+        </div>
+      </div>
+    </section>
+
+    <div id="messageBox" class="message"></div>
+
+    <section class="layout">
+      <aside class="panel">
+        <div class="field-row" style="justify-content: space-between; margin-bottom: 14px;">
+          <h2 style="margin:0;">Мои поиски</h2>
+          <button id="newSearchBtn" class="primary" type="button">Новый поиск</button>
+        </div>
+        <div id="templateList" class="template-list"></div>
+      </aside>
+
+      <div class="stack">
+        <section class="panel">
+          <h2>Основное</h2>
+          <div class="grid-2">
+            <label class="field">
+              Название поиска
+              <input id="name" type="text" maxlength="50" placeholder="Например: Product/Data Analyst">
+            </label>
+            <label class="field">
+              Где искать слова
+              <select id="searchFields" multiple></select>
+              <small>Можно выбрать сразу несколько полей.</small>
+            </label>
+          </div>
+          <label class="field" style="margin-top: 14px;">
+            Названия вакансий и синонимы
+            <textarea id="queries" placeholder="По одному на строке или через запятую"></textarea>
+          </label>
+          <div class="field" style="margin-top: 14px;">
+            Опыт работы
+            <div id="experienceGroup" class="check-grid"></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>География</h2>
+          <div class="grid-2">
+            <label class="field">
+              Включить страны и города
+              <textarea id="includedAreas" placeholder="Например: Грузия, Казахстан, Тбилиси"></textarea>
+              <small>Если поле пустое, поиск идёт по всем регионам.</small>
+            </label>
+            <label class="field">
+              Исключить страны и города
+              <textarea id="excludedAreas" placeholder="Например: Россия, Москва"></textarea>
+              <small>Исключение страны автоматически исключает и её города.</small>
+            </label>
+          </div>
+          <div class="summary-box" id="areaHint"></div>
+        </section>
+
+        <section class="panel">
+          <h2>Слова и исключения</h2>
+          <div class="grid-2">
+            <label class="field">
+              Включающие слова
+              <textarea id="includeKeywords" placeholder="Например: sql, product, retention"></textarea>
+            </label>
+            <label class="field">
+              Исключающие слова
+              <textarea id="excludeKeywords" placeholder="Например: casino, betting, sportsbook"></textarea>
+            </label>
+          </div>
+          <div class="grid-3" style="margin-top: 14px;">
+            <label class="field">
+              Где искать включающие слова
+              <select id="includeIn">
+                <option value="both">И в названии, и в описании</option>
+                <option value="title">Только в названии</option>
+                <option value="description">Только в описании</option>
+              </select>
+            </label>
+            <label class="field">
+              Где применять исключения
+              <select id="excludeIn">
+                <option value="both">И в названии, и в описании</option>
+                <option value="title">Только в названии</option>
+                <option value="description">Только в описании</option>
+              </select>
+            </label>
+            <label class="field">
+              Исключить работодателей
+              <textarea id="excludedEmployers" placeholder="Например: lenkep recruitment"></textarea>
+            </label>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Формат работы и зарплата</h2>
+          <div class="field">
+            Формат работы
+            <div id="workFormatsGroup" class="check-grid"></div>
+          </div>
+          <div class="field" style="margin-top: 14px;">
+            Тип занятости
+            <div id="employmentGroup" class="check-grid"></div>
+          </div>
+          <div class="grid-3" style="margin-top: 14px;">
+            <label class="field">
+              Минимальная зарплата
+              <input id="salaryMin" type="number" min="0" step="1000" placeholder="0">
+            </label>
+            <label class="field" style="justify-content: end;">
+              Только вакансии с зарплатой
+              <span class="check-pill" style="margin-top: 7px;">
+                <input id="onlyWithSalary" type="checkbox">
+                Показывать только вакансии с указанной зарплатой
+              </span>
+            </label>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Выдача и расписание</h2>
+          <div class="grid-3">
+            <label class="field">
+              Сортировка
+              <select id="sort"></select>
+            </label>
+            <label class="field">
+              Период поиска
+              <select id="periodDays"></select>
+            </label>
+            <label class="field">
+              Страниц на один запрос
+              <input id="maxPages" type="number" min="1" max="20">
+            </label>
+            <label class="field">
+              Лимит результатов
+              <input id="maxResults" type="number" min="1" max="500">
+            </label>
+            <label class="field">
+              В одной странице выдачи
+              <input id="deliveryPageSize" type="number" min="1" max="50">
+            </label>
+            <label class="field">
+              Интервал автопоиска, минут
+              <input id="interval" type="number" min="5" max="1440">
+            </label>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Действия</h2>
+          <div class="actions">
+            <button id="saveBtn" class="primary" type="button">Сохранить</button>
+            <button id="saveActivateBtn" class="secondary" type="button">Сохранить и сделать текущим</button>
+            <button id="activateBtn" class="ghost" type="button">Сделать текущим</button>
+            <button id="resetSentBtn" class="ghost" type="button">Сбросить историю отправок</button>
+            <button id="deleteBtn" class="danger" type="button">Удалить</button>
+          </div>
+          <div id="currentSummary" class="summary-box" style="margin-top: 14px;"></div>
+        </section>
+
+        <section class="panel">
+          <div class="results-head">
+            <div>
+              <h2 style="margin-bottom: 6px;">Результаты</h2>
+              <div id="resultsMeta" class="hint">Запустите поиск или предпросмотр.</div>
+            </div>
+            <div class="actions">
+              <button id="resultsPrev" class="ghost" type="button">Назад</button>
+              <button id="resultsNext" class="ghost" type="button">Далее</button>
+            </div>
+          </div>
+          <div id="resultsList" class="results-list"></div>
+          <div class="pager">
+            <span id="resultsPage" class="hint"></span>
+          </div>
+        </section>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const TOKEN_REQUIRED = __TOKEN_REQUIRED__;
+    const state = {
+      data: null,
+      selectedTemplateId: '',
+      result: null,
+      resultPage: 0,
+      authToken: localStorage.getItem('hh_web_admin_token') || '',
+    };
+
+    const els = {};
+
+    function qs(id) {
+      return document.getElementById(id);
+    }
+
+    function splitValues(value) {
+      return String(value || '')
+        .split(/[\n,;]+/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+    }
+
+    function escapeHtml(value) {
+      return String(value || '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function formatDate(ts) {
+      if (!ts) {
+        return 'ещё не запускался';
+      }
+      const date = new Date(Number(ts) * 1000);
+      if (Number.isNaN(date.getTime())) {
+        return 'ещё не запускался';
+      }
+      return date.toLocaleString('ru-RU');
+    }
+
+    function showMessage(text, type) {
+      const box = els.messageBox;
+      if (!text) {
+        box.className = 'message';
+        box.textContent = '';
+        return;
+      }
+      box.className = 'message ' + (type || 'info');
+      box.textContent = text;
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
+    async function api(path, options = {}) {
+      const headers = Object.assign({}, options.headers || {});
+      if (state.authToken) {
+        headers['x-admin-token'] = state.authToken;
+      }
+      if (options.body && !headers['Content-Type']) {
+        headers['Content-Type'] = 'application/json';
+      }
+      const response = await fetch(path, Object.assign({}, options, { headers }));
+      let payload = {};
+      try {
+        payload = await response.json();
+      } catch (error) {
+        payload = {};
+      }
+      if (!response.ok || payload.ok === false) {
+        const message = payload.error || ('HTTP ' + response.status);
+        throw new Error(message);
+      }
+      return payload;
+    }
+
+    function renderSelect(selectEl, items, selectedValue) {
+      selectEl.innerHTML = items.map((item) => {
+        const selected = String(item.id) === String(selectedValue) ? ' selected' : '';
+        return '<option value="' + escapeHtml(item.id) + '"' + selected + '>' + escapeHtml(item.label) + '</option>';
+      }).join('');
+    }
+
+    function renderMultiSelect(selectEl, items, selectedValues) {
+      const selectedSet = new Set((selectedValues || []).map(String));
+      selectEl.innerHTML = items.map((item) => {
+        const selected = selectedSet.has(String(item.id)) ? ' selected' : '';
+        return '<option value="' + escapeHtml(item.id) + '"' + selected + '>' + escapeHtml(item.label) + '</option>';
+      }).join('');
+    }
+
+    function renderCheckGroup(container, items, selectedValues) {
+      const selected = new Set((selectedValues || []).map(String));
+      container.innerHTML = items.map((item) => {
+        const checked = selected.has(String(item.id)) ? ' checked' : '';
+        return (
+          '<label class="check-pill">' +
+            '<input type="checkbox" value="' + escapeHtml(item.id) + '"' + checked + '>' +
+            '<span>' + escapeHtml(item.label) + '</span>' +
+          '</label>'
+        );
+      }).join('');
+    }
+
+    function readCheckedValues(container) {
+      return Array.from(container.querySelectorAll('input[type="checkbox"]:checked')).map((input) => input.value);
+    }
+
+    function currentTemplates() {
+      return (state.data && state.data.templates) || [];
+    }
+
+    function getSelectedTemplate() {
+      return currentTemplates().find((item) => item.id === state.selectedTemplateId) || null;
+    }
+
+    function renderStatus() {
+      const status = state.data.status;
+      els.statusSearch.textContent = status.searching ? 'Автопоиск включён' : 'Автопоиск на паузе';
+      els.statusTemplate.textContent = status.active_template_name || 'не выбран';
+      els.statusChat.textContent = status.chat_configured ? 'Подключён' : 'Telegram ещё не писал боту';
+      els.statusLastCheck.textContent = formatDate(status.last_check);
+      els.toggleBtn.textContent = status.searching ? 'Пауза' : 'Включить';
+      els.areaHint.textContent = 'Подсказка: популярные регионы для быстрого ввода — ' + state.data.options.popular_areas.join(', ');
+    }
+
+    function renderTemplateList() {
+      const templates = currentTemplates();
+      if (!templates.length) {
+        els.templateList.innerHTML = '<div class="hint">Сохранённых поисков пока нет.</div>';
+        return;
+      }
+      els.templateList.innerHTML = templates.map((template) => {
+        const isActive = template.id === state.data.active_template_id;
+        const isSelected = template.id === state.selectedTemplateId;
+        const classes = ['template-card'];
+        if (isActive || isSelected) {
+          classes.push('active');
+        }
+        const meta = [
+          'Запросов: ' + template.queries.length,
+          'Интервал: ' + template.interval + ' мин',
+          'Страниц: ' + template.max_pages,
+          'В выдаче: ' + template.delivery_page_size
+        ].join('\\n');
+        return (
+          '<div class="' + classes.join(' ') + '">' +
+            '<div>' +
+              '<h4>' + escapeHtml(template.name) + '</h4>' +
+              '<div class="template-meta">' + escapeHtml(meta) + '</div>' +
+            '</div>' +
+            '<div class="actions">' +
+              '<button class="ghost" type="button" onclick="selectTemplate(\\'' + template.id + '\\')">Открыть</button>' +
+              '<button class="ghost" type="button" onclick="activateTemplate(\\'' + template.id + '\\')">' + (isActive ? 'Текущий' : 'Сделать текущим') + '</button>' +
+              '<button class="danger" type="button" onclick="deleteTemplate(\\'' + template.id + '\\')">Удалить</button>' +
+            '</div>' +
+          '</div>'
+        );
+      }).join('');
+    }
+
+    function fillForm(template) {
+      const options = state.data.options;
+      const current = template || state.data.new_template;
+      state.selectedTemplateId = current.id || '';
+
+      els.name.value = current.name || '';
+      els.queries.value = (current.queries || []).join('\\n');
+      renderMultiSelect(els.searchFields, options.search_fields, current.search_fields || []);
+      renderCheckGroup(els.experienceGroup, options.experience, current.experience || []);
+      els.includedAreas.value = (current.included_area_names || []).join('\\n');
+      els.excludedAreas.value = (current.excluded_area_names || []).join('\\n');
+      els.includeKeywords.value = (current.include_keywords || []).join('\\n');
+      els.excludeKeywords.value = (current.exclude_keywords || []).join('\\n');
+      els.includeIn.value = current.include_in || 'both';
+      els.excludeIn.value = current.exclude_in || 'both';
+      els.excludedEmployers.value = (current.excluded_employers || []).join('\\n');
+      renderCheckGroup(els.workFormatsGroup, options.work_formats, current.work_formats || []);
+      renderCheckGroup(els.employmentGroup, options.employment_types, current.employment_types || []);
+      els.onlyWithSalary.checked = !!current.only_with_salary;
+      els.salaryMin.value = current.salary_min || 0;
+      renderSelect(els.sort, options.sort, current.sort || 'publication_time');
+      renderSelect(els.periodDays, options.period_days, current.period_days || 1);
+      els.maxPages.value = current.max_pages || 5;
+      els.maxResults.value = current.max_results || 50;
+      els.deliveryPageSize.value = current.delivery_page_size || 5;
+      els.interval.value = current.interval || 30;
+      els.currentSummary.innerHTML = current.summary_html || '';
+    }
+
+    function gatherForm() {
+      return {
+        id: state.selectedTemplateId || '',
+        name: els.name.value.trim(),
+        queries: splitValues(els.queries.value),
+        search_fields: Array.from(els.searchFields.selectedOptions).map((option) => option.value),
+        experience: readCheckedValues(els.experienceGroup),
+        included_area_names: splitValues(els.includedAreas.value),
+        excluded_area_names: splitValues(els.excludedAreas.value),
+        include_keywords: splitValues(els.includeKeywords.value),
+        include_in: els.includeIn.value,
+        exclude_keywords: splitValues(els.excludeKeywords.value),
+        exclude_in: els.excludeIn.value,
+        work_formats: readCheckedValues(els.workFormatsGroup),
+        employment_types: readCheckedValues(els.employmentGroup),
+        only_with_salary: els.onlyWithSalary.checked,
+        salary_min: els.salaryMin.value,
+        excluded_employers: splitValues(els.excludedEmployers.value),
+        sort: els.sort.value,
+        period_days: els.periodDays.value,
+        max_pages: els.maxPages.value,
+        max_results: els.maxResults.value,
+        delivery_page_size: els.deliveryPageSize.value,
+        interval: els.interval.value
+      };
+    }
+
+    function renderResults() {
+      const result = state.result;
+      if (!result) {
+        els.resultsMeta.textContent = 'Запустите поиск или предпросмотр.';
+        els.resultsList.innerHTML = '';
+        els.resultsPage.textContent = '';
+        els.resultsPrev.disabled = true;
+        els.resultsNext.disabled = true;
+        return;
+      }
+
+      const pageSize = Math.max(1, Number(result.page_size || 5));
+      const vacancies = result.vacancies || [];
+      const pageCount = Math.max(1, Math.ceil(vacancies.length / pageSize));
+      if (state.resultPage >= pageCount) {
+        state.resultPage = pageCount - 1;
+      }
+      if (state.resultPage < 0) {
+        state.resultPage = 0;
+      }
+      const start = state.resultPage * pageSize;
+      const pageItems = vacancies.slice(start, start + pageSize);
+      const parts = [
+        (result.persist ? 'Поиск' : 'Предпросмотр') + ': ' + result.template_name,
+        'Показано: ' + result.shown_count,
+        'Всего найдено: ' + result.total_found
+      ];
+      if (result.reason) {
+        parts.push(result.reason);
+      }
+      if (result.errors && result.errors.length) {
+        parts.push('Ошибки: ' + result.errors.slice(0, 2).join('; '));
+      }
+      els.resultsMeta.textContent = parts.join(' · ');
+
+      if (!pageItems.length) {
+        els.resultsList.innerHTML = '<div class="hint">Нет вакансий для отображения.</div>';
+      } else {
+        els.resultsList.innerHTML = pageItems.map((vacancy, index) => {
+          const number = start + index + 1;
+          const meta = [
+            vacancy.employer,
+            vacancy.area
+          ].filter(Boolean).join(' · ');
+          const extra = [
+            vacancy.experience ? 'Опыт: ' + vacancy.experience : '',
+            vacancy.salary ? 'Зарплата: ' + vacancy.salary : '',
+            vacancy.work_formats && vacancy.work_formats.length ? 'Формат: ' + vacancy.work_formats.join(', ') : '',
+            vacancy.schedule ? 'График: ' + vacancy.schedule : ''
+          ].filter(Boolean).join(' · ');
+          return (
+            '<article class="result-card">' +
+              '<h4>' + number + '. ' + escapeHtml(vacancy.name) + '</h4>' +
+              '<div class="result-meta">' + escapeHtml(meta) + '</div>' +
+              '<div class="result-meta">' + escapeHtml(extra) + '</div>' +
+              (vacancy.snippet ? '<div>' + escapeHtml(vacancy.snippet) + '</div>' : '') +
+              (vacancy.url ? '<div><a href="' + escapeHtml(vacancy.url) + '" target="_blank" rel="noreferrer">Открыть вакансию на hh.ru</a></div>' : '') +
+            '</article>'
+          );
+        }).join('');
+      }
+
+      els.resultsPage.textContent = 'Страница ' + (state.resultPage + 1) + ' из ' + pageCount;
+      els.resultsPrev.disabled = state.resultPage <= 0;
+      els.resultsNext.disabled = state.resultPage >= pageCount - 1;
+    }
+
+    function renderAll() {
+      renderStatus();
+      renderTemplateList();
+      fillForm(getSelectedTemplate() || state.data.active_template || state.data.new_template);
+      renderResults();
+    }
+
+    async function loadState(preferredTemplateId) {
+      const payload = await api('/api/web/state');
+      state.data = payload.state;
+      const templateIds = new Set(currentTemplates().map((item) => item.id));
+      if (preferredTemplateId && templateIds.has(preferredTemplateId)) {
+        state.selectedTemplateId = preferredTemplateId;
+      } else if (state.selectedTemplateId && templateIds.has(state.selectedTemplateId)) {
+        // keep current selection
+      } else if (state.data.active_template) {
+        state.selectedTemplateId = state.data.active_template.id;
+      } else if (currentTemplates()[0]) {
+        state.selectedTemplateId = currentTemplates()[0].id;
+      } else {
+        state.selectedTemplateId = state.data.new_template.id;
+      }
+      renderAll();
+    }
+
+    async function saveTemplate(activate) {
+      const payload = await api('/api/web/template/save', {
+        method: 'POST',
+        body: JSON.stringify({
+          template: gatherForm(),
+          activate: !!activate
+        })
+      });
+      state.result = null;
+      state.resultPage = 0;
+      await loadState(payload.template.id);
+      const messages = [];
+      if (payload.warnings && payload.warnings.length) {
+        messages.push(payload.warnings.join('\\n'));
+      }
+      messages.unshift('Поиск сохранён.');
+      showMessage(messages.join('\\n'), payload.warnings && payload.warnings.length ? 'info' : 'success');
+    }
+
+    async function activateTemplate(id) {
+      const targetId = id || state.selectedTemplateId;
+      if (!targetId) {
+        showMessage('Сначала сохраните поиск.', 'error');
+        return;
+      }
+      await api('/api/web/template/' + targetId + '/activate', { method: 'POST' });
+      state.result = null;
+      state.resultPage = 0;
+      await loadState(targetId);
+      showMessage('Текущий поиск обновлён.', 'success');
+    }
+
+    async function deleteTemplate(id) {
+      const targetId = id || state.selectedTemplateId;
+      if (!targetId) {
+        showMessage('Нет выбранного поиска для удаления.', 'error');
+        return;
+      }
+      if (!window.confirm('Удалить этот поиск?')) {
+        return;
+      }
+      await api('/api/web/template/' + targetId, { method: 'DELETE' });
+      state.result = null;
+      state.resultPage = 0;
+      await loadState();
+      showMessage('Поиск удалён.', 'success');
+    }
+
+    async function resetSent() {
+      const targetId = state.selectedTemplateId;
+      if (!targetId) {
+        showMessage('Сначала сохраните или выберите поиск.', 'error');
+        return;
+      }
+      await api('/api/web/template/' + targetId + '/reset-sent', { method: 'POST' });
+      await loadState(targetId);
+      showMessage('История отправок очищена.', 'success');
+    }
+
+    async function toggleSearching() {
+      const nextStatus = !state.data.status.searching;
+      await api('/api/web/searching', {
+        method: 'POST',
+        body: JSON.stringify({ searching: nextStatus })
+      });
+      await loadState(state.selectedTemplateId);
+      showMessage(nextStatus ? 'Автопоиск включён.' : 'Автопоиск поставлен на паузу.', 'success');
+    }
+
+    async function runSearch(persist) {
+      const form = gatherForm();
+      if (persist && !form.id) {
+        showMessage('Сначала сохраните поиск, потом запускайте обычный режим.', 'error');
+        return;
+      }
+      const path = persist ? '/api/web/search/run' : '/api/web/search/preview';
+      const payload = await api(path, {
+        method: 'POST',
+        body: JSON.stringify({
+          template_id: form.id || '',
+          template: persist ? null : form
+        })
+      });
+      state.result = payload.result;
+      state.resultPage = 0;
+      state.data = payload.state;
+      if (payload.template && payload.template.id) {
+        state.selectedTemplateId = payload.template.id;
+      }
+      renderAll();
+      if (payload.result.reason) {
+        showMessage(payload.result.reason, payload.result.errors && payload.result.errors.length ? 'error' : 'info');
+      } else {
+        showMessage((persist ? 'Поиск' : 'Предпросмотр') + ' завершён. Найдено к показу: ' + payload.result.shown_count, 'success');
+      }
+    }
+
+    function selectTemplate(id) {
+      state.result = null;
+      state.resultPage = 0;
+      state.selectedTemplateId = id;
+      renderAll();
+      showMessage('', 'info');
+    }
+
+    function createNewTemplate() {
+      state.result = null;
+      state.resultPage = 0;
+      state.selectedTemplateId = state.data.new_template.id;
+      fillForm(state.data.new_template);
+      renderTemplateList();
+      renderResults();
+      showMessage('Форма очищена. Заполните поля и сохраните новый поиск.', 'info');
+    }
+
+    function bindEvents() {
+      els.refreshBtn.addEventListener('click', () => loadState(state.selectedTemplateId).then(() => showMessage('Данные обновлены.', 'success')).catch((error) => showMessage(error.message, 'error')));
+      els.toggleBtn.addEventListener('click', () => toggleSearching().catch((error) => showMessage(error.message, 'error')));
+      els.runBtn.addEventListener('click', () => runSearch(true).catch((error) => showMessage(error.message, 'error')));
+      els.previewBtn.addEventListener('click', () => runSearch(false).catch((error) => showMessage(error.message, 'error')));
+      els.newSearchBtn.addEventListener('click', createNewTemplate);
+      els.saveBtn.addEventListener('click', () => saveTemplate(false).catch((error) => showMessage(error.message, 'error')));
+      els.saveActivateBtn.addEventListener('click', () => saveTemplate(true).catch((error) => showMessage(error.message, 'error')));
+      els.activateBtn.addEventListener('click', () => activateTemplate().catch((error) => showMessage(error.message, 'error')));
+      els.deleteBtn.addEventListener('click', () => deleteTemplate().catch((error) => showMessage(error.message, 'error')));
+      els.resetSentBtn.addEventListener('click', () => resetSent().catch((error) => showMessage(error.message, 'error')));
+      els.resultsPrev.addEventListener('click', () => {
+        state.resultPage -= 1;
+        renderResults();
+      });
+      els.resultsNext.addEventListener('click', () => {
+        state.resultPage += 1;
+        renderResults();
+      });
+      els.saveTokenBtn.addEventListener('click', async () => {
+        state.authToken = els.authToken.value.trim();
+        localStorage.setItem('hh_web_admin_token', state.authToken);
+        try {
+          await loadState(state.selectedTemplateId);
+          showMessage('Токен сохранён.', 'success');
+        } catch (error) {
+          showMessage(error.message, 'error');
+        }
+      });
+    }
+
+    async function init() {
+      els.messageBox = qs('messageBox');
+      els.tokenBox = qs('tokenBox');
+      els.authToken = qs('authToken');
+      els.saveTokenBtn = qs('saveTokenBtn');
+      els.statusSearch = qs('statusSearch');
+      els.statusTemplate = qs('statusTemplate');
+      els.statusChat = qs('statusChat');
+      els.statusLastCheck = qs('statusLastCheck');
+      els.toggleBtn = qs('toggleBtn');
+      els.refreshBtn = qs('refreshBtn');
+      els.runBtn = qs('runBtn');
+      els.previewBtn = qs('previewBtn');
+      els.newSearchBtn = qs('newSearchBtn');
+      els.templateList = qs('templateList');
+      els.name = qs('name');
+      els.queries = qs('queries');
+      els.searchFields = qs('searchFields');
+      els.experienceGroup = qs('experienceGroup');
+      els.includedAreas = qs('includedAreas');
+      els.excludedAreas = qs('excludedAreas');
+      els.areaHint = qs('areaHint');
+      els.includeKeywords = qs('includeKeywords');
+      els.excludeKeywords = qs('excludeKeywords');
+      els.includeIn = qs('includeIn');
+      els.excludeIn = qs('excludeIn');
+      els.excludedEmployers = qs('excludedEmployers');
+      els.workFormatsGroup = qs('workFormatsGroup');
+      els.employmentGroup = qs('employmentGroup');
+      els.onlyWithSalary = qs('onlyWithSalary');
+      els.salaryMin = qs('salaryMin');
+      els.sort = qs('sort');
+      els.periodDays = qs('periodDays');
+      els.maxPages = qs('maxPages');
+      els.maxResults = qs('maxResults');
+      els.deliveryPageSize = qs('deliveryPageSize');
+      els.interval = qs('interval');
+      els.saveBtn = qs('saveBtn');
+      els.saveActivateBtn = qs('saveActivateBtn');
+      els.activateBtn = qs('activateBtn');
+      els.resetSentBtn = qs('resetSentBtn');
+      els.deleteBtn = qs('deleteBtn');
+      els.currentSummary = qs('currentSummary');
+      els.resultsMeta = qs('resultsMeta');
+      els.resultsList = qs('resultsList');
+      els.resultsPrev = qs('resultsPrev');
+      els.resultsNext = qs('resultsNext');
+      els.resultsPage = qs('resultsPage');
+
+      if (TOKEN_REQUIRED) {
+        els.tokenBox.classList.add('visible');
+      }
+      if (state.authToken) {
+        els.authToken.value = state.authToken;
+      }
+
+      bindEvents();
+      try {
+        await loadState();
+        showMessage('Панель готова к работе.', 'success');
+      } catch (error) {
+        showMessage(error.message, 'error');
+      }
+    }
+
+    window.selectTemplate = selectTemplate;
+    window.activateTemplate = activateTemplate;
+    window.deleteTemplate = deleteTemplate;
+    window.addEventListener('DOMContentLoaded', init);
+  </script>
+</body>
+</html>
+'''.replace("__TOKEN_REQUIRED__", token_required)
+
+
 if FastAPI is not None:
     app = FastAPI(title="HH Vacancy Bot")
 
+    def _web_unauthorized_response():
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
+
+    async def _read_request_json(request: Request):
+        try:
+            return await request.json()
+        except Exception:
+            return {}
+
     @app.get("/")
+    @app.get("/ui")
+    @app.get("/index")
+    @app.get("/index.html")
+    @app.get("/api/ui")
     def api_root():
+        return HTMLResponse(_web_ui_html())
+
+    @app.get("/health")
+    @app.get("/api/health")
+    def api_health():
         return {
             **_build_runtime_status(),
             "message": "HH bot is alive",
-            "hobby_note": "На Vercel Hobby cron ограничен. Для частого автопоиска используйте ручной /run или внешний scheduler на /api/cron.",
         }
 
     @app.get("/status")
     @app.get("/api/status")
     def api_status():
         return _build_runtime_status()
+
+    @app.get("/api/web/state")
+    def api_web_state(request: Request):
+        if not _web_request_authorized(request):
+            return _web_unauthorized_response()
+        data = load_data()
+        return {"ok": True, "state": _build_web_state(data)}
+
+    @app.post("/api/web/template/save")
+    async def api_web_template_save(request: Request):
+        if not _web_request_authorized(request):
+            return _web_unauthorized_response()
+        payload = await _read_request_json(request)
+        data = load_data()
+        template, warnings = _build_template_from_payload(payload.get("template") or {})
+        activate = _coerce_bool(payload.get("activate"))
+        template = _upsert_template(data, template, activate=activate)
+        _ensure_templates_ready(data)
+        save_data(data)
+        return {
+            "ok": True,
+            "warnings": warnings,
+            "template": _template_to_web_payload(template),
+            "state": _build_web_state(data),
+        }
+
+    @app.post("/api/web/template/{template_id}/activate")
+    def api_web_template_activate(template_id: str, request: Request):
+        if not _web_request_authorized(request):
+            return _web_unauthorized_response()
+        data = load_data()
+        tmpl = next((item for item in data.get("templates", []) if item.get("id") == template_id), None)
+        if not tmpl:
+            return JSONResponse({"ok": False, "error": "Поиск не найден"}, status_code=404)
+        data["active_template_id"] = template_id
+        data.setdefault("sent_ids_by_template", {}).setdefault(str(template_id), [])
+        save_data(data)
+        return {"ok": True, "state": _build_web_state(data)}
+
+    @app.post("/api/web/template/{template_id}/reset-sent")
+    def api_web_template_reset_sent(template_id: str, request: Request):
+        if not _web_request_authorized(request):
+            return _web_unauthorized_response()
+        data = load_data()
+        tmpl = next((item for item in data.get("templates", []) if item.get("id") == template_id), None)
+        if not tmpl:
+            return JSONResponse({"ok": False, "error": "Поиск не найден"}, status_code=404)
+        _set_template_sent_ids(data, template_id, [])
+        save_data(data)
+        return {"ok": True, "state": _build_web_state(data)}
+
+    @app.delete("/api/web/template/{template_id}")
+    def api_web_template_delete(template_id: str, request: Request):
+        if not _web_request_authorized(request):
+            return _web_unauthorized_response()
+        data = load_data()
+        before = len(data.get("templates", []))
+        data["templates"] = [item for item in data.get("templates", []) if item.get("id") != template_id]
+        if len(data["templates"]) == before:
+            return JSONResponse({"ok": False, "error": "Поиск не найден"}, status_code=404)
+        data.get("sent_ids_by_template", {}).pop(str(template_id), None)
+        if data.get("active_template_id") == template_id:
+            data["active_template_id"] = data["templates"][0]["id"] if data["templates"] else None
+            data["searching"] = False
+        _ensure_templates_ready(data)
+        save_data(data)
+        return {"ok": True, "state": _build_web_state(data)}
+
+    @app.post("/api/web/searching")
+    async def api_web_searching(request: Request):
+        if not _web_request_authorized(request):
+            return _web_unauthorized_response()
+        payload = await _read_request_json(request)
+        data = load_data()
+        if not _active_template(data):
+            return JSONResponse({"ok": False, "error": "Нет текущего поиска"}, status_code=400)
+        data["searching"] = _coerce_bool(payload.get("searching"))
+        save_data(data)
+        return {"ok": True, "state": _build_web_state(data)}
+
+    @app.post("/api/web/search/run")
+    async def api_web_search_run(request: Request):
+        if not _web_request_authorized(request):
+            return _web_unauthorized_response()
+        payload = await _read_request_json(request)
+        data = load_data()
+        template_id = str(payload.get("template_id") or "").strip()
+        tmpl = next((item for item in data.get("templates", []) if item.get("id") == template_id), None)
+        if not tmpl:
+            return JSONResponse({"ok": False, "error": "Сначала сохраните поиск, потом запускайте обычный режим"}, status_code=400)
+        result = _web_search_response(data, tmpl, persist=True)
+        save_data(data)
+        return {
+            "ok": True,
+            "template": _template_to_web_payload(tmpl),
+            "result": result,
+            "state": _build_web_state(data),
+        }
+
+    @app.post("/api/web/search/preview")
+    async def api_web_search_preview(request: Request):
+        if not _web_request_authorized(request):
+            return _web_unauthorized_response()
+        payload = await _read_request_json(request)
+        data = load_data()
+        template_payload = payload.get("template") or {}
+        template_id = str(payload.get("template_id") or "").strip()
+        warnings = []
+        if template_payload:
+            tmpl, warnings = _build_template_from_payload(template_payload)
+        elif template_id:
+            tmpl = next((item for item in data.get("templates", []) if item.get("id") == template_id), None)
+            if tmpl is None:
+                return JSONResponse({"ok": False, "error": "Поиск не найден"}, status_code=404)
+        else:
+            return JSONResponse({"ok": False, "error": "Нет данных для предпросмотра"}, status_code=400)
+        result = _web_search_response(data, tmpl, persist=False)
+        return {
+            "ok": True,
+            "warnings": warnings,
+            "template": _template_to_web_payload(tmpl),
+            "result": result,
+            "state": _build_web_state(data),
+        }
 
     @app.get("/webhook-info")
     @app.get("/webhook/info")
