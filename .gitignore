@@ -1,0 +1,4 @@
+bot_local_config.py
+bot_data.json
+__pycache__/
+*.pyc

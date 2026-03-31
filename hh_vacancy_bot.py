@@ -6,10 +6,15 @@ HH.ru Smart Vacancy Bot v2
 Настройка поиска прямо через Telegram — без редактирования кода.
 
 Команды:
+  /menu      — главное меню
   /start     — приветствие и помощь
   /new       — создать новый поисковый шаблон (wizard)
   /templates — список шаблонов, выбор/редактирование/удаление
+  /current   — показать активный шаблон
   /run       — запустить поиск прямо сейчас (не ждать таймер)
+  /preview   — предпросмотр без сохранения истории
+  /clone     — копия активного шаблона
+  /reset_sent — сброс истории отправок текущего шаблона
   /toggle    — включить/выключить автопоиск
   /status    — текущий статус и статистика
 
@@ -21,13 +26,25 @@ import json
 import time
 import uuid
 import re
+import html
+import os
 from datetime import datetime
 
 # ═══════════════════════════════════════════════════════════
 #  КОНФИГ
 # ═══════════════════════════════════════════════════════════
 
-BOT_TOKEN   = "8704568628:AAFse14Tq9yE0c26_BZi3WuE31LjnfMUGqQ"
+try:
+    from bot_local_config import BOT_TOKEN
+except Exception:
+    BOT_TOKEN = os.getenv("HH_TELEGRAM_BOT_TOKEN", "").strip()
+
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "Не найден BOT_TOKEN. Укажите его в файле bot_local_config.py "
+        "или в переменной окружения HH_TELEGRAM_BOT_TOKEN."
+    )
+
 DATA_FILE   = "bot_data.json"
 AREAS_CACHE = "areas_cache.json"
 
@@ -76,6 +93,23 @@ MAX_PAGES_OPTIONS = {
     5:  "5 страниц",
     10: "10 страниц",
 }
+
+PERIOD_OPTIONS = {
+    1:  "За 1 день",
+    3:  "За 3 дня",
+    7:  "За 7 дней",
+    14: "За 14 дней",
+    30: "За 30 дней",
+}
+
+MAX_RESULTS_OPTIONS = {
+    20:  "20 вакансий",
+    50:  "50 вакансий",
+    100: "100 вакансий",
+    200: "200 вакансий",
+}
+
+SKIP_WORDS = {"нет", "no", "none", "-", "skip"}
 
 RUSSIA_AREA_ID = 113
 MOSCOW_AREA_ID = 1
@@ -155,13 +189,29 @@ def load_data():
             "active_template_id": None,
             "searching":          False,
             "sent_ids":           [],
+            "sent_ids_by_template": {},
             "last_check":         0,
             "user_states":        {},
         }
     return _normalize_data(data)
 
 def save_data(data):
-    data["sent_ids"] = list(data.get("sent_ids", []))[-10000:]
+    sent_ids_by_template = {}
+    for template_id, values in (data.get("sent_ids_by_template", {}) or {}).items():
+        sent_ids_by_template[str(template_id)] = list(values or [])[-10000:]
+
+    all_sent_ids = []
+    seen_ids = set()
+    for values in sent_ids_by_template.values():
+        for vacancy_id in reversed(values):
+            if vacancy_id in seen_ids:
+                continue
+            seen_ids.add(vacancy_id)
+            all_sent_ids.append(vacancy_id)
+    all_sent_ids = list(reversed(all_sent_ids[-10000:]))
+
+    data["sent_ids_by_template"] = sent_ids_by_template
+    data["sent_ids"] = all_sent_ids
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -226,7 +276,16 @@ def _normalize_template(template):
     tmpl["excluded_area_names"] = [n.strip() for n in (excluded_names or []) if n and n.strip()]
 
     tmpl["exclude_keywords"] = [k.strip().lower() for k in tmpl.get("exclude_keywords", DEFAULT_EXCLUDE_KEYWORDS) if k and k.strip()]
+    tmpl["include_keywords"] = [k.strip().lower() for k in tmpl.get("include_keywords", []) if k and k.strip()]
+    tmpl["include_in"] = tmpl.get("include_in", "both")
     tmpl["exclude_in"] = tmpl.get("exclude_in", "both")
+    tmpl["work_formats"] = _unique_list(tmpl.get("work_formats", []))
+    tmpl["employment_types"] = _unique_list(tmpl.get("employment_types", []))
+    tmpl["period_days"] = int(tmpl.get("period_days", 1) or 1)
+    tmpl["only_with_salary"] = bool(tmpl.get("only_with_salary", False))
+    tmpl["salary_min"] = max(0, int(tmpl.get("salary_min", 0) or 0))
+    tmpl["excluded_employers"] = [k.strip().lower() for k in tmpl.get("excluded_employers", []) if k and k.strip()]
+    tmpl["max_results"] = max(1, int(tmpl.get("max_results", 50) or 50))
     tmpl["sort"] = tmpl.get("sort", "publication_time")
     tmpl["interval"] = int(tmpl.get("interval", 30) or 30)
     tmpl["max_pages"] = int(tmpl.get("max_pages", 5) or 5)
@@ -237,12 +296,23 @@ def _normalize_template(template):
 
 
 def _normalize_data(data):
+    sent_ids_by_template = data.get("sent_ids_by_template", {}) or {}
+    normalized_sent_map = {}
+    for template_id, values in sent_ids_by_template.items():
+        normalized_sent_map[str(template_id)] = list(values or [])[-10000:]
+
+    legacy_sent_ids = list(data.get("sent_ids", []))
+    active_template_id = data.get("active_template_id")
+    if legacy_sent_ids and active_template_id and str(active_template_id) not in normalized_sent_map:
+        normalized_sent_map[str(active_template_id)] = legacy_sent_ids[-10000:]
+
     normalized = {
         "chat_id":            data.get("chat_id"),
         "templates":          [_normalize_template(t) for t in data.get("templates", [])],
         "active_template_id": data.get("active_template_id"),
         "searching":          bool(data.get("searching", False)),
         "sent_ids":           list(data.get("sent_ids", [])),
+        "sent_ids_by_template": normalized_sent_map,
         "last_check":         data.get("last_check", 0),
         "user_states":        data.get("user_states", {}),
     }
@@ -256,6 +326,21 @@ def _normalize_data(data):
             state["draft"] = _normalize_template(state.get("draft", {}))
 
     return normalized
+
+
+def _template_sent_ids(data, template_id):
+    template_id = str(template_id or "")
+    return list((data.get("sent_ids_by_template", {}) or {}).get(template_id, []))
+
+
+def _set_template_sent_ids(data, template_id, vacancy_ids):
+    template_id = str(template_id or "")
+    sent_map = data.setdefault("sent_ids_by_template", {})
+    sent_map[template_id] = list(vacancy_ids or [])[-10000:]
+
+
+def _esc(value):
+    return html.escape(str(value or ""), quote=True)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -304,10 +389,12 @@ def get_updates(offset=0):
 # ═══════════════════════════════════════════════════════════
 
 _area_tree   = None
-_russia_ids  = None
 _area_by_id  = None
 _area_by_name = None
 _area_children_cache = {}
+_hh_dictionaries = None
+_employment_options = None
+_work_format_options = None
 
 def get_area_tree():
     global _area_tree
@@ -328,6 +415,57 @@ def get_area_tree():
     except Exception as e:
         print(f"❌ Ошибка загрузки дерева регионов: {e}")
         return []
+
+
+def get_hh_dictionaries():
+    global _hh_dictionaries
+    if _hh_dictionaries is not None:
+        return _hh_dictionaries
+    try:
+        response = requests.get(f"{HH_API}/dictionaries", timeout=20)
+        response.raise_for_status()
+        _hh_dictionaries = response.json()
+    except Exception as e:
+        print(f"⚠️ Не удалось загрузить словари HH: {e}")
+        _hh_dictionaries = {}
+    return _hh_dictionaries
+
+
+def get_employment_options():
+    global _employment_options
+    if _employment_options is not None:
+        return _employment_options
+
+    items = get_hh_dictionaries().get("employment", [])
+    options = {item.get("id"): item.get("name") for item in items if item.get("id") and item.get("name")}
+    if not options:
+        options = {
+            "full": "Полная занятость",
+            "part": "Частичная занятость",
+            "project": "Проектная работа",
+            "volunteer": "Волонтерство",
+            "probation": "Стажировка",
+        }
+    _employment_options = options
+    return _employment_options
+
+
+def get_work_format_options():
+    global _work_format_options
+    if _work_format_options is not None:
+        return _work_format_options
+
+    items = get_hh_dictionaries().get("work_format", [])
+    options = {item.get("id"): item.get("name") for item in items if item.get("id") and item.get("name")}
+    if not options:
+        options = {
+            "REMOTE": "Удалённо",
+            "HYBRID": "Гибрид",
+            "ON_SITE": "На месте работодателя",
+            "FIELD_WORK": "Разъездной",
+        }
+    _work_format_options = options
+    return _work_format_options
 
 def _index_areas():
     global _area_by_id, _area_by_name
@@ -386,21 +524,6 @@ def _collect_ids(area, ids):
     for sub in area.get("areas", []):
         _collect_ids(sub, ids)
 
-def get_russia_ids():
-    global _russia_ids
-    if _russia_ids is not None:
-        return _russia_ids
-    ids = set()
-    try:
-        r = requests.get(f"{HH_API}/areas/{RUSSIA_AREA_ID}", timeout=20)
-        _collect_ids(r.json(), ids)
-    except Exception as e:
-        print(f"❌ Ошибка загрузки регионов России: {e}")
-    ids.add(str(RUSSIA_AREA_ID))
-    _russia_ids = ids
-    return _russia_ids
-
-
 def get_area_children(area_id):
     area_id = str(area_id)
     if area_id in _area_children_cache:
@@ -429,21 +552,79 @@ def expand_area_ids(area_ids):
 #  ПОИСК ВАКАНСИЙ
 # ═══════════════════════════════════════════════════════════
 
+def _vacancy_text_parts(vacancy):
+    snippet = vacancy.get("snippet") or {}
+    return {
+        "title": (vacancy.get("name") or "").lower(),
+        "description": f"{snippet.get('requirement') or ''} {snippet.get('responsibility') or ''}".lower(),
+        "employer": ((vacancy.get("employer") or {}).get("name") or "").lower(),
+    }
+
+
+def _keyword_hit(parts, keywords, where):
+    if not keywords:
+        return False
+
+    title_text = parts["title"]
+    desc_text = parts["description"]
+
+    for keyword in keywords:
+        hit_title = where in ("title", "both") and keyword in title_text
+        hit_desc = where in ("description", "both") and keyword in desc_text
+        if hit_title or hit_desc:
+            return True
+    return False
+
+
+def _vacancy_work_format_ids(vacancy):
+    work_format = vacancy.get("work_format")
+    ids = set()
+
+    if isinstance(work_format, list):
+        for item in work_format:
+            work_format_id = (item or {}).get("id")
+            if work_format_id:
+                ids.add(str(work_format_id))
+    elif isinstance(work_format, dict):
+        work_format_id = work_format.get("id")
+        if work_format_id:
+            ids.add(str(work_format_id))
+
+    if not ids:
+        schedule_id = ((vacancy.get("schedule") or {}).get("id") or "").strip()
+        if schedule_id == "remote":
+            ids.add("REMOTE")
+
+    return ids
+
+
+def _vacancy_employment_id(vacancy):
+    employment = vacancy.get("employment") or {}
+    return str(employment.get("id") or "").strip()
+
+
 def fetch_vacancies(template):
     template = _normalize_template(template)
 
     included_area_ids = [str(x) for x in template.get("included_area_ids", [])]
     excluded_area_ids = [str(x) for x in template.get("excluded_area_ids", [])]
-    excluded_area_ids = excluded_area_ids or []
-
     included_area_set = expand_area_ids(included_area_ids)
     excluded_area_set = expand_area_ids(excluded_area_ids)
 
+    include_kw = [k.lower() for k in template.get("include_keywords", [])]
+    include_in = template.get("include_in", "both")
     excl_kw = [k.lower() for k in template.get("exclude_keywords", [])]
     excl_in = template.get("exclude_in", "both")
+    work_formats = set(template.get("work_formats", []))
+    employment_types = set(template.get("employment_types", []))
+    only_with_salary = bool(template.get("only_with_salary"))
+    salary_min = max(0, int(template.get("salary_min", 0) or 0))
+    excluded_employers = [name.lower() for name in template.get("excluded_employers", [])]
     sort_by = template.get("sort", "publication_time")
     queries = template.get("queries", DEFAULT_QUERIES)
     max_pages = int(template.get("max_pages", 5) or 5)
+    period_days = int(template.get("period_days", 1) or 1)
+    max_results = int(template.get("max_results", 50) or 50)
     search_fields = template.get("search_fields", ["name", "company_name", "description"])
 
     exp_list = template.get("experience", [ANY_EXPERIENCE])
@@ -467,7 +648,7 @@ def fetch_vacancies(template):
                     "per_page":        50,
                     "page":            page,
                     "order_by":        api_sort,
-                    "period":          1,
+                    "period":          period_days,
                     "enable_snippets": "true",
                 }
 
@@ -502,23 +683,33 @@ def fetch_vacancies(template):
                     if excluded_area_set and area_id in excluded_area_set:
                         continue
 
-                    if excl_kw:
-                        title = (v.get("name") or "").lower()
-                        snippet = v.get("snippet") or {}
-                        req = (snippet.get("requirement") or "").lower()
-                        resp = (snippet.get("responsibility") or "").lower()
-                        employer = (v.get("employer", {}).get("name") or "").lower()
-                        desc_txt = f"{req} {resp} {employer}"
+                    parts = _vacancy_text_parts(v)
 
-                        blocked = False
-                        for kw in excl_kw:
-                            hit_title = excl_in in ("title", "both") and kw in title
-                            hit_desc = excl_in in ("description", "both") and kw in desc_txt
-                            if hit_title or hit_desc:
-                                blocked = True
-                                break
-                        if blocked:
+                    if include_kw and not _keyword_hit(parts, include_kw, include_in):
+                        continue
+
+                    if excl_kw:
+                        if _keyword_hit(parts, excl_kw, excl_in):
                             continue
+
+                    employer_name = parts["employer"]
+                    if excluded_employers and any(name in employer_name for name in excluded_employers):
+                        continue
+
+                    if work_formats:
+                        vacancy_work_formats = _vacancy_work_format_ids(v)
+                        if not (vacancy_work_formats & work_formats):
+                            continue
+
+                    if employment_types:
+                        if _vacancy_employment_id(v) not in employment_types:
+                            continue
+
+                    salary_value = _salary_key(v)
+                    if only_with_salary and salary_value < 0:
+                        continue
+                    if salary_min and salary_value < salary_min:
+                        continue
 
                     results.append(v)
 
@@ -543,7 +734,8 @@ def fetch_vacancies(template):
             seen_final.add(vid)
             final.append(v)
 
-    return _sort_vacancies(final, sort_by, queries)
+    sorted_final = _sort_vacancies(final, sort_by, queries)
+    return sorted_final[:max_results]
 
 
 def _normalize_text(text):
@@ -640,12 +832,17 @@ def _sort_vacancies(vacancies, sort_by, queries):
     return sorted(vacancies, key=_publication_key, reverse=True)
 
 def format_vacancy(v):
-    name     = v.get("name") or "—"
-    employer = (v.get("employer") or {}).get("name") or "—"
-    area     = (v.get("area") or {}).get("name") or "—"
+    name     = _esc(v.get("name") or "—")
+    employer = _esc((v.get("employer") or {}).get("name") or "—")
+    area     = _esc((v.get("area") or {}).get("name") or "—")
     url      = v.get("alternate_url") or ""
-    exp      = (v.get("experience") or {}).get("name") or "—"
-    schedule = (v.get("schedule") or {}).get("name") or ""
+    exp      = _esc((v.get("experience") or {}).get("name") or "—")
+    schedule = _esc((v.get("schedule") or {}).get("name") or "")
+    work_formats = ", ".join(
+        _esc((item or {}).get("name") or "")
+        for item in (v.get("work_format") or [])
+        if (item or {}).get("name")
+    )
 
     salary = v.get("salary")
     if salary:
@@ -662,8 +859,8 @@ def format_vacancy(v):
         sal = "не указана"
 
     snippet = v.get("snippet") or {}
-    req  = (snippet.get("requirement") or "")[:200]
-    req  = req.replace("<highlighttext>", "<b>").replace("</highlighttext>", "</b>")
+    req = _esc((snippet.get("requirement") or "")[:200])
+    req = req.replace("&lt;highlighttext&gt;", "<b>").replace("&lt;/highlighttext&gt;", "</b>")
 
     lines = [
         f"<b>{name}</b>",
@@ -672,8 +869,10 @@ def format_vacancy(v):
         f"Опыт: {exp}",
         f"Зарплата: {sal}",
     ]
+    if work_formats:
+        lines.append(f"Формат работы: {work_formats}")
     if schedule:
-        lines.append(f"Формат: {schedule}")
+        lines.append(f"График: {schedule}")
     if req:
         lines.append(f"\n<i>{req}</i>")
     if url:
@@ -686,21 +885,69 @@ def format_vacancy(v):
 #  WIZARD — МАСТЕР СОЗДАНИЯ ШАБЛОНА
 # ═══════════════════════════════════════════════════════════
 
+def _format_template_summary(template, detailed=False):
+    template = _normalize_template(template)
+    exp_names = [EXPERIENCE_OPTIONS.get(code, code) for code in template.get("experience", [])]
+    search_fields = [SEARCH_FIELD_OPTIONS.get(code, code) for code in template.get("search_fields", [])]
+    include_names = template.get("included_area_names", [])
+    exclude_names = template.get("excluded_area_names", [])
+    include_kw = template.get("include_keywords", [])
+    exclude_kw = template.get("exclude_keywords", [])
+    work_formats = [get_work_format_options().get(code, code) for code in template.get("work_formats", [])]
+    employment_types = [get_employment_options().get(code, code) for code in template.get("employment_types", [])]
+    excluded_employers = template.get("excluded_employers", [])
+
+    include_text = ", ".join(_esc(name) for name in include_names) if include_names else "Все страны и города"
+    exclude_text = ", ".join(_esc(name) for name in exclude_names) if exclude_names else "Без исключений"
+    include_kw_preview = ", ".join(_esc(word) for word in include_kw[:6]) or "нет"
+    exclude_kw_preview = ", ".join(_esc(word) for word in exclude_kw[:6]) or "нет"
+    if len(include_kw) > 6:
+        include_kw_preview += f" ... (+{len(include_kw) - 6})"
+    if len(exclude_kw) > 6:
+        exclude_kw_preview += f" ... (+{len(exclude_kw) - 6})"
+
+    lines = [
+        f"<b>{_esc(template.get('name', 'Новый шаблон'))}</b>",
+        f"Запросов: <b>{len(template.get('queries', []))}</b>",
+        f"Поля поиска: {_esc(', '.join(search_fields) or '—')}",
+        f"Опыт: {_esc(', '.join(exp_names) or '—')}",
+        f"Искать в: {include_text}",
+        f"Исключить регионы: {exclude_text}",
+        f"Включающие слова: <i>{include_kw_preview}</i>",
+        f"Где искать включающие слова: {_esc({'title': 'только название', 'description': 'только описание', 'both': 'и название, и описание'}.get(template.get('include_in', 'both'), 'и название, и описание'))}",
+        f"Исключающие слова: <i>{exclude_kw_preview}</i>",
+        f"Где применять исключения: {_esc({'title': 'только название', 'description': 'только описание', 'both': 'и название, и описание'}.get(template.get('exclude_in', 'both'), 'и название, и описание'))}",
+        f"Сортировка: {_esc(SORT_OPTIONS.get(template.get('sort', ''), '—'))}",
+        f"Период: {_esc(PERIOD_OPTIONS.get(template.get('period_days', 1), 'За 1 день'))}",
+        f"Страниц на запрос: {template.get('max_pages', 5)}",
+        f"Лимит результатов: {template.get('max_results', 50)}",
+        f"Интервал: {template.get('interval', 30)} мин",
+    ]
+
+    if detailed:
+        lines.extend([
+            f"Форматы работы: {_esc(', '.join(work_formats) or 'Любые')}",
+            f"Тип занятости: {_esc(', '.join(employment_types) or 'Любой')}",
+            f"Только с зарплатой: {'да' if template.get('only_with_salary') else 'нет'}",
+            f"Минимальная зарплата: {template.get('salary_min', 0) or 'не задана'}",
+            f"Исключённые работодатели: {_esc(', '.join(excluded_employers) or 'нет')}",
+            f"Примеры запросов: <i>{_esc(', '.join(template.get('queries', [])[:6]))}</i>",
+        ])
+
+    return "\n".join(lines)
+
+
 def wizard_start(chat_id, data, template_id=None):
     """Запускает мастер создания или редактирования шаблона."""
     if template_id:
         tmpl  = next((t for t in data["templates"] if t["id"] == template_id), None)
         draft = _normalize_template(tmpl) if tmpl else _new_draft()
-        mode  = "edit"
     else:
         draft = _new_draft()
-        mode  = "create"
 
     data["user_states"][str(chat_id)] = {
-        "step":        "queries",
-        "draft":       draft,
-        "mode":        mode,
-        "template_id": template_id,
+        "step":  "queries",
+        "draft": draft,
     }
     save_data(data)
 
@@ -710,7 +957,8 @@ def wizard_start(chat_id, data, template_id=None):
         "<b>Запросы</b>\n"
         "Введите названия вакансий через запятую.\n"
         "Или напишите <code>default</code> для полного набора аналитических должностей и синонимов.\n\n"
-        "Пример: <code>data analyst, product analyst, business analyst</code>"
+        "Пример: <code>data analyst, product analyst, business analyst</code>\n\n"
+        "Дальше я пошагово спрошу опыт, географию, слова, формат работы, зарплату и другие фильтры."
     )
 
 def _new_draft():
@@ -725,7 +973,16 @@ def _new_draft():
         "excluded_area_ids": [],
         "excluded_area_names": [],
         "exclude_keywords": DEFAULT_EXCLUDE_KEYWORDS[:],
+        "include_keywords": [],
+        "include_in":       "both",
         "exclude_in":       "both",
+        "work_formats":     [],
+        "employment_types": [],
+        "period_days":      1,
+        "only_with_salary": False,
+        "salary_min":       0,
+        "excluded_employers": [],
+        "max_results":      50,
         "sort":             "publication_time",
         "interval":         30,
         "max_pages":        5,
@@ -762,6 +1019,9 @@ def wizard_handle_text(chat_id, text, data):
             draft["queries"] = DEFAULT_QUERIES[:]
         else:
             draft["queries"] = [q.strip() for q in txt.split(",") if q.strip()]
+        if not draft["queries"]:
+            send_msg(chat_id, "Введите хотя бы один запрос или напишите <code>default</code>.")
+            return True
         state["step"] = "search_fields"
         save_data(data)
         _send_search_fields_kb(chat_id, draft["search_fields"])
@@ -784,7 +1044,7 @@ def wizard_handle_text(chat_id, text, data):
 
     if step == "exclude_areas":
         lo = txt.lower()
-        if lo in ("нет", "no", "none", "-", "skip"):
+        if lo in SKIP_WORDS:
             draft["excluded_area_ids"] = []
             draft["excluded_area_names"] = []
         else:
@@ -794,26 +1054,74 @@ def wizard_handle_text(chat_id, text, data):
             draft["excluded_area_names"] = resolved_names
             if not_found:
                 send_msg(chat_id, f"Не найдены регионы: <b>{', '.join(not_found)}</b>\nПродолжаю с найденными.")
-        state["step"] = "exclude_kw"
+        state["step"] = "include_kw"
         save_data(data)
-        _send_exclude_kw_prompt(chat_id)
+        _send_include_kw_prompt(chat_id)
+        return True
+
+    if step == "include_kw":
+        lo = txt.lower()
+        if lo in SKIP_WORDS:
+            draft["include_keywords"] = []
+            state["step"] = "exclude_kw"
+            save_data(data)
+            _send_exclude_kw_prompt(chat_id)
+            return True
+
+        draft["include_keywords"] = [k.strip().lower() for k in txt.split(",") if k.strip()]
+        if not draft["include_keywords"]:
+            send_msg(chat_id, "Введите слова через запятую или напишите <code>нет</code>.")
+            return True
+        state["step"] = "include_in"
+        save_data(data)
+        _send_include_in_kb(chat_id)
         return True
 
     if step == "exclude_kw":
         lo = txt.lower()
         if lo == "default":
             draft["exclude_keywords"] = DEFAULT_EXCLUDE_KEYWORDS[:]
-        elif lo in ("нет", "no", "none", "-"):
+        elif lo in SKIP_WORDS:
             draft["exclude_keywords"] = []
-        else:
-            draft["exclude_keywords"] = [k.strip().lower() for k in txt.split(",") if k.strip()]
+            state["step"] = "work_formats"
+            save_data(data)
+            _send_work_formats_kb(chat_id, draft.get("work_formats", []))
+            return True
+
+        draft["exclude_keywords"] = [k.strip().lower() for k in txt.split(",") if k.strip()]
+        if not draft["exclude_keywords"]:
+            send_msg(chat_id, "Введите слова через запятую, <code>default</code> или <code>нет</code>.")
+            return True
         state["step"] = "exclude_in"
         save_data(data)
         _send_exclude_in_kb(chat_id)
         return True
 
+    if step == "salary_min":
+        value = re.sub(r"[^0-9]", "", txt)
+        if not value:
+            send_msg(chat_id, "Введите число, например <code>120000</code>, или вернитесь назад через /new.")
+            return True
+        draft["only_with_salary"] = True
+        draft["salary_min"] = int(value)
+        state["step"] = "employers"
+        save_data(data)
+        _send_employers_prompt(chat_id)
+        return True
+
+    if step == "employers":
+        lo = txt.lower()
+        if lo in SKIP_WORDS:
+            draft["excluded_employers"] = []
+        else:
+            draft["excluded_employers"] = [item.strip().lower() for item in txt.split(",") if item.strip()]
+        state["step"] = "sort"
+        save_data(data)
+        _send_sort_kb(chat_id)
+        return True
+
     if step == "name":
-        if txt.lower() not in ("ok", "ок", "ок"):
+        if txt.lower() not in ("ok", "ок"):
             draft["name"] = txt[:50]
         state["step"] = "confirm"
         save_data(data)
@@ -828,7 +1136,7 @@ def wizard_handle_text(chat_id, text, data):
 def _send_search_fields_kb(chat_id, selected):
     buttons = []
     for code, label in SEARCH_FIELD_OPTIONS.items():
-        mark = "Выбрано: " if code in selected else "Добавить: "
+        mark = "[x] " if code in selected else "[ ] "
         buttons.append([{"text": mark + label, "callback_data": f"sf_{code}"}])
     buttons.append([{"text": "Далее", "callback_data": "sf_done"}])
     send_msg(chat_id, "<b>Где искать совпадения</b>\nВыберите одно или несколько полей:", reply_markup={"inline_keyboard": buttons})
@@ -836,7 +1144,7 @@ def _send_search_fields_kb(chat_id, selected):
 def _send_experience_kb(chat_id, selected):
     buttons = []
     for code, label in EXPERIENCE_OPTIONS.items():
-        mark = "Выбрано: " if code in selected else "Добавить: "
+        mark = "[x] " if code in selected else "[ ] "
         buttons.append([{"text": mark + label, "callback_data": f"exp_{code}"}])
     buttons.append([{"text": "Далее", "callback_data": "exp_done"}])
     send_msg(chat_id, "<b>Опыт работы</b>\nВыберите один или несколько вариантов:",
@@ -870,6 +1178,22 @@ def _send_exclude_area_prompt(chat_id):
         "<code>Россия</code>"
     )
 
+def _send_include_kw_prompt(chat_id):
+    send_msg(
+        chat_id,
+        "<b>Слова, которые должны присутствовать</b>\n"
+        "Введите через запятую или <code>нет</code>, если такой фильтр не нужен.\n\n"
+        "Пример: <code>sql, python, product</code>"
+    )
+
+def _send_include_in_kb(chat_id):
+    kb = {"inline_keyboard": [
+        [{"text": "Искать только в названии", "callback_data": "ii_title"}],
+        [{"text": "Искать только в описании", "callback_data": "ii_description"}],
+        [{"text": "Искать и в названии, и в описании", "callback_data": "ii_both"}],
+    ]}
+    send_msg(chat_id, "<b>Где должны встречаться включающие слова</b>", reply_markup=kb)
+
 def _send_exclude_kw_prompt(chat_id):
     send_msg(
         chat_id,
@@ -888,6 +1212,44 @@ def _send_exclude_in_kb(chat_id):
     ]}
     send_msg(chat_id, "<b>Где применять фильтр слов</b>", reply_markup=kb)
 
+def _work_formats_keyboard(selected):
+    buttons = [[{"text": "Сбросить выбор (любой формат)", "callback_data": "wf_any"}]]
+    for code, label in get_work_format_options().items():
+        mark = "[x] " if code in selected else "[ ] "
+        buttons.append([{"text": mark + label.replace("\xa0", " "), "callback_data": f"wf_{code}"}])
+    buttons.append([{"text": "Далее", "callback_data": "wf_done"}])
+    return buttons
+
+def _send_work_formats_kb(chat_id, selected):
+    send_msg(chat_id, "<b>Формат работы</b>\nВыберите один или несколько вариантов. Если ничего не выбрано, подойдут любые.", reply_markup={"inline_keyboard": _work_formats_keyboard(selected)})
+
+def _employment_keyboard(selected):
+    buttons = [[{"text": "Сбросить выбор (любая занятость)", "callback_data": "emp_any"}]]
+    for code, label in get_employment_options().items():
+        mark = "[x] " if code in selected else "[ ] "
+        buttons.append([{"text": mark + label, "callback_data": f"emp_{code}"}])
+    buttons.append([{"text": "Далее", "callback_data": "emp_done"}])
+    return buttons
+
+def _send_employment_kb(chat_id, selected):
+    send_msg(chat_id, "<b>Тип занятости</b>\nВыберите один или несколько вариантов. Если ничего не выбрано, подойдут любые.", reply_markup={"inline_keyboard": _employment_keyboard(selected)})
+
+def _send_salary_mode_kb(chat_id):
+    kb = {"inline_keyboard": [
+        [{"text": "Без фильтра по зарплате", "callback_data": "sal_any"}],
+        [{"text": "Только вакансии с зарплатой", "callback_data": "sal_only"}],
+        [{"text": "Указать минимальную зарплату", "callback_data": "sal_min"}],
+    ]}
+    send_msg(chat_id, "<b>Фильтр по зарплате</b>", reply_markup=kb)
+
+def _send_employers_prompt(chat_id):
+    send_msg(
+        chat_id,
+        "<b>Работодатели для исключения</b>\n"
+        "Введите компании через запятую или <code>нет</code>.\n\n"
+        "Пример: <code>ANCOR, Lenkep recruitment</code>"
+    )
+
 def _send_sort_kb(chat_id):
     kb = {"inline_keyboard": [
         [{"text": label, "callback_data": f"sort_{code}"}]
@@ -895,12 +1257,26 @@ def _send_sort_kb(chat_id):
     ]}
     send_msg(chat_id, "<b>Сортировка</b>", reply_markup=kb)
 
+def _send_period_kb(chat_id):
+    kb = {"inline_keyboard": [
+        [{"text": label, "callback_data": f"period_{days}"}]
+        for days, label in PERIOD_OPTIONS.items()
+    ]}
+    send_msg(chat_id, "<b>Период поиска</b>\nЗа какой период брать вакансии с hh.ru:", reply_markup=kb)
+
 def _send_pages_kb(chat_id):
     kb = {"inline_keyboard": [
         [{"text": label, "callback_data": f"pages_{pages}"}]
         for pages, label in MAX_PAGES_OPTIONS.items()
     ]}
     send_msg(chat_id, "<b>Глубина поиска</b>\nСколько страниц просматривать для каждого запроса:", reply_markup=kb)
+
+def _send_max_results_kb(chat_id):
+    kb = {"inline_keyboard": [
+        [{"text": label, "callback_data": f"limit_{limit}"}]
+        for limit, label in MAX_RESULTS_OPTIONS.items()
+    ]}
+    send_msg(chat_id, "<b>Лимит за один запуск</b>\nСколько вакансий максимум отправлять за одну проверку:", reply_markup=kb)
 
 def _send_interval_kb(chat_id):
     kb = {"inline_keyboard": [
@@ -910,41 +1286,7 @@ def _send_interval_kb(chat_id):
     send_msg(chat_id, "<b>Интервал автопроверки</b>", reply_markup=kb)
 
 def _send_confirm(chat_id, draft):
-    exp_names = [EXPERIENCE_OPTIONS.get(e, e) for e in draft.get("experience", [])]
-    search_fields = [SEARCH_FIELD_OPTIONS.get(f, f) for f in draft.get("search_fields", [])]
-    include_names = draft.get("included_area_names", [])
-    exclude_names = draft.get("excluded_area_names", [])
-    kws = draft.get("exclude_keywords", [])
-    kw_preview = ", ".join(kws[:6]) + (f" ... (+{len(kws)-6})" if len(kws) > 6 else "")
-    excl_where = {"title": "названии", "description": "описании", "both": "везде"}.get(
-        draft.get("exclude_in", "both"), "везде"
-    )
-    qs = draft.get("queries", [])
-
-    if include_names:
-        include_text = ", ".join(include_names)
-    else:
-        include_text = "Все страны и города"
-
-    if exclude_names:
-        exclude_text = ", ".join(exclude_names)
-    else:
-        exclude_text = "Без исключений"
-
-    text = (
-        f"<b>Шаблон: {draft.get('name', '—')}</b>\n\n"
-        f"Запросов: <b>{len(qs)}</b>\n"
-        f"   <i>{', '.join(qs[:4])}{'...' if len(qs) > 4 else ''}</i>\n\n"
-        f"Поля поиска: {', '.join(search_fields) or '—'}\n"
-        f"Опыт: {', '.join(exp_names) or '—'}\n"
-        f"Искать только в: {include_text}\n"
-        f"Исключить регионы: {exclude_text}\n"
-        f"Слова-фильтры ({len(kws)} шт.) в {excl_where}:\n"
-        f"   <i>{kw_preview or 'нет'}</i>\n"
-        f"Сортировка: {SORT_OPTIONS.get(draft.get('sort',''), '—')}\n"
-        f"Страниц на запрос: {draft.get('max_pages', 5)}\n"
-        f"Интервал: {draft.get('interval', 30)} мин\n"
-    )
+    text = _format_template_summary(draft, detailed=True)
     kb = {"inline_keyboard": [[
         {"text": "Сохранить", "callback_data": "confirm_save"},
         {"text": "Отмена",   "callback_data": "confirm_cancel"},
@@ -956,6 +1298,26 @@ def _send_confirm(chat_id, draft):
 #  КОМАНДЫ БОТА
 # ═══════════════════════════════════════════════════════════
 
+def _menu_reply_markup():
+    return {"inline_keyboard": [
+        [{"text": "Новый поиск", "callback_data": "tmpl_new"},
+         {"text": "Шаблоны", "callback_data": "menu_templates"}],
+        [{"text": "Текущий шаблон", "callback_data": "menu_current"},
+         {"text": "Поиск сейчас", "callback_data": "run_now"}],
+        [{"text": "Предпросмотр", "callback_data": "preview_now"},
+         {"text": "Пауза / запуск", "callback_data": "toggle"}],
+        [{"text": "Клон шаблона", "callback_data": "clone_active"},
+         {"text": "Сбросить историю", "callback_data": "reset_sent"}],
+        [{"text": "Справка", "callback_data": "menu_help"}],
+    ]}
+
+
+def cmd_menu(chat_id, data):
+    data["chat_id"] = chat_id
+    save_data(data)
+    send_msg(chat_id, "<b>Главное меню</b>\nВыберите действие:", reply_markup=_menu_reply_markup())
+
+
 def cmd_start(chat_id, data):
     data["chat_id"] = chat_id
     save_data(data)
@@ -963,37 +1325,100 @@ def cmd_start(chat_id, data):
         "<b>HH.ru Vacancy Bot</b>\n\n"
         "Отслеживаю вакансии на hh.ru и присылаю новые по вашим критериям.\n\n"
         "<b>Команды:</b>\n"
+        "/menu      — главное меню\n"
         "/new       — создать поисковый шаблон\n"
         "/templates — шаблоны (выбор/редактирование)\n"
+        "/current   — показать активный шаблон\n"
         "/run       — запустить поиск прямо сейчас\n"
+        "/preview   — предпросмотр без сохранения в историю\n"
+        "/clone     — сделать копию активного шаблона\n"
+        "/reset_sent — очистить историю отправок активного шаблона\n"
         "/toggle    — включить/выключить автопоиск\n"
         "/status    — статус и статистика\n"
         "/help      — подробная справка"
+        ,
+        reply_markup=_menu_reply_markup()
     )
 
 def cmd_help(chat_id):
     send_msg(chat_id,
         "<b>Как пользоваться</b>\n\n"
-        "1. <b>/new</b> — настройте поиск пошагово через меню\n"
-        "   • Укажите должности, поля поиска, опыт, географию, фильтры, страницы и интервал\n"
-        "   • Шаблон сохранится автоматически\n\n"
-        "2. <b>/run</b> — немедленная проверка без ожидания таймера\n\n"
-        "3. <b>/toggle</b> — пауза или возобновление автопоиска\n\n"
-        "4. <b>/templates</b> — список шаблонов:\n"
-        "   • Выбрать активный\n"
-        "   • Редактировать (пройти wizard заново)\n"
-        "   • Удалить\n\n"
-        "5. Каждая вакансия содержит ссылку на hh.ru\n\n"
-        "<b>Фильтры:</b>\n"
-        "• География: любые страны, только выбранные страны/города, исключение стран и отдельных городов\n"
-        "• Опыт: любой, без опыта, 1-3, 3-6, 6+ лет; можно выбрать несколько\n"
-        "• Слова: фильтрация в названии, описании или везде\n"
-        "• Сортировка: по дате, совпадению, названию, зарплате\n"
-        "• Страницы: настройка глубины поиска по каждому запросу"
+        "1. <b>/new</b> — создайте шаблон через мастер\n"
+        "2. <b>/templates</b> — выберите, отредактируйте, удалите или клонируйте шаблон\n"
+        "3. <b>/run</b> — немедленно пришлю новые вакансии\n"
+        "4. <b>/preview</b> — покажу результат без записи в историю\n"
+        "5. <b>/toggle</b> — пауза или запуск автопоиска\n"
+        "6. <b>/current</b> — полная сводка активного шаблона\n"
+        "7. <b>/reset_sent</b> — очистка истории отправок активного шаблона\n\n"
+        "<b>Доступные фильтры:</b>\n"
+        "• География: страны и города на включение и исключение\n"
+        "• Опыт: любые HH-варианты, можно несколько\n"
+        "• Поля поиска: название, компания, описание\n"
+        "• Включающие и исключающие слова\n"
+        "• Формат работы и тип занятости\n"
+        "• Только вакансии с зарплатой и минимальная зарплата\n"
+        "• Исключение работодателей\n"
+        "• Сортировка, глубина страниц, период и лимит результатов"
     )
 
+
+def cmd_current(chat_id, data):
+    data["chat_id"] = chat_id
+    save_data(data)
+    tmpl = _active_template(data)
+    if not tmpl:
+        send_msg(chat_id, "Нет активного шаблона. Создайте его через /new")
+        return
+    send_msg(chat_id, _format_template_summary(tmpl, detailed=True))
+
+
+def _clone_template(data, tmpl):
+    clone = _normalize_template(dict(tmpl))
+    clone["id"] = str(uuid.uuid4())[:8]
+    clone["name"] = f"{tmpl['name'][:38]} (копия)"[:50]
+    data["templates"].append(clone)
+    data["active_template_id"] = clone["id"]
+    _set_template_sent_ids(data, clone["id"], [])
+    return clone
+
+
+def cmd_clone(chat_id, data):
+    data["chat_id"] = chat_id
+    tmpl = _active_template(data)
+    if not tmpl:
+        save_data(data)
+        send_msg(chat_id, "Нет активного шаблона для копирования.")
+        return
+
+    clone = _clone_template(data, tmpl)
+    save_data(data)
+
+    send_msg(
+        chat_id,
+        f"Создана копия шаблона.\nАктивный шаблон: <b>{_esc(clone['name'])}</b>\n"
+        "При необходимости отредактируйте её через /templates."
+    )
+
+
+def cmd_reset_sent(chat_id, data):
+    data["chat_id"] = chat_id
+    tmpl = _active_template(data)
+    if not tmpl:
+        save_data(data)
+        send_msg(chat_id, "Нет активного шаблона. Нечего очищать.")
+        return
+
+    _set_template_sent_ids(data, tmpl["id"], [])
+    save_data(data)
+    send_msg(chat_id, f"История отправок для шаблона <b>{_esc(tmpl['name'])}</b> очищена.")
+
 def cmd_toggle(chat_id, data):
-    data["chat_id"]   = chat_id
+    data["chat_id"] = chat_id
+    if not _active_template(data):
+        save_data(data)
+        send_msg(chat_id, "Нет активного шаблона. Сначала создайте или выберите шаблон.")
+        return
+
     data["searching"] = not data.get("searching", False)
     save_data(data)
     if data["searching"]:
@@ -1010,12 +1435,15 @@ def cmd_status(chat_id, data):
     st_text  = "активен" if data.get("searching") else "на паузе"
     last_ts  = data.get("last_check", 0)
     last_str = datetime.fromtimestamp(last_ts).strftime("%d.%m %H:%M") if last_ts else "никогда"
+    current_sent = len(_template_sent_ids(data, tmpl["id"])) if tmpl else 0
+    total_sent = len(data.get("sent_ids", []))
 
     text = (
         f"{icon} <b>Статус: {st_text}</b>\n\n"
-        f"Шаблон: <b>{tmpl['name'] if tmpl else 'не выбран'}</b>\n"
+        f"Шаблон: <b>{_esc(tmpl['name']) if tmpl else 'не выбран'}</b>\n"
         f"Последняя проверка: {last_str}\n"
-        f"Отправлено всего: {len(data.get('sent_ids', []))} вакансий\n"
+        f"Отправлено по текущему шаблону: {current_sent}\n"
+        f"Отправлено всего: {total_sent}\n"
     )
 
     if tmpl and data.get("searching"):
@@ -1028,6 +1456,8 @@ def cmd_status(chat_id, data):
         [{"text": "Пауза" if data.get("searching") else "Включить",
           "callback_data": "toggle"},
          {"text": "Поиск сейчас", "callback_data": "run_now"}],
+        [{"text": "Предпросмотр", "callback_data": "preview_now"},
+         {"text": "Текущий шаблон", "callback_data": "menu_current"}],
     ]}
     send_msg(chat_id, text, reply_markup=kb)
 
@@ -1043,11 +1473,12 @@ def cmd_templates(chat_id, data):
     buttons = []
     for t in tmpls:
         mark = "Активный: " if t["id"] == data.get("active_template_id") else ""
-        text += f"{mark}<b>{t['name']}</b>\n"
-        text += f"   {len(t.get('queries', []))} запросов · {t.get('interval', 30)} мин · {t.get('max_pages', 5)} стр.\n\n"
+        text += f"{mark}<b>{_esc(t['name'])}</b>\n"
+        text += f"   {len(t.get('queries', []))} запросов · {t.get('interval', 30)} мин · {t.get('max_pages', 5)} стр. · {t.get('max_results', 50)} вакансий\n\n"
         buttons.append([
             {"text": f"{'Активный: ' if mark else ''}Выбрать: {t['name'][:18]}", "callback_data": f"tmpl_select_{t['id']}"},
             {"text": "Ред.", "callback_data": f"tmpl_edit_{t['id']}"},
+            {"text": "Клон", "callback_data": f"tmpl_clone_{t['id']}"},
             {"text": "Удал.", "callback_data": f"tmpl_delete_{t['id']}"},
         ])
     buttons.append([{"text": "Новый шаблон", "callback_data": "tmpl_new"}])
@@ -1060,8 +1491,19 @@ def cmd_run(chat_id, data):
     if not tmpl:
         send_msg(chat_id, "Нет активного шаблона. Создайте через /new")
         return
-    send_msg(chat_id, f"Запускаю поиск по шаблону «{tmpl['name']}»...")
-    _run_search(chat_id, data, tmpl)
+    send_msg(chat_id, f"Запускаю поиск по шаблону «{_esc(tmpl['name'])}»...")
+    _run_search(chat_id, data, tmpl, persist=True)
+
+
+def cmd_preview(chat_id, data):
+    data["chat_id"] = chat_id
+    save_data(data)
+    tmpl = _active_template(data)
+    if not tmpl:
+        send_msg(chat_id, "Нет активного шаблона. Создайте через /new")
+        return
+    send_msg(chat_id, f"Предпросмотр по шаблону «{_esc(tmpl['name'])}» без записи в историю...")
+    _run_search(chat_id, data, tmpl, persist=False)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1074,28 +1516,40 @@ def _active_template(data):
         return None
     return next((t for t in data.get("templates", []) if t["id"] == aid), None)
 
-def _run_search(chat_id, data, tmpl):
+def _run_search(chat_id, data, tmpl, persist=True):
     vacancies = fetch_vacancies(tmpl)
-    sent_set  = set(data.get("sent_ids", []))
+    sent_ids  = _template_sent_ids(data, tmpl["id"])
+    sent_set  = set(sent_ids)
     new_count = 0
+    sent_now = 0
 
     for v in vacancies:
         vid = str(v.get("id", ""))
-        if vid in sent_set:
+        if persist and vid in sent_set:
             continue
-        sent_set.add(vid)
         new_count += 1
+        sent_now += 1
+        if persist:
+            sent_set.add(vid)
+            sent_ids.append(vid)
         send_msg(chat_id, format_vacancy(v))
         time.sleep(0.05)
 
-    data["sent_ids"]   = list(sent_set)
-    data["last_check"] = time.time()
+    if persist:
+        data["last_check"] = time.time()
+        _set_template_sent_ids(data, tmpl["id"], sent_ids)
     save_data(data)
 
     if new_count == 0:
-        send_msg(chat_id, "Проверка завершена: новых вакансий не найдено.")
+        suffix = "Новых вакансий не найдено."
+        if not persist:
+            suffix = "По предпросмотру ничего не найдено."
+        send_msg(chat_id, f"Проверка завершена: {suffix}")
     else:
-        send_msg(chat_id, f"Отправлено <b>{new_count}</b> новых вакансий.")
+        if persist:
+            send_msg(chat_id, f"Отправлено <b>{sent_now}</b> новых вакансий.")
+        else:
+            send_msg(chat_id, f"Предпросмотр завершён: показано <b>{sent_now}</b> вакансий без записи в историю.")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1122,6 +1576,35 @@ def handle_callback(cb, data):
         cmd_run(chat_id, data)
         return
 
+    if cdata == "preview_now":
+        data = load_data()
+        cmd_preview(chat_id, data)
+        return
+
+    if cdata == "menu_templates":
+        data = load_data()
+        cmd_templates(chat_id, data)
+        return
+
+    if cdata == "menu_current":
+        data = load_data()
+        cmd_current(chat_id, data)
+        return
+
+    if cdata == "menu_help":
+        cmd_help(chat_id)
+        return
+
+    if cdata == "clone_active":
+        data = load_data()
+        cmd_clone(chat_id, data)
+        return
+
+    if cdata == "reset_sent":
+        data = load_data()
+        cmd_reset_sent(chat_id, data)
+        return
+
     # ── Шаблоны ───────────────────────────────────────────
     if cdata == "tmpl_new":
         data = load_data()
@@ -1132,14 +1615,27 @@ def handle_callback(cb, data):
         tmpl_id = cdata[len("tmpl_select_"):]
         data["active_template_id"] = tmpl_id
         data["searching"]          = True
+        data.setdefault("sent_ids_by_template", {}).setdefault(str(tmpl_id), [])
         save_data(data)
         tmpl = next((t for t in data["templates"] if t["id"] == tmpl_id), None)
-        send_msg(chat_id, f"Активный шаблон: <b>{tmpl['name']}</b>\n"
+        send_msg(chat_id, f"Активный шаблон: <b>{_esc(tmpl['name'])}</b>\n"
                           "Автопоиск включён.",
                  reply_markup={"inline_keyboard": [[
                      {"text": "Редактировать", "callback_data": f"tmpl_edit_{tmpl_id}"},
                      {"text": "Поиск сейчас",  "callback_data": "run_now"},
                  ]]})
+        return
+
+    if cdata.startswith("tmpl_clone_"):
+        tmpl_id = cdata[len("tmpl_clone_"):]
+        tmpl = next((t for t in data["templates"] if t["id"] == tmpl_id), None)
+        if not tmpl:
+            send_msg(chat_id, "Шаблон для копирования не найден.")
+            return
+
+        clone = _clone_template(data, tmpl)
+        save_data(data)
+        send_msg(chat_id, f"Создана копия шаблона <b>{_esc(clone['name'])}</b>.")
         return
 
     if cdata.startswith("tmpl_edit_"):
@@ -1151,6 +1647,7 @@ def handle_callback(cb, data):
     if cdata.startswith("tmpl_delete_"):
         tmpl_id = cdata[len("tmpl_delete_"):]
         data["templates"] = [t for t in data["templates"] if t["id"] != tmpl_id]
+        data.get("sent_ids_by_template", {}).pop(str(tmpl_id), None)
         if data.get("active_template_id") == tmpl_id:
             data["active_template_id"] = None
             data["searching"]          = False
@@ -1173,7 +1670,7 @@ def handle_callback(cb, data):
         save_data(data)
         buttons = []
         for field_code, label in SEARCH_FIELD_OPTIONS.items():
-            mark = "Выбрано: " if field_code in draft["search_fields"] else "Добавить: "
+            mark = "[x] " if field_code in draft["search_fields"] else "[ ] "
             buttons.append([{"text": mark + label, "callback_data": f"sf_{field_code}"}])
         buttons.append([{"text": "Далее", "callback_data": "sf_done"}])
         edit_reply_markup(chat_id, msg_id, {"inline_keyboard": buttons})
@@ -1205,7 +1702,7 @@ def handle_callback(cb, data):
         # Обновить кнопки in-place
         buttons = []
         for c, label in EXPERIENCE_OPTIONS.items():
-            mark = "Выбрано: " if c in draft["experience"] else "Добавить: "
+            mark = "[x] " if c in draft["experience"] else "[ ] "
             buttons.append([{"text": mark + label, "callback_data": f"exp_{c}"}])
         buttons.append([{"text": "Далее", "callback_data": "exp_done"}])
         edit_reply_markup(chat_id, msg_id, {"inline_keyboard": buttons})
@@ -1233,20 +1730,117 @@ def handle_callback(cb, data):
             _send_include_area_prompt(chat_id)
         return
 
+    # ── Wizard: Include in ────────────────────────────────
+    if cdata.startswith("ii_"):
+        draft["include_in"] = cdata[3:]
+        state["draft"] = draft
+        state["step"] = "exclude_kw"
+        save_data(data)
+        _send_exclude_kw_prompt(chat_id)
+        return
+
     # ── Wizard: Exclude in ────────────────────────────────
     if cdata.startswith("ei_"):
         draft["exclude_in"] = cdata[3:]
         state["draft"]      = draft
-        state["step"]       = "sort"
+        state["step"]       = "work_formats"
         save_data(data)
-        _send_sort_kb(chat_id)
+        _send_work_formats_kb(chat_id, draft.get("work_formats", []))
+        return
+
+    # ── Wizard: Work formats ──────────────────────────────
+    if cdata == "wf_any":
+        draft["work_formats"] = []
+        state["draft"] = draft
+        save_data(data)
+        edit_reply_markup(chat_id, msg_id, {"inline_keyboard": _work_formats_keyboard(draft.get("work_formats", []))})
+        return
+
+    if cdata.startswith("wf_") and cdata != "wf_done":
+        code = cdata[3:]
+        selected = draft.get("work_formats", [])
+        if code in selected:
+            selected.remove(code)
+        else:
+            selected.append(code)
+        draft["work_formats"] = _unique_list(selected)
+        state["draft"] = draft
+        save_data(data)
+        edit_reply_markup(chat_id, msg_id, {"inline_keyboard": _work_formats_keyboard(draft.get("work_formats", []))})
+        return
+
+    if cdata == "wf_done":
+        state["step"] = "employment"
+        save_data(data)
+        _send_employment_kb(chat_id, draft.get("employment_types", []))
+        return
+
+    # ── Wizard: Employment ────────────────────────────────
+    if cdata == "emp_any":
+        draft["employment_types"] = []
+        state["draft"] = draft
+        save_data(data)
+        edit_reply_markup(chat_id, msg_id, {"inline_keyboard": _employment_keyboard(draft.get("employment_types", []))})
+        return
+
+    if cdata.startswith("emp_") and cdata != "emp_done":
+        code = cdata[4:]
+        selected = draft.get("employment_types", [])
+        if code in selected:
+            selected.remove(code)
+        else:
+            selected.append(code)
+        draft["employment_types"] = _unique_list(selected)
+        state["draft"] = draft
+        save_data(data)
+        edit_reply_markup(chat_id, msg_id, {"inline_keyboard": _employment_keyboard(draft.get("employment_types", []))})
+        return
+
+    if cdata == "emp_done":
+        state["step"] = "salary_mode"
+        save_data(data)
+        _send_salary_mode_kb(chat_id)
+        return
+
+    # ── Wizard: Salary ────────────────────────────────────
+    if cdata == "sal_any":
+        draft["only_with_salary"] = False
+        draft["salary_min"] = 0
+        state["draft"] = draft
+        state["step"] = "employers"
+        save_data(data)
+        _send_employers_prompt(chat_id)
+        return
+
+    if cdata == "sal_only":
+        draft["only_with_salary"] = True
+        draft["salary_min"] = 0
+        state["draft"] = draft
+        state["step"] = "employers"
+        save_data(data)
+        _send_employers_prompt(chat_id)
+        return
+
+    if cdata == "sal_min":
+        state["step"] = "salary_min"
+        save_data(data)
+        send_msg(chat_id, "<b>Минимальная зарплата</b>\nВведите число, например <code>120000</code>.")
         return
 
     # ── Wizard: Sort ──────────────────────────────────────
     if cdata.startswith("sort_"):
         draft["sort"] = cdata[5:]
         state["draft"] = draft
-        state["step"]  = "pages"
+        state["step"]  = "period"
+        save_data(data)
+        _send_period_kb(chat_id)
+        return
+
+    # ── Wizard: Period ────────────────────────────────────
+    if cdata.startswith("period_"):
+        draft["period_days"] = int(cdata[7:])
+        state["draft"] = draft
+        state["step"] = "pages"
         save_data(data)
         _send_pages_kb(chat_id)
         return
@@ -1254,6 +1848,15 @@ def handle_callback(cb, data):
     # ── Wizard: Pages ─────────────────────────────────────
     if cdata.startswith("pages_"):
         draft["max_pages"] = int(cdata[6:])
+        state["draft"] = draft
+        state["step"] = "max_results"
+        save_data(data)
+        _send_max_results_kb(chat_id)
+        return
+
+    # ── Wizard: Max results ───────────────────────────────
+    if cdata.startswith("limit_"):
+        draft["max_results"] = int(cdata[6:])
         state["draft"] = draft
         state["step"] = "interval"
         save_data(data)
@@ -1268,7 +1871,7 @@ def handle_callback(cb, data):
         save_data(data)
         send_msg(chat_id,
             "<b>Название шаблона</b>\n"
-            f"Текущее: <code>{draft.get('name', 'Новый шаблон')}</code>\n\n"
+            f"Текущее: <code>{_esc(draft.get('name', 'Новый шаблон'))}</code>\n\n"
             "Введите новое название или <code>ok</code> чтобы оставить текущее."
         )
         return
@@ -1281,11 +1884,12 @@ def handle_callback(cb, data):
         data["templates"]          = existing
         data["active_template_id"] = tmpl["id"]
         data["searching"]          = True
+        data.setdefault("sent_ids_by_template", {}).setdefault(str(tmpl["id"]), [])
         if str(chat_id) in data["user_states"]:
             del data["user_states"][str(chat_id)]
         save_data(data)
         send_msg(chat_id,
-            f"<b>Шаблон «{tmpl['name']}» сохранён.</b>\n"
+            f"<b>Шаблон «{_esc(tmpl['name'])}» сохранён.</b>\n"
             "Автопоиск включён.\n"
             "/run — запустить поиск прямо сейчас."
         )
@@ -1314,8 +1918,17 @@ def _create_default_template():
         "included_area_names": [],
         "excluded_area_ids":  [str(MOSCOW_AREA_ID)],
         "excluded_area_names": ["Москва"],
+        "include_keywords":   [],
+        "include_in":         "both",
         "exclude_keywords":   DEFAULT_EXCLUDE_KEYWORDS[:],
         "exclude_in":         "both",
+        "work_formats":       [],
+        "employment_types":   [],
+        "period_days":        3,
+        "only_with_salary":   False,
+        "salary_min":         0,
+        "excluded_employers": [],
+        "max_results":        50,
         "sort":               "match_desc",
         "interval":           30,
         "max_pages":          5,
@@ -1341,6 +1954,7 @@ def main():
 
     print("📡 Загружаю дерево регионов HH...")
     _index_areas()
+    get_hh_dictionaries()
     print("✅ Готов. Отправьте /start боту в Telegram.")
 
     while True:
@@ -1395,6 +2009,8 @@ def main():
             try:
                 if cmd == "/start":
                     cmd_start(chat_id, data)
+                elif cmd == "/menu":
+                    cmd_menu(chat_id, data)
                 elif cmd == "/help":
                     cmd_help(chat_id)
                 elif cmd == "/new":
@@ -1402,15 +2018,23 @@ def main():
                     wizard_start(chat_id, data)
                 elif cmd == "/templates":
                     cmd_templates(chat_id, data)
+                elif cmd == "/current":
+                    cmd_current(chat_id, data)
                 elif cmd == "/run":
                     cmd_run(chat_id, data)
+                elif cmd == "/preview":
+                    cmd_preview(chat_id, data)
+                elif cmd == "/clone":
+                    cmd_clone(chat_id, data)
+                elif cmd == "/reset_sent":
+                    cmd_reset_sent(chat_id, data)
                 elif cmd == "/toggle":
                     cmd_toggle(chat_id, data)
                 elif cmd == "/status":
                     cmd_status(chat_id, data)
                 else:
                     send_msg(chat_id,
-                        "Неизвестная команда. /help — список команд.")
+                        "Неизвестная команда. /menu — быстрое меню, /help — список команд.")
             except Exception as e:
                 print(f"❌ Ошибка команды {cmd}: {e}")
 
