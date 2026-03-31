@@ -3,18 +3,18 @@
 HH.ru Smart Vacancy Bot v2
 ===========================
 Полноценный Telegram-бот для поиска вакансий на hh.ru.
-Настройка поиска прямо через Telegram — без редактирования кода.
+Настройка шаблонов поиска прямо через Telegram — без редактирования кода.
 
 Команды:
   /menu      — главное меню
   /start     — приветствие и помощь
-  /new       — создать новый сценарий (wizard)
-  /templates — список сохранённых сценариев, выбор/редактирование/удаление
-  /current   — показать активный сценарий
+  /new       — создать новый шаблон (wizard)
+  /templates — список сохранённых шаблонов, выбор/редактирование/удаление
+  /current   — показать текущий шаблон
   /run       — запустить поиск прямо сейчас (не ждать таймер)
   /preview   — предпросмотр без сохранения истории
-  /reset_sent — сброс истории отправок активного сценария
-  /toggle    — включить/выключить автопоиск
+  /reset_sent — сброс истории отправок текущего шаблона
+  /toggle    — включить/выключить автопроверку
   /status    — текущий статус и статистика
 
 Запуск: python3 hh_vacancy_bot.py
@@ -30,8 +30,12 @@ import re
 import html
 import os
 import tempfile
+import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
+from requests.adapters import HTTPAdapter
 
 try:
     from fastapi import FastAPI, Request
@@ -75,6 +79,14 @@ CRON_SECRET = (os.getenv("CRON_SECRET") or os.getenv("HH_CRON_SECRET") or "").st
 WEB_ADMIN_TOKEN = (os.getenv("HH_WEB_ADMIN_TOKEN") or "").strip()
 STATE_TTL_SECONDS = int(os.getenv("HH_STATE_TTL_SECONDS", str(60 * 60 * 24 * 30)) or (60 * 60 * 24 * 30))
 AREAS_TTL_SECONDS = int(os.getenv("HH_AREAS_TTL_SECONDS", str(60 * 60 * 24 * 30)) or (60 * 60 * 24 * 30))
+SEARCH_RESULT_TTL_SECONDS = int(os.getenv("HH_SEARCH_RESULT_TTL_SECONDS", "90") or 90)
+HH_SEARCH_WORKERS = max(1, int(os.getenv("HH_SEARCH_WORKERS", "4") or 4))
+HTTP_POOL_SIZE = max(4, int(os.getenv("HH_HTTP_POOL_SIZE", "16") or 16))
+HTTP_CONNECT_TIMEOUT = max(2, int(os.getenv("HH_HTTP_CONNECT_TIMEOUT", "5") or 5))
+HTTP_READ_TIMEOUT = max(4, int(os.getenv("HH_HTTP_READ_TIMEOUT", "15") or 15))
+HH_REQUEST_RETRIES = max(0, int(os.getenv("HH_REQUEST_RETRIES", "2") or 2))
+HH_RETRY_BASE_DELAY_SECONDS = max(0.5, float(os.getenv("HH_RETRY_BASE_DELAY_SECONDS", "1.5") or 1.5))
+HH_403_COOLDOWN_SECONDS = max(2.0, float(os.getenv("HH_403_COOLDOWN_SECONDS", "8") or 8))
 
 DATA_FILE = os.path.join(tempfile.gettempdir(), "bot_data.json") if IS_VERCEL else "bot_data.json"
 AREAS_CACHE = os.path.join(tempfile.gettempdir(), "areas_cache.json") if IS_VERCEL else "areas_cache.json"
@@ -85,6 +97,7 @@ HH_API = "https://api.hh.ru"
 STATE_CACHE_KEY = "bot_data"
 AREAS_CACHE_KEY = "areas_tree_gzip"
 DICTS_CACHE_KEY = "hh_dictionaries"
+SEARCH_CACHE_PREFIX = "hh_search_result_v3:"
 
 _runtime_cache = None
 if IS_VERCEL and RuntimeCache is not None:
@@ -92,6 +105,13 @@ if IS_VERCEL and RuntimeCache is not None:
         _runtime_cache = RuntimeCache(namespace="hh_vacancy_bot")
     except Exception as e:
         print(f"⚠️ Runtime Cache недоступен: {e}")
+
+_http_local = threading.local()
+_search_result_local_cache = {}
+_query_spec_local_cache = {}
+_web_options_cache = None
+_hh_backoff_lock = threading.Lock()
+_hh_backoff_until = 0.0
 
 # ─── HH.ru опции ────────────────────────────────────────────
 ANY_EXPERIENCE = "any"
@@ -158,6 +178,7 @@ PAGE_SIZE_OPTIONS = {
 }
 
 SKIP_WORDS = {"нет", "no", "none", "-", "skip"}
+KEEP_WORDS = {"ok", "ок", "оставить", "как есть"}
 
 RUSSIA_AREA_ID = 113
 MOSCOW_AREA_ID = 1
@@ -276,6 +297,111 @@ def _unpack_json(payload):
     raw = gzip.decompress(base64.b64decode(str(payload).encode("ascii")))
     return json.loads(raw.decode("utf-8"))
 
+
+def _get_http_session():
+    session = getattr(_http_local, "session", None)
+    if session is not None:
+        return session
+
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=HTTP_POOL_SIZE, pool_maxsize=HTTP_POOL_SIZE, max_retries=0)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({
+        "User-Agent": "HH Vacancy Bot/2 (+https://data-analyst-work-parser.vercel.app)",
+        "Accept": "application/json",
+        "Accept-Language": "ru,en;q=0.9",
+        "Connection": "keep-alive",
+    })
+    _http_local.session = session
+    return session
+
+
+def _http_timeout():
+    return (HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT)
+
+
+def _wait_hh_backoff():
+    while True:
+        with _hh_backoff_lock:
+            remaining = _hh_backoff_until - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, 1.0))
+
+
+def _push_hh_backoff(seconds):
+    global _hh_backoff_until
+    until = time.time() + max(0.0, float(seconds or 0.0))
+    with _hh_backoff_lock:
+        if until > _hh_backoff_until:
+            _hh_backoff_until = until
+
+
+def _format_hh_request_error(query, exp_label, page, status_code, raw_error=None):
+    page_text = f"страница {page + 1}"
+    if status_code == 403:
+        return f"{query} / {exp_label}: HH временно ограничил запросы (403), {page_text}"
+    if status_code == 429:
+        return f"{query} / {exp_label}: HH временно ограничил частоту запросов (429), {page_text}"
+    if status_code:
+        return f"{query} / {exp_label}: ошибка HH {status_code}, {page_text}"
+    return f"{query} / {exp_label}: {raw_error or 'ошибка запроса'}"
+
+
+def _search_cache_get(key):
+    entry = _search_result_local_cache.get(key)
+    now_ts = time.time()
+    if entry and entry.get("expires_at", 0) > now_ts:
+        return entry.get("value")
+    if entry:
+        _search_result_local_cache.pop(key, None)
+
+    cached = _cache_get(key)
+    if cached is not None:
+        _search_result_local_cache[key] = {
+            "value": cached,
+            "expires_at": now_ts + SEARCH_RESULT_TTL_SECONDS,
+        }
+        return cached
+    return None
+
+
+def _search_cache_set(key, value):
+    expires_at = time.time() + SEARCH_RESULT_TTL_SECONDS
+    _search_result_local_cache[key] = {
+        "value": value,
+        "expires_at": expires_at,
+    }
+    _cache_set(key, value, SEARCH_RESULT_TTL_SECONDS, tags=["hh-search"])
+
+
+def _build_search_cache_key(template):
+    template = _normalize_template(template)
+    payload = {
+        "queries": template.get("queries", []),
+        "search_fields": template.get("search_fields", []),
+        "experience": template.get("experience", []),
+        "included_area_ids": template.get("included_area_ids", []),
+        "excluded_area_ids": template.get("excluded_area_ids", []),
+        "include_keywords": template.get("include_keywords", []),
+        "include_in": template.get("include_in", "both"),
+        "exclude_keywords": template.get("exclude_keywords", []),
+        "exclude_in": template.get("exclude_in", "both"),
+        "work_formats": template.get("work_formats", []),
+        "employment_types": template.get("employment_types", []),
+        "only_with_salary": bool(template.get("only_with_salary")),
+        "salary_min": int(template.get("salary_min", 0) or 0),
+        "excluded_employers": template.get("excluded_employers", []),
+        "sort": template.get("sort", "publication_time"),
+        "max_pages": int(template.get("max_pages", 5) or 5),
+        "period_days": int(template.get("period_days", 1) or 1),
+        "max_results": int(template.get("max_results", 50) or 50),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    return f"{SEARCH_CACHE_PREFIX}{digest}"
+
 def load_data():
     cached = _cache_get(STATE_CACHE_KEY)
     if cached is not None:
@@ -343,6 +469,114 @@ def _unique_list(values):
     return result
 
 
+def _normalize_area_work_format_rules(rules):
+    normalized = []
+    seen = set()
+
+    for item in rules or []:
+        if not isinstance(item, dict):
+            continue
+        area_id = str(item.get("area_id") or item.get("id") or "").strip()
+        area_name = str(item.get("area_name") or item.get("name") or "").strip()
+        formats_raw = item.get("work_formats") or item.get("formats") or []
+        work_formats = []
+        for value in formats_raw if isinstance(formats_raw, list) else [formats_raw]:
+            code = _resolve_work_format_code(value)
+            if code and code not in work_formats:
+                work_formats.append(code)
+        if not work_formats:
+            continue
+        if not area_id and area_name:
+            found_id = find_area_id(area_name)
+            if found_id:
+                area_id = str(found_id)
+        if area_id and not area_name:
+            area_name = get_area_name(area_id) or area_id
+        if not area_id and not area_name:
+            continue
+        key = (area_id, ",".join(work_formats))
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append({
+            "area_id": area_id,
+            "area_name": area_name or area_id,
+            "work_formats": work_formats,
+        })
+    return normalized
+
+
+def _default_area_work_format_rules():
+    rules = []
+    for area_name in ("Россия", "Беларусь"):
+        area_id = find_area_id(area_name)
+        if area_id:
+            rules.append({
+                "area_id": str(area_id),
+                "area_name": area_name,
+                "work_formats": ["REMOTE"],
+            })
+    return _normalize_area_work_format_rules(rules)
+
+
+def _area_work_format_rules_text(rules):
+    lines = []
+    for rule in _normalize_area_work_format_rules(rules):
+        labels = [get_work_format_options().get(code, code) for code in rule.get("work_formats", [])]
+        lines.append(f"{rule.get('area_name') or rule.get('area_id')} = {', '.join(labels)}")
+    return "\n".join(lines)
+
+
+def _parse_area_work_format_rules(raw_value):
+    lines = []
+    if isinstance(raw_value, list):
+        lines = [str(item or "").strip() for item in raw_value if str(item or "").strip()]
+    else:
+        text = str(raw_value or "").strip()
+        if text:
+            lines = [line.strip() for line in re.split(r"[\n;]+", text) if line.strip()]
+
+    rules = []
+    warnings = []
+    for line in lines:
+        if "=" in line:
+            area_part, formats_part = line.split("=", 1)
+        elif ":" in line:
+            area_part, formats_part = line.split(":", 1)
+        else:
+            warnings.append(f"Не удалось понять правило формата: {line}")
+            continue
+
+        area_name = area_part.strip()
+        format_items = [part.strip() for part in re.split(r"[,/]+", formats_part) if part.strip()]
+        area_id = find_area_id(area_name)
+        if not area_id:
+            warnings.append(f"Не распознан регион для формата: {area_name}")
+            continue
+
+        work_formats = []
+        wrong_formats = []
+        for item in format_items:
+            code = _resolve_work_format_code(item)
+            if not code:
+                wrong_formats.append(item)
+                continue
+            if code not in work_formats:
+                work_formats.append(code)
+        if wrong_formats:
+            warnings.append(f"Не распознаны форматы для {area_name}: {', '.join(wrong_formats)}")
+        if not work_formats:
+            continue
+
+        rules.append({
+            "area_id": str(area_id),
+            "area_name": get_area_name(area_id) or area_name,
+            "work_formats": work_formats,
+        })
+
+    return _normalize_area_work_format_rules(rules), warnings
+
+
 def _normalize_template(template):
     tmpl = dict(template or {})
 
@@ -393,6 +627,7 @@ def _normalize_template(template):
     tmpl["include_in"] = tmpl.get("include_in", "both")
     tmpl["exclude_in"] = tmpl.get("exclude_in", "both")
     tmpl["work_formats"] = _unique_list(tmpl.get("work_formats", []))
+    tmpl["area_work_format_rules"] = _normalize_area_work_format_rules(tmpl.get("area_work_format_rules", []))
     tmpl["employment_types"] = _unique_list(tmpl.get("employment_types", []))
     tmpl["period_days"] = int(tmpl.get("period_days", 1) or 1)
     tmpl["only_with_salary"] = bool(tmpl.get("only_with_salary", False))
@@ -403,7 +638,7 @@ def _normalize_template(template):
     tmpl["sort"] = tmpl.get("sort", "publication_time")
     tmpl["interval"] = int(tmpl.get("interval", 30) or 30)
     tmpl["max_pages"] = int(tmpl.get("max_pages", 5) or 5)
-    tmpl["name"] = (tmpl.get("name") or "Новый сценарий")[:50]
+    tmpl["name"] = (tmpl.get("name") or "Новый поиск")[:50]
     tmpl["id"] = str(tmpl.get("id") or str(uuid.uuid4())[:8])
 
     if tmpl["id"] == "default01":
@@ -412,6 +647,10 @@ def _normalize_template(template):
             tmpl["name"] = "Аналитик — все страны кроме России"
             tmpl["excluded_area_ids"] = [str(RUSSIA_AREA_ID)]
             tmpl["excluded_area_names"] = ["Россия"]
+        if ANY_EXPERIENCE not in tmpl["experience"]:
+            tmpl["experience"] = _unique_list(tmpl.get("experience", []) + [ANY_EXPERIENCE])
+        if not tmpl.get("area_work_format_rules"):
+            tmpl["area_work_format_rules"] = _default_area_work_format_rules()
 
     return tmpl
 
@@ -602,9 +841,9 @@ def _vacancy_to_web_item(vacancy):
     }
 
 
-def _template_to_web_payload(template):
+def _template_to_web_payload(template, include_summary=True):
     tmpl = _normalize_template(template)
-    return {
+    payload = {
         "id": tmpl["id"],
         "name": tmpl["name"],
         "queries": list(tmpl.get("queries", [])),
@@ -617,6 +856,8 @@ def _template_to_web_payload(template):
         "exclude_keywords": list(tmpl.get("exclude_keywords", [])),
         "exclude_in": tmpl.get("exclude_in", "both"),
         "work_formats": list(tmpl.get("work_formats", [])),
+        "area_work_format_rules": list(tmpl.get("area_work_format_rules", [])),
+        "area_work_format_rules_text": _area_work_format_rules_text(tmpl.get("area_work_format_rules", [])),
         "employment_types": list(tmpl.get("employment_types", [])),
         "only_with_salary": bool(tmpl.get("only_with_salary", False)),
         "salary_min": int(tmpl.get("salary_min", 0) or 0),
@@ -627,12 +868,18 @@ def _template_to_web_payload(template):
         "max_results": int(tmpl.get("max_results", 50) or 50),
         "delivery_page_size": int(tmpl.get("delivery_page_size", 5) or 5),
         "interval": int(tmpl.get("interval", 30) or 30),
-        "summary_html": _format_template_summary(tmpl, detailed=True),
     }
+    if include_summary:
+        payload["summary_html"] = _format_template_summary(tmpl, detailed=True)
+    return payload
 
 
 def _web_options_payload():
-    return {
+    global _web_options_cache
+    if _web_options_cache is not None:
+        return _web_options_cache
+
+    _web_options_cache = {
         "search_fields": _option_list(SEARCH_FIELD_OPTIONS),
         "experience": _option_list(EXPERIENCE_OPTIONS),
         "work_formats": _option_list(get_work_format_options()),
@@ -645,6 +892,7 @@ def _web_options_payload():
         "interval": _option_list(INTERVAL_OPTIONS),
         "popular_areas": list(POPULAR_AREA_NAMES),
     }
+    return _web_options_cache
 
 
 def _upsert_template(data, template, activate=False):
@@ -679,7 +927,7 @@ def _build_template_from_payload(payload):
         search_fields = ["name", "company_name", "description"]
 
     experience = [item for item in _unique_list(payload.get("experience", [])) if item in experience_allowed]
-    if ANY_EXPERIENCE in experience or not experience:
+    if not experience:
         experience = [ANY_EXPERIENCE]
 
     included_area_names = _split_text_values(payload.get("included_area_names"))
@@ -693,6 +941,12 @@ def _build_template_from_payload(payload):
         warnings.append(f"Не распознаны регионы для исключения: {', '.join(not_found_exclude)}")
 
     work_formats = [item for item in _unique_list(payload.get("work_formats", [])) if item in work_formats_allowed]
+    area_work_format_rules, area_work_format_warnings = _parse_area_work_format_rules(
+        payload.get("area_work_format_rules_text")
+        if payload.get("area_work_format_rules_text") not in (None, "")
+        else payload.get("area_work_format_rules", [])
+    )
+    warnings.extend(area_work_format_warnings)
     employment_types = [item for item in _unique_list(payload.get("employment_types", [])) if item in employment_allowed]
 
     sort_code = str(payload.get("sort") or "publication_time")
@@ -709,7 +963,7 @@ def _build_template_from_payload(payload):
 
     template = {
         "id": str(payload.get("id") or str(uuid.uuid4())[:8]),
-        "name": str(payload.get("name") or "Новый сценарий").strip()[:50] or "Новый сценарий",
+        "name": str(payload.get("name") or "Новый поиск").strip()[:50] or "Новый поиск",
         "queries": queries,
         "search_fields": search_fields,
         "experience": experience,
@@ -722,6 +976,7 @@ def _build_template_from_payload(payload):
         "exclude_keywords": [item.lower() for item in _split_text_values(payload.get("exclude_keywords"))],
         "exclude_in": exclude_in,
         "work_formats": work_formats,
+        "area_work_format_rules": area_work_format_rules,
         "employment_types": employment_types,
         "only_with_salary": _coerce_bool(payload.get("only_with_salary")),
         "salary_min": _coerce_int(payload.get("salary_min"), default=0, min_value=0),
@@ -744,8 +999,8 @@ def _build_web_state(data=None):
         "status": _build_runtime_status(data),
         "searching": bool(data.get("searching", False)),
         "active_template_id": data.get("active_template_id"),
-        "templates": [_template_to_web_payload(item) for item in data.get("templates", [])],
-        "active_template": _template_to_web_payload(active) if active else None,
+        "templates": [_template_to_web_payload(item, include_summary=True) for item in data.get("templates", [])],
+        "active_template": _template_to_web_payload(active, include_summary=True) if active else None,
         "new_template": _template_to_web_payload(_new_draft()),
         "options": _web_options_payload(),
     }
@@ -776,7 +1031,7 @@ def tg_call(method, **kwargs):
         print(f"❌ Telegram API недоступен: не задан BOT_TOKEN ({method})")
         return {"ok": False, "description": "BOT_TOKEN missing"}
     try:
-        r = requests.post(f"{TG_API}/{method}", json=kwargs, timeout=15)
+        r = _get_http_session().post(f"{TG_API}/{method}", json=kwargs, timeout=_http_timeout())
         return r.json()
     except Exception as e:
         print(f"❌ Telegram API error ({method}): {e}")
@@ -819,9 +1074,9 @@ def get_updates(offset=0):
         print("❌ getUpdates недоступен: не задан BOT_TOKEN")
         return []
     try:
-        r = requests.post(f"{TG_API}/getUpdates",
+        r = _get_http_session().post(f"{TG_API}/getUpdates",
                           json={"offset": offset, "timeout": 3, "limit": 20},
-                          timeout=10)
+                          timeout=_http_timeout())
         return r.json().get("result", [])
     except Exception:
         return []
@@ -852,6 +1107,7 @@ _area_tree   = None
 _area_by_id  = None
 _area_by_name = None
 _area_children_cache = {}
+_area_name_cache = {}
 _hh_dictionaries = None
 _employment_options = None
 _work_format_options = None
@@ -876,7 +1132,7 @@ def get_area_tree():
     except Exception:
         pass
     try:
-        r = requests.get(f"{HH_API}/areas", timeout=20)
+        r = _get_http_session().get(f"{HH_API}/areas", timeout=_http_timeout())
         r.raise_for_status()
         _area_tree = r.json()
         _cache_set(AREAS_CACHE_KEY, _pack_json(_area_tree), AREAS_TTL_SECONDS, tags=["hh-areas"])
@@ -902,7 +1158,7 @@ def get_hh_dictionaries():
         return _hh_dictionaries
 
     try:
-        response = requests.get(f"{HH_API}/dictionaries", timeout=20)
+        response = _get_http_session().get(f"{HH_API}/dictionaries", timeout=_http_timeout())
         response.raise_for_status()
         _hh_dictionaries = response.json()
         _cache_set(DICTS_CACHE_KEY, _hh_dictionaries, AREAS_TTL_SECONDS, tags=["hh-dictionaries"])
@@ -948,8 +1204,41 @@ def get_work_format_options():
     _work_format_options = options
     return _work_format_options
 
+
+def _resolve_work_format_code(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    options = get_work_format_options()
+    if raw in options:
+        return raw
+
+    normalized = re.sub(r"\s+", " ", raw.casefold()).replace("ё", "е")
+    aliases = {
+        "remote": "REMOTE",
+        "удаленно": "REMOTE",
+        "удалённо": "REMOTE",
+        "hybrid": "HYBRID",
+        "гибрид": "HYBRID",
+        "on site": "ON_SITE",
+        "onsite": "ON_SITE",
+        "на месте": "ON_SITE",
+        "на месте работодателя": "ON_SITE",
+        "field work": "FIELD_WORK",
+        "разъездной": "FIELD_WORK",
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+
+    for code, label in options.items():
+        option_norm = re.sub(r"\s+", " ", str(label).casefold()).replace("ё", "е").replace("\xa0", " ")
+        if normalized == option_norm:
+            return code
+    return None
+
 def _index_areas():
-    global _area_by_id, _area_by_name
+    global _area_by_id, _area_by_name, _area_name_cache
     if _area_by_id is not None and _area_by_name is not None:
         return _area_by_id, _area_by_name
 
@@ -971,7 +1260,21 @@ def _index_areas():
 
     _area_by_id = by_id
     _area_by_name = by_name
+    _area_name_cache = {str(area_id): (area.get("name") or "").strip() for area_id, area in by_id.items()}
     return _area_by_id, _area_by_name
+
+
+def get_area_name(area_id):
+    area_id = str(area_id or "").strip()
+    if not area_id:
+        return ""
+    if area_id in _area_name_cache:
+        return _area_name_cache[area_id]
+    by_id, _ = _index_areas()
+    area_name = ((by_id.get(area_id) or {}).get("name") or "").strip()
+    if area_name:
+        _area_name_cache[area_id] = area_name
+    return area_name
 
 def find_area_id(name):
     if not name:
@@ -1084,8 +1387,233 @@ def _vacancy_employment_id(vacancy):
     return str(employment.get("id") or "").strip()
 
 
-def fetch_vacancies(template):
+def _compile_area_work_format_rules(rules):
+    compiled = []
+    for rule in _normalize_area_work_format_rules(rules):
+        area_id = str(rule.get("area_id") or "").strip()
+        if not area_id:
+            continue
+        compiled.append({
+            "area_id": area_id,
+            "area_name": rule.get("area_name") or get_area_name(area_id) or area_id,
+            "work_formats": set(rule.get("work_formats", [])),
+            "expanded_area_ids": expand_area_ids([area_id]),
+        })
+    compiled.sort(key=lambda item: len(item.get("expanded_area_ids", [])) or 10**9)
+    return compiled
+
+
+def _rule_work_formats_for_area(area_id, compiled_rules, cache):
+    area_id = str(area_id or "").strip()
+    if not area_id or not compiled_rules:
+        return None
+    if area_id in cache:
+        return cache[area_id]
+    for rule in compiled_rules:
+        if area_id in rule.get("expanded_area_ids", set()):
+            cache[area_id] = set(rule.get("work_formats", set()))
+            return cache[area_id]
+    cache[area_id] = None
+    return None
+
+
+def _fetch_vacancy_batch(
+    query,
+    exp,
+    search_fields,
+    api_sort,
+    period_days,
+    max_pages,
+    included_area_ids,
+    included_area_set,
+    excluded_area_set,
+    include_kw,
+    include_in,
+    excl_kw,
+    excl_in,
+    work_formats,
+    area_work_format_rules,
+    employment_types,
+    only_with_salary,
+    salary_min,
+    excluded_employers,
+):
+    session = _get_http_session()
+    collected = []
+    seen_ids = set()
+    errors = []
+    requests_made = 0
+    stale_pages = 0
+    area_rule_cache = {}
+
+    for page in range(max_pages):
+        params = {
+            "text": query,
+            "search_field": search_fields,
+            "per_page": 50,
+            "page": page,
+            "order_by": api_sort,
+            "period": period_days,
+            "enable_snippets": "true",
+        }
+
+        if exp:
+            params["experience"] = exp
+        if included_area_ids:
+            params["area"] = included_area_ids
+
+        data = None
+        exp_label = EXPERIENCE_OPTIONS.get(exp, "любой опыт") if exp else "любой опыт"
+        for attempt in range(HH_REQUEST_RETRIES + 1):
+            try:
+                _wait_hh_backoff()
+                requests_made += 1
+                response = session.get(f"{HH_API}/vacancies", params=params, timeout=_http_timeout())
+                status_code = int(response.status_code or 0)
+                if status_code in (403, 429, 500, 502, 503, 504):
+                    response.raise_for_status()
+                response.raise_for_status()
+                data = response.json()
+                break
+            except requests.HTTPError as e:
+                status_code = int((e.response.status_code if e.response is not None else 0) or 0)
+                is_retryable = status_code in (403, 429, 500, 502, 503, 504)
+                if is_retryable and attempt < HH_REQUEST_RETRIES:
+                    delay = HH_RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
+                    if status_code == 403:
+                        delay = max(delay, HH_403_COOLDOWN_SECONDS)
+                    _push_hh_backoff(delay)
+                    print(
+                        f"⚠️ HH ограничил запросы: {query} / {exp_label}, "
+                        f"страница {page + 1}, статус {status_code}, повтор через {round(delay, 1)} c"
+                    )
+                    time.sleep(delay)
+                    continue
+
+                error_text = _format_hh_request_error(query, exp_label, page, status_code, str(e))
+                print(f"❌ Ошибка запроса hh.ru: {error_text}")
+                errors.append(error_text)
+                break
+            except Exception as e:
+                error_text = _format_hh_request_error(query, exp_label, page, None, str(e))
+                print(f"❌ Ошибка запроса hh.ru: {error_text}")
+                errors.append(error_text)
+                break
+
+        if data is None:
+            break
+
+        items = data.get("items", [])
+        if not items:
+            break
+
+        fresh_ids_on_page = 0
+        for vacancy in items:
+            vacancy_id = str(vacancy.get("id", ""))
+            if not vacancy_id or vacancy_id in seen_ids:
+                continue
+            seen_ids.add(vacancy_id)
+            fresh_ids_on_page += 1
+
+            area_id = str(vacancy.get("area", {}).get("id", ""))
+            if included_area_set and area_id not in included_area_set:
+                continue
+            if excluded_area_set and area_id in excluded_area_set:
+                continue
+
+            parts = _vacancy_text_parts(vacancy)
+            if include_kw and not _keyword_hit(parts, include_kw, include_in):
+                continue
+            if excl_kw and _keyword_hit(parts, excl_kw, excl_in):
+                continue
+
+            employer_name = parts["employer"]
+            if excluded_employers and any(name in employer_name for name in excluded_employers):
+                continue
+
+            applicable_work_formats = work_formats
+            area_rule_formats = _rule_work_formats_for_area(area_id, area_work_format_rules, area_rule_cache)
+            if area_rule_formats is not None:
+                applicable_work_formats = area_rule_formats
+
+            if applicable_work_formats:
+                vacancy_work_formats = _vacancy_work_format_ids(vacancy)
+                if not (vacancy_work_formats & applicable_work_formats):
+                    continue
+
+            if employment_types and _vacancy_employment_id(vacancy) not in employment_types:
+                continue
+
+            salary_value = _salary_key(vacancy)
+            if only_with_salary and salary_value < 0:
+                continue
+            if salary_min and salary_value < salary_min:
+                continue
+
+            collected.append(vacancy)
+
+        if fresh_ids_on_page == 0:
+            stale_pages += 1
+            if stale_pages >= 2:
+                break
+        else:
+            stale_pages = 0
+
+        total_pages = data.get("pages", 1)
+        if page >= total_pages - 1:
+            break
+
+    return {
+        "vacancies": collected,
+        "errors": errors,
+        "requests_made": requests_made,
+    }
+
+
+def _merge_priority_vacancies(sorted_vacancies, priority_ids, max_results):
+    if not priority_ids:
+        return sorted_vacancies[:max_results]
+
+    vacancy_map = {}
+    for vacancy in sorted_vacancies:
+        vacancy_id = str(vacancy.get("id", ""))
+        if vacancy_id and vacancy_id not in vacancy_map:
+            vacancy_map[vacancy_id] = vacancy
+
+    merged = []
+    merged_ids = set()
+
+    for vacancy_id in priority_ids:
+        vacancy = vacancy_map.get(str(vacancy_id))
+        if not vacancy:
+            continue
+        if vacancy_id in merged_ids:
+            continue
+        merged_ids.add(vacancy_id)
+        merged.append(vacancy)
+
+    for vacancy in sorted_vacancies:
+        vacancy_id = str(vacancy.get("id", ""))
+        if not vacancy_id or vacancy_id in merged_ids:
+            continue
+        merged_ids.add(vacancy_id)
+        merged.append(vacancy)
+
+    return merged[:max_results]
+
+
+def fetch_vacancies(template, on_batch=None):
     template = _normalize_template(template)
+    cache_key = _build_search_cache_key(template)
+    cached_result = _search_cache_get(cache_key)
+    if cached_result is not None:
+        print(f"✅ HH поиск из кеша: {len(cached_result.get('vacancies', []))} вакансий")
+        if on_batch and cached_result.get("vacancies"):
+            try:
+                on_batch(cached_result.get("vacancies", []))
+            except Exception as e:
+                print(f"⚠️ Ошибка live-выдачи из кеша: {e}")
+        return cached_result
 
     included_area_ids = [str(x) for x in template.get("included_area_ids", [])]
     excluded_area_ids = [str(x) for x in template.get("excluded_area_ids", [])]
@@ -1097,6 +1625,7 @@ def fetch_vacancies(template):
     excl_kw = [k.lower() for k in template.get("exclude_keywords", [])]
     excl_in = template.get("exclude_in", "both")
     work_formats = set(template.get("work_formats", []))
+    area_work_format_rules = _compile_area_work_format_rules(template.get("area_work_format_rules", []))
     employment_types = set(template.get("employment_types", []))
     only_with_salary = bool(template.get("only_with_salary"))
     salary_min = max(0, int(template.get("salary_min", 0) or 0))
@@ -1115,104 +1644,88 @@ def fetch_vacancies(template):
         exp_filters = exp_list
 
     api_sort = sort_by if sort_by in API_SORT_OPTIONS else "publication_time"
+    query_exp_tasks = []
+    seen_task_keys = set()
+    for query in queries:
+        normalized_query = str(query or "").strip()
+        if not normalized_query:
+            continue
+        for exp in exp_filters:
+            task_key = (normalized_query, exp or "")
+            if task_key in seen_task_keys:
+                continue
+            seen_task_keys.add(task_key)
+            query_exp_tasks.append((normalized_query, exp))
 
     results = []
-    seen_ids = set()
     errors = []
     requests_made = 0
+    priority_ids = []
+    started_at = time.time()
+    if query_exp_tasks:
+        search_pressure = len(query_exp_tasks) * max_pages
+        adaptive_workers = HH_SEARCH_WORKERS
+        if search_pressure >= 60:
+            adaptive_workers = min(adaptive_workers, 2)
+        elif search_pressure >= 24:
+            adaptive_workers = min(adaptive_workers, 3)
 
-    for query in queries:
-        for exp in exp_filters:
-            stale_pages = 0
-            for page in range(max_pages):
-                params = {
-                    "text":            query,
-                    "search_field":    search_fields,
-                    "per_page":        50,
-                    "page":            page,
-                    "order_by":        api_sort,
-                    "period":          period_days,
-                    "enable_snippets": "true",
-                }
+        max_workers = min(adaptive_workers, len(query_exp_tasks))
+        print(
+            f"🔧 HH поиск: {len(query_exp_tasks)} комбинаций, "
+            f"{max_pages} стр./запрос, воркеров {max_workers}"
+        )
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(
+                    _fetch_vacancy_batch,
+                    query,
+                    exp,
+                    search_fields,
+                    api_sort,
+                    period_days,
+                    max_pages,
+                    included_area_ids,
+                    included_area_set,
+                    excluded_area_set,
+                    include_kw,
+                    include_in,
+                    excl_kw,
+                    excl_in,
+                    work_formats,
+                    area_work_format_rules,
+                    employment_types,
+                    only_with_salary,
+                    salary_min,
+                    excluded_employers,
+                ): (query, exp)
+                for query, exp in query_exp_tasks
+            }
 
-                if exp:
-                    params["experience"] = exp
-                if included_area_ids:
-                    params["area"] = included_area_ids
-
+            for future in as_completed(future_map):
                 try:
-                    r = requests.get(f"{HH_API}/vacancies", params=params, timeout=20)
-                    requests_made += 1
-                    r.raise_for_status()
-                    data = r.json()
+                    batch = future.result()
                 except Exception as e:
+                    query, exp = future_map[future]
                     exp_label = EXPERIENCE_OPTIONS.get(exp, "любой опыт") if exp else "любой опыт"
                     error_text = f"{query} / {exp_label}: {e}"
-                    print(f"❌ Ошибка запроса hh.ru: {error_text}")
+                    print(f"❌ Ошибка параллельного запроса hh.ru: {error_text}")
                     errors.append(error_text)
-                    break
+                    continue
 
-                items = data.get("items", [])
-                if not items:
-                    break
-
-                fresh_ids_on_page = 0
-
-                for v in items:
-                    vid = str(v.get("id", ""))
-                    if not vid or vid in seen_ids:
-                        continue
-                    seen_ids.add(vid)
-                    fresh_ids_on_page += 1
-
-                    area_id = str(v.get("area", {}).get("id", ""))
-                    if included_area_set and area_id not in included_area_set:
-                        continue
-                    if excluded_area_set and area_id in excluded_area_set:
-                        continue
-
-                    parts = _vacancy_text_parts(v)
-
-                    if include_kw and not _keyword_hit(parts, include_kw, include_in):
-                        continue
-
-                    if excl_kw:
-                        if _keyword_hit(parts, excl_kw, excl_in):
-                            continue
-
-                    employer_name = parts["employer"]
-                    if excluded_employers and any(name in employer_name for name in excluded_employers):
-                        continue
-
-                    if work_formats:
-                        vacancy_work_formats = _vacancy_work_format_ids(v)
-                        if not (vacancy_work_formats & work_formats):
-                            continue
-
-                    if employment_types:
-                        if _vacancy_employment_id(v) not in employment_types:
-                            continue
-
-                    salary_value = _salary_key(v)
-                    if only_with_salary and salary_value < 0:
-                        continue
-                    if salary_min and salary_value < salary_min:
-                        continue
-
-                    results.append(v)
-
-                if fresh_ids_on_page == 0:
-                    stale_pages += 1
-                    if stale_pages >= 2:
-                        break
-                else:
-                    stale_pages = 0
-
-                total_pages = data.get("pages", 1)
-                if page >= total_pages - 1:
-                    break
-
-                time.sleep(0.25)
+                requests_made += int(batch.get("requests_made", 0) or 0)
+                errors.extend(batch.get("errors", []))
+                batch_vacancies = batch.get("vacancies", [])
+                results.extend(batch_vacancies)
+                if on_batch and batch_vacancies:
+                    try:
+                        streamed_ids = on_batch(batch_vacancies) or []
+                        for vacancy_id in streamed_ids:
+                            vacancy_id = str(vacancy_id or "")
+                            if vacancy_id and vacancy_id not in priority_ids:
+                                priority_ids.append(vacancy_id)
+                    except Exception as e:
+                        print(f"⚠️ Ошибка live-выдачи вакансий: {e}")
 
     final = []
     seen_final = set()
@@ -1223,12 +1736,21 @@ def fetch_vacancies(template):
             final.append(v)
 
     sorted_final = _sort_vacancies(final, sort_by, queries)
-    return {
-        "vacancies": sorted_final[:max_results],
+    final_vacancies = _merge_priority_vacancies(sorted_final, priority_ids, max_results)
+    payload = {
+        "vacancies": final_vacancies,
         "errors": _unique_list(errors),
         "requests_made": requests_made,
         "queries_count": len(queries),
     }
+    duration = round(time.time() - started_at, 2)
+    print(
+        f"✅ HH поиск завершён: {len(payload['vacancies'])} вакансий, "
+        f"{requests_made} запросов, {len(query_exp_tasks)} комбинаций, {duration} c"
+    )
+    if payload["vacancies"] or not payload["errors"]:
+        _search_cache_set(cache_key, payload)
+    return payload
 
 
 def _normalize_text(text):
@@ -1254,7 +1776,32 @@ def _salary_key(vacancy):
     return -1.0
 
 
-def _match_score(vacancy, queries):
+def _prepare_query_specs(queries):
+    cache_key = tuple(str(query or "").strip() for query in (queries or []) if str(query or "").strip())
+    cached = _query_spec_local_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    prepared = []
+    for query in cache_key:
+        normalized_query = _normalize_text(query)
+        if not normalized_query:
+            continue
+        tokens = tuple(token for token in normalized_query.split() if token)
+        prepared.append({
+            "text": normalized_query,
+            "tokens": tokens,
+            "token_set": set(tokens),
+            "token_count": len(tokens),
+        })
+
+    if len(_query_spec_local_cache) > 128:
+        _query_spec_local_cache.clear()
+    _query_spec_local_cache[cache_key] = prepared
+    return prepared
+
+
+def _match_score(vacancy, query_specs):
     snippet = vacancy.get("snippet") or {}
     title = _normalize_text(vacancy.get("name", ""))
     employer = _normalize_text((vacancy.get("employer") or {}).get("name", ""))
@@ -1266,13 +1813,11 @@ def _match_score(vacancy, queries):
     title_tokens = set(title.split())
     desc_tokens = set(description.split())
 
-    for query in queries or []:
-        normalized_query = _normalize_text(query)
-        if not normalized_query:
-            continue
-
+    for query_spec in query_specs or []:
+        normalized_query = query_spec["text"]
         score = 0
-        query_tokens = set(normalized_query.split())
+        query_tokens = query_spec["token_set"]
+        token_count = query_spec["token_count"]
 
         if normalized_query == title:
             score += 140
@@ -1281,9 +1826,9 @@ def _match_score(vacancy, queries):
         elif normalized_query in description:
             score += 50
 
-        if query_tokens:
-            title_overlap = len(query_tokens & title_tokens) / len(query_tokens)
-            desc_overlap = len(query_tokens & desc_tokens) / len(query_tokens)
+        if token_count:
+            title_overlap = len(query_tokens & title_tokens) / token_count
+            desc_overlap = len(query_tokens & desc_tokens) / token_count
             score += int(title_overlap * 80)
             score += int(desc_overlap * 25)
 
@@ -1294,9 +1839,10 @@ def _match_score(vacancy, queries):
 
 def _sort_vacancies(vacancies, sort_by, queries):
     if sort_by in ("relevance", "match_desc"):
+        query_specs = _prepare_query_specs(queries)
         return sorted(
             vacancies,
-            key=lambda v: (_match_score(v, queries), _publication_key(v)),
+            key=lambda v: (_match_score(v, query_specs), _publication_key(v)),
             reverse=True,
         )
 
@@ -1486,6 +2032,7 @@ def _format_template_summary(template, detailed=False):
     include_kw = template.get("include_keywords", [])
     exclude_kw = template.get("exclude_keywords", [])
     work_formats = [get_work_format_options().get(code, code) for code in template.get("work_formats", [])]
+    area_work_format_rules = template.get("area_work_format_rules", [])
     employment_types = [get_employment_options().get(code, code) for code in template.get("employment_types", [])]
     excluded_employers = template.get("excluded_employers", [])
 
@@ -1504,7 +2051,7 @@ def _format_template_summary(template, detailed=False):
         exclude_kw_preview += f" ... (+{len(exclude_kw) - 6})"
 
     lines = [
-        f"<b>{_esc(template.get('name', 'Новый сценарий'))}</b>",
+        f"<b>{_esc(template.get('name', 'Новый поиск'))}</b>",
         f"Запросов: <b>{len(template.get('queries', []))}</b>",
         f"Поля поиска: {_esc(', '.join(search_fields) or '—')}",
         f"Опыт: {_esc(', '.join(exp_names) or '—')}",
@@ -1521,6 +2068,16 @@ def _format_template_summary(template, detailed=False):
         f"В одной странице выдачи: {template.get('delivery_page_size', 5)}",
         f"Интервал: {template.get('interval', 30)} мин",
     ]
+
+    if area_work_format_rules:
+        area_rules_preview = []
+        for rule in area_work_format_rules[:4]:
+            labels = [get_work_format_options().get(code, code) for code in rule.get("work_formats", [])]
+            area_rules_preview.append(f"{rule.get('area_name')}: {', '.join(labels)}")
+        area_rules_text = "; ".join(area_rules_preview)
+        if len(area_work_format_rules) > 4:
+            area_rules_text += f" ... (+{len(area_work_format_rules) - 4})"
+        lines.append(f"Формат по регионам: {_esc(area_rules_text)}")
 
     if detailed:
         lines.extend([
@@ -1565,7 +2122,7 @@ def _format_launch_message(template, preview=False):
     if included_areas:
         lines.append(f"География: <b>{_esc(_compact_preview(included_areas, limit=2))}</b>")
     else:
-        lines.append("География: <b>все регионы</b>")
+        lines.append("География: <b>все страны и города</b>")
 
     if excluded_areas:
         lines.append(f"Исключения: <b>{_esc(_compact_preview(excluded_areas, limit=2))}</b>")
@@ -1573,36 +2130,51 @@ def _format_launch_message(template, preview=False):
     return "\n".join(lines)
 
 
+def _friendly_fetch_error_summary(fetch_errors):
+    if not fetch_errors:
+        return ""
+    joined = " ".join(str(item) for item in fetch_errors)
+    if "ограничил запросы (403)" in joined:
+        return "HH временно ограничил часть запросов. Обычно помогает повторить поиск позже или уменьшить число страниц и запросов."
+    if "ограничил частоту запросов (429)" in joined:
+        return "HH временно ограничил частоту запросов. Повторите поиск немного позже."
+    return f"Ошибка запроса: <code>{_esc('; '.join(fetch_errors[:2]))}</code>"
+
+
 def wizard_start(chat_id, data, template_id=None):
     """Запускает мастер создания или редактирования шаблона."""
     if template_id:
         tmpl  = next((t for t in data["templates"] if t["id"] == template_id), None)
         draft = _normalize_template(tmpl) if tmpl else _new_draft()
+        mode = "edit"
     else:
         draft = _new_draft()
+        mode = "create"
 
     data["user_states"][str(chat_id)] = {
         "step":  "queries",
         "draft": draft,
         "history": [],
+        "mode": mode,
     }
     save_data(data)
 
+    title = "Редактирование шаблона" if mode == "edit" else "Создание шаблона"
     send_msg(
         chat_id,
-        "<b>Мастер настройки поиска</b>\n\n"
-        "<b>Запросы</b>\n"
-        "Введите названия вакансий через запятую.\n"
-        "Или напишите <code>default</code> для полного набора аналитических должностей и синонимов.\n\n"
+        f"<b>{title}</b>\n\n"
+        "<b>Шаг 1. Что ищем</b>\n"
+        "Введите основную вакансию и синонимы через запятую.\n"
+        "Или напишите <code>default</code>, если нужен готовый набор аналитических ролей.\n\n"
         "Пример: <code>data analyst, product analyst, business analyst</code>\n\n"
-        "Дальше я пошагово спрошу опыт, географию, слова, формат работы, зарплату и другие фильтры.",
+        "Я буду задавать вопросы по одному блоку: опыт, география, формат работы, исключения и автопроверка. В конце покажу итоговое подтверждение перед сохранением.",
         reply_markup={"inline_keyboard": _back_home_row()}
     )
 
 def _new_draft():
     return _normalize_template({
         "id":               str(uuid.uuid4())[:8],
-        "name":             "Новый сценарий",
+        "name":             "Новый поиск",
         "queries":          DEFAULT_QUERIES[:],
         "search_fields":    ["name", "company_name", "description"],
         "experience":       [ANY_EXPERIENCE],
@@ -1615,6 +2187,7 @@ def _new_draft():
         "include_in":       "both",
         "exclude_in":       "both",
         "work_formats":     [],
+        "area_work_format_rules": [],
         "employment_types": [],
         "period_days":      1,
         "only_with_salary": False,
@@ -1643,6 +2216,11 @@ def _resolve_area_names(names):
 
     return _unique_list(area_ids), resolved_names, not_found
 
+
+def _current_value_note(values, empty_text="не задано"):
+    preview = _compact_preview(values or [], limit=3, empty_text=empty_text)
+    return f"\nТекущее значение: <code>{_esc(preview)}</code>\nНапишите <code>ok</code>, чтобы оставить как есть.\n\n"
+
 def wizard_handle_text(chat_id, text, data):
     """Обрабатывает ввод текста в контексте wizard-шага. Возвращает True если обработано."""
     state = data["user_states"].get(str(chat_id))
@@ -1652,9 +2230,15 @@ def wizard_handle_text(chat_id, text, data):
     step  = state["step"]
     draft = state["draft"]
     txt   = text.strip()
+    lo    = txt.lower()
 
     if step == "queries":
-        if txt.lower() == "default":
+        if lo in KEEP_WORDS and draft.get("queries"):
+            _wizard_move_to(state, "search_fields")
+            save_data(data)
+            _send_search_fields_kb(chat_id, draft["search_fields"])
+            return True
+        if lo == "default":
             draft["queries"] = DEFAULT_QUERIES[:]
         else:
             draft["queries"] = [q.strip() for q in txt.split(",") if q.strip()]
@@ -1667,6 +2251,11 @@ def wizard_handle_text(chat_id, text, data):
         return True
 
     if step == "include_areas":
+        if lo in KEEP_WORDS:
+            _wizard_move_to(state, "exclude_areas")
+            save_data(data)
+            _send_exclude_area_prompt(chat_id, draft.get("excluded_area_names", []), state.get("mode", "create"))
+            return True
         names    = [n.strip() for n in txt.split(",") if n.strip()]
         area_ids, resolved_names, not_found = _resolve_area_names(names)
         if names and not area_ids:
@@ -1678,11 +2267,15 @@ def wizard_handle_text(chat_id, text, data):
             send_msg(chat_id, f"Не найдены регионы: <b>{', '.join(not_found)}</b>\nПродолжаю с найденными.")
         _wizard_move_to(state, "exclude_areas")
         save_data(data)
-        _send_exclude_area_prompt(chat_id)
+        _send_exclude_area_prompt(chat_id, draft.get("excluded_area_names", []), state.get("mode", "create"))
         return True
 
     if step == "exclude_areas":
-        lo = txt.lower()
+        if lo in KEEP_WORDS:
+            _wizard_move_to(state, "include_kw")
+            save_data(data)
+            _send_include_kw_prompt(chat_id, draft.get("include_keywords", []), state.get("mode", "create"))
+            return True
         if lo in SKIP_WORDS:
             draft["excluded_area_ids"] = []
             draft["excluded_area_names"] = []
@@ -1695,16 +2288,25 @@ def wizard_handle_text(chat_id, text, data):
                 send_msg(chat_id, f"Не найдены регионы: <b>{', '.join(not_found)}</b>\nПродолжаю с найденными.")
         _wizard_move_to(state, "include_kw")
         save_data(data)
-        _send_include_kw_prompt(chat_id)
+        _send_include_kw_prompt(chat_id, draft.get("include_keywords", []), state.get("mode", "create"))
         return True
 
     if step == "include_kw":
-        lo = txt.lower()
+        if lo in KEEP_WORDS:
+            if draft.get("include_keywords"):
+                _wizard_move_to(state, "include_in")
+                save_data(data)
+                _send_include_in_kb(chat_id)
+            else:
+                _wizard_move_to(state, "exclude_kw")
+                save_data(data)
+                _send_exclude_kw_prompt(chat_id, draft.get("exclude_keywords", []), state.get("mode", "create"))
+            return True
         if lo in SKIP_WORDS:
             draft["include_keywords"] = []
             _wizard_move_to(state, "exclude_kw")
             save_data(data)
-            _send_exclude_kw_prompt(chat_id)
+            _send_exclude_kw_prompt(chat_id, draft.get("exclude_keywords", []), state.get("mode", "create"))
             return True
 
         draft["include_keywords"] = [k.strip().lower() for k in txt.split(",") if k.strip()]
@@ -1717,7 +2319,16 @@ def wizard_handle_text(chat_id, text, data):
         return True
 
     if step == "exclude_kw":
-        lo = txt.lower()
+        if lo in KEEP_WORDS:
+            if draft.get("exclude_keywords"):
+                _wizard_move_to(state, "exclude_in")
+                save_data(data)
+                _send_exclude_in_kb(chat_id)
+            else:
+                _wizard_move_to(state, "work_formats")
+                save_data(data)
+                _send_work_formats_kb(chat_id, draft.get("work_formats", []))
+            return True
         if lo == "default":
             draft["exclude_keywords"] = DEFAULT_EXCLUDE_KEYWORDS[:]
         elif lo in SKIP_WORDS:
@@ -1744,9 +2355,9 @@ def wizard_handle_text(chat_id, text, data):
             return True
         if txt.lower() in SKIP_WORDS:
             draft["work_formats"] = []
-            _wizard_move_to(state, "employment")
+            _wizard_move_to(state, "area_work_formats")
             save_data(data)
-            _send_employment_kb(chat_id, draft.get("employment_types", []))
+            _send_area_work_formats_prompt(chat_id, draft.get("area_work_format_rules", []), state.get("mode", "create"))
             return True
 
         selected_codes = []
@@ -1766,6 +2377,34 @@ def wizard_handle_text(chat_id, text, data):
             return True
 
         draft["work_formats"] = _unique_list(selected_codes)
+        _wizard_move_to(state, "area_work_formats")
+        save_data(data)
+        _send_area_work_formats_prompt(chat_id, draft.get("area_work_format_rules", []), state.get("mode", "create"))
+        return True
+
+    if step == "area_work_formats":
+        if lo in KEEP_WORDS:
+            _wizard_move_to(state, "employment")
+            save_data(data)
+            _send_employment_kb(chat_id, draft.get("employment_types", []))
+            return True
+        if lo in SKIP_WORDS:
+            draft["area_work_format_rules"] = []
+            _wizard_move_to(state, "employment")
+            save_data(data)
+            _send_employment_kb(chat_id, draft.get("employment_types", []))
+            return True
+
+        rules, warnings = _parse_area_work_format_rules(txt)
+        if not rules:
+            if warnings:
+                send_msg(chat_id, "\n".join(warnings))
+            else:
+                send_msg(chat_id, "Не удалось распознать ни одного правила. Пример: <code>Россия = удалённо</code>")
+            return True
+        draft["area_work_format_rules"] = rules
+        if warnings:
+            send_msg(chat_id, "\n".join(warnings))
         _wizard_move_to(state, "employment")
         save_data(data)
         _send_employment_kb(chat_id, draft.get("employment_types", []))
@@ -1774,17 +2413,21 @@ def wizard_handle_text(chat_id, text, data):
     if step == "salary_min":
         value = re.sub(r"[^0-9]", "", txt)
         if not value:
-            send_msg(chat_id, "Введите число, например <code>120000</code>, или вернитесь назад через /new.")
+            send_msg(chat_id, "Введите число, например <code>120000</code>, или нажмите кнопку «Назад».")
             return True
         draft["only_with_salary"] = True
         draft["salary_min"] = int(value)
         _wizard_move_to(state, "employers")
         save_data(data)
-        _send_employers_prompt(chat_id)
+        _send_employers_prompt(chat_id, draft.get("excluded_employers", []), state.get("mode", "create"))
         return True
 
     if step == "employers":
-        lo = txt.lower()
+        if lo in KEEP_WORDS:
+            _wizard_move_to(state, "sort")
+            save_data(data)
+            _send_sort_kb(chat_id)
+            return True
         if lo in SKIP_WORDS:
             draft["excluded_employers"] = []
         else:
@@ -1814,7 +2457,7 @@ def _send_search_fields_kb(chat_id, selected):
         buttons.append([{"text": mark + label, "callback_data": f"sf_{code}"}])
     buttons.append([{"text": "Далее", "callback_data": "sf_done"}])
     buttons.extend(_back_home_row("wiz_back"))
-    send_msg(chat_id, "<b>Где искать совпадения</b>\nВыберите одно или несколько полей:", reply_markup={"inline_keyboard": buttons})
+    send_msg(chat_id, "<b>Где искать совпадения</b>\nВыберите, где искать вакансию: в названии, компании и/или описании.", reply_markup={"inline_keyboard": buttons})
 
 def _send_experience_kb(chat_id, selected):
     buttons = []
@@ -1823,33 +2466,37 @@ def _send_experience_kb(chat_id, selected):
         buttons.append([{"text": mark + label, "callback_data": f"exp_{code}"}])
     buttons.append([{"text": "Далее", "callback_data": "exp_done"}])
     buttons.extend(_back_home_row("wiz_back"))
-    send_msg(chat_id, "<b>Опыт работы</b>\nВыберите один или несколько вариантов:",
+    send_msg(chat_id, "<b>Опыт</b>\nВыберите один или несколько вариантов:",
              reply_markup={"inline_keyboard": buttons})
 
 def _send_area_scope_kb(chat_id):
     kb = {"inline_keyboard": [
-        [{"text": "Искать везде", "callback_data": "scope_all"}],
-        [{"text": "Искать только в выбранных странах/городах", "callback_data": "scope_selected"}],
+        [{"text": "Все страны", "callback_data": "scope_all"}],
+        [{"text": "Выбрать страны и города", "callback_data": "scope_selected"}],
         *_back_home_row("wiz_back"),
     ]}
-    send_msg(chat_id, "<b>География поиска</b>\nСначала выберите общий режим:", reply_markup=kb)
+    send_msg(chat_id, "<b>Где искать вакансии</b>\nСначала выберите общий режим поиска:", reply_markup=kb)
 
-def _send_include_area_prompt(chat_id):
+def _send_include_area_prompt(chat_id, current_values=None, mode="create"):
     examples = ", ".join(POPULAR_AREA_NAMES[:12])
+    note = _current_value_note(current_values, "все страны и города") if mode == "edit" else "\n"
     send_msg(
         chat_id,
-        "<b>Страны / города для включения</b>\n"
-        "Введите через запятую.\n\n"
+        "<b>Страны и города</b>\n"
+        "Введите страны и города через запятую.\n\n"
+        + note +
         f"Примеры: {examples}\n\n"
         "Пример: <code>Грузия, Тбилиси, Беларусь</code>",
         reply_markup={"inline_keyboard": _back_home_row("wiz_back")}
     )
 
-def _send_exclude_area_prompt(chat_id):
+def _send_exclude_area_prompt(chat_id, current_values=None, mode="create"):
+    note = _current_value_note(current_values, "без исключений") if mode == "edit" else "\n"
     send_msg(
         chat_id,
-        "<b>Страны / города для исключения</b>\n"
-        "Введите через запятую или <code>нет</code>, если исключений не нужно.\n\n"
+        "<b>Исключения по регионам</b>\n"
+        "Введите страны или города через запятую, либо <code>нет</code>, если исключений не нужно.\n\n"
+        + note +
         "Примеры:\n"
         "<code>Москва</code>\n"
         "<code>Москва, Минск</code>\n"
@@ -1857,30 +2504,34 @@ def _send_exclude_area_prompt(chat_id):
         reply_markup={"inline_keyboard": _back_home_row("wiz_back")}
     )
 
-def _send_include_kw_prompt(chat_id):
+def _send_include_kw_prompt(chat_id, current_values=None, mode="create"):
+    note = _current_value_note(current_values, "нет") if mode == "edit" else "\n"
     send_msg(
         chat_id,
-        "<b>Слова, которые должны присутствовать</b>\n"
-        "Введите через запятую или <code>нет</code>, если такой фильтр не нужен.\n\n"
+        "<b>Обязательные слова</b>\n"
+        "Введите слова через запятую или <code>нет</code>, если такой фильтр не нужен.\n\n"
+        + note +
         "Пример: <code>sql, python, product</code>",
         reply_markup={"inline_keyboard": _back_home_row("wiz_back")}
     )
 
 def _send_include_in_kb(chat_id):
     kb = {"inline_keyboard": [
-        [{"text": "Искать только в названии", "callback_data": "ii_title"}],
-        [{"text": "Искать только в описании", "callback_data": "ii_description"}],
-        [{"text": "Искать и в названии, и в описании", "callback_data": "ii_both"}],
+        [{"text": "Только в названии", "callback_data": "ii_title"}],
+        [{"text": "Только в описании", "callback_data": "ii_description"}],
+        [{"text": "И в названии, и в описании", "callback_data": "ii_both"}],
         *_back_home_row("wiz_back"),
     ]}
-    send_msg(chat_id, "<b>Где должны встречаться включающие слова</b>", reply_markup=kb)
+    send_msg(chat_id, "<b>Где искать обязательные слова</b>", reply_markup=kb)
 
-def _send_exclude_kw_prompt(chat_id):
+def _send_exclude_kw_prompt(chat_id, current_values=None, mode="create"):
+    note = _current_value_note(current_values, "нет") if mode == "edit" else "\n"
     send_msg(
         chat_id,
-        "<b>Ключевые слова для исключения</b>\n\n"
-        "• <code>default</code> — стандартный список (гемблинг, казино, беттинг и т.д.)\n"
-        "• <code>нет</code>     — не фильтровать\n"
+        "<b>Исключающие слова</b>\n\n"
+        + note +
+        "• <code>default</code> — стандартный список\n"
+        "• <code>нет</code> — не использовать исключающие слова\n"
         "• Или введите свои слова через запятую\n\n"
         f"В дефолтном списке: <b>{len(DEFAULT_EXCLUDE_KEYWORDS)}</b> слов",
         reply_markup={"inline_keyboard": _back_home_row("wiz_back")}
@@ -1893,10 +2544,10 @@ def _send_exclude_in_kb(chat_id):
         [{"text": "И в названии, и в описании", "callback_data": "ei_both"}],
         *_back_home_row("wiz_back"),
     ]}
-    send_msg(chat_id, "<b>Где применять фильтр слов</b>", reply_markup=kb)
+    send_msg(chat_id, "<b>Где применять исключающие слова</b>", reply_markup=kb)
 
 def _work_formats_keyboard(selected):
-    buttons = [[{"text": "Сбросить выбор (любой формат)", "callback_data": "wf_any"}]]
+    buttons = [[{"text": "Любой формат", "callback_data": "wf_any"}]]
     for code, label in get_work_format_options().items():
         mark = "[x] " if code in selected else "[ ] "
         buttons.append([{"text": mark + label.replace("\xa0", " "), "callback_data": f"wf_{code}"}])
@@ -1917,8 +2568,32 @@ def _send_work_formats_kb(chat_id, selected):
         reply_markup={"inline_keyboard": _work_formats_keyboard(selected)},
     )
 
+
+def _send_area_work_formats_prompt(chat_id, current_rules=None, mode="create"):
+    current_text = _area_work_format_rules_text(current_rules)
+    note = ""
+    if mode == "edit":
+        note = (
+            f"Текущее значение:\n<code>{_esc(current_text or 'нет')}</code>\n"
+            "Напишите <code>ok</code>, чтобы оставить как есть.\n\n"
+        )
+    send_msg(
+        chat_id,
+        "<b>Формат по странам и городам</b>\n"
+        "Если для отдельных стран или городов нужен свой формат, введите правила построчно.\n"
+        "Одно правило в строке: <code>страна = формат</code>.\n"
+        "Можно несколько форматов через запятую.\n"
+        "Если не нужно, напишите <code>нет</code>.\n\n"
+        + note +
+        "Примеры:\n"
+        "<code>Россия = удалённо</code>\n"
+        "<code>Беларусь = удалённо</code>\n"
+        "<code>Казахстан = удалённо, гибрид</code>",
+        reply_markup={"inline_keyboard": _back_home_row("wiz_back")},
+    )
+
 def _employment_keyboard(selected):
-    buttons = [[{"text": "Сбросить выбор (любая занятость)", "callback_data": "emp_any"}]]
+    buttons = [[{"text": "Любая занятость", "callback_data": "emp_any"}]]
     for code, label in get_employment_options().items():
         mark = "[x] " if code in selected else "[ ] "
         buttons.append([{"text": mark + label, "callback_data": f"emp_{code}"}])
@@ -1927,22 +2602,24 @@ def _employment_keyboard(selected):
     return buttons
 
 def _send_employment_kb(chat_id, selected):
-    send_msg(chat_id, "<b>Тип занятости</b>\nВыберите один или несколько вариантов. Если ничего не выбрано, подойдут любые.", reply_markup={"inline_keyboard": _employment_keyboard(selected)})
+    send_msg(chat_id, "<b>Тип занятости</b>\nВыберите один или несколько вариантов. Если ничего не выбрано, подойдёт любая занятость.", reply_markup={"inline_keyboard": _employment_keyboard(selected)})
 
 def _send_salary_mode_kb(chat_id):
     kb = {"inline_keyboard": [
         [{"text": "Без фильтра по зарплате", "callback_data": "sal_any"}],
         [{"text": "Только вакансии с зарплатой", "callback_data": "sal_only"}],
-        [{"text": "Указать минимальную зарплату", "callback_data": "sal_min"}],
+        [{"text": "Минимальная зарплата", "callback_data": "sal_min"}],
         *_back_home_row("wiz_back"),
     ]}
-    send_msg(chat_id, "<b>Фильтр по зарплате</b>", reply_markup=kb)
+    send_msg(chat_id, "<b>Зарплата</b>\nВыберите, нужен ли фильтр по зарплате.", reply_markup=kb)
 
-def _send_employers_prompt(chat_id):
+def _send_employers_prompt(chat_id, current_values=None, mode="create"):
+    note = _current_value_note(current_values, "нет") if mode == "edit" else "\n"
     send_msg(
         chat_id,
-        "<b>Работодатели для исключения</b>\n"
+        "<b>Исключить работодателей</b>\n"
         "Введите компании через запятую или <code>нет</code>.\n\n"
+        + note +
         "Пример: <code>ANCOR, Lenkep recruitment</code>",
         reply_markup={"inline_keyboard": _back_home_row("wiz_back")}
     )
@@ -1953,7 +2630,7 @@ def _send_sort_kb(chat_id):
         for code, label in SORT_OPTIONS.items()
     ]}
     kb["inline_keyboard"].extend(_back_home_row("wiz_back"))
-    send_msg(chat_id, "<b>Сортировка</b>", reply_markup=kb)
+    send_msg(chat_id, "<b>Сортировка</b>\nВыберите, как упорядочить вакансии.", reply_markup=kb)
 
 def _send_period_kb(chat_id):
     kb = {"inline_keyboard": [
@@ -1969,7 +2646,7 @@ def _send_pages_kb(chat_id):
         for pages, label in MAX_PAGES_OPTIONS.items()
     ]}
     kb["inline_keyboard"].extend(_back_home_row("wiz_back"))
-    send_msg(chat_id, "<b>Глубина поиска</b>\nСколько страниц просматривать для каждого запроса:", reply_markup=kb)
+    send_msg(chat_id, "<b>Глубина поиска</b>\nСколько страниц проверять по каждому запросу:", reply_markup=kb)
 
 def _send_max_results_kb(chat_id):
     kb = {"inline_keyboard": [
@@ -1977,7 +2654,7 @@ def _send_max_results_kb(chat_id):
         for limit, label in MAX_RESULTS_OPTIONS.items()
     ]}
     kb["inline_keyboard"].extend(_back_home_row("wiz_back"))
-    send_msg(chat_id, "<b>Лимит за один запуск</b>\nСколько вакансий максимум отправлять за одну проверку:", reply_markup=kb)
+    send_msg(chat_id, "<b>Лимит за один запуск</b>\nСколько вакансий максимум сохранить в результате одной проверки:", reply_markup=kb)
 
 
 def _send_page_size_kb(chat_id):
@@ -1986,7 +2663,7 @@ def _send_page_size_kb(chat_id):
         for size, label in PAGE_SIZE_OPTIONS.items()
     ]}
     kb["inline_keyboard"].extend(_back_home_row("wiz_back"))
-    send_msg(chat_id, "<b>Размер страницы выдачи</b>\nСколько вакансий показывать за один экран:", reply_markup=kb)
+    send_msg(chat_id, "<b>Сколько показывать сразу</b>\nСколько вакансий присылать и показывать за один экран:", reply_markup=kb)
 
 def _send_interval_kb(chat_id):
     kb = {"inline_keyboard": [
@@ -1994,15 +2671,20 @@ def _send_interval_kb(chat_id):
         for mins, label in INTERVAL_OPTIONS.items()
     ]}
     kb["inline_keyboard"].extend(_back_home_row("wiz_back"))
-    send_msg(chat_id, "<b>Интервал автопроверки</b>", reply_markup=kb)
+    send_msg(chat_id, "<b>Автопроверка</b>\nКак часто автоматически запускать текущий шаблон:", reply_markup=kb)
 
 def _send_confirm(chat_id, draft):
-    text = _format_template_summary(draft, detailed=True)
+    text = (
+        "<b>Проверьте шаблон перед сохранением</b>\n"
+        "Если всё верно, сохраните его или сразу сделайте текущим.\n\n"
+        + _format_template_summary(draft, detailed=True)
+    )
     kb = {"inline_keyboard": [
         [
-            {"text": "Сохранить", "callback_data": "confirm_save"},
-            {"text": "Отмена",   "callback_data": "confirm_cancel"},
+            {"text": "Сохранить шаблон", "callback_data": "confirm_save"},
+            {"text": "Сохранить и сделать текущим", "callback_data": "confirm_activate"},
         ],
+        [{"text": "Отмена",   "callback_data": "confirm_cancel"}],
         *_back_home_row("wiz_back"),
     ]}
     send_msg(chat_id, text, reply_markup=kb)
@@ -2014,25 +2696,71 @@ def _send_confirm(chat_id, draft):
 
 def _menu_reply_markup():
     return {"inline_keyboard": [
-        [{"text": "Создать сценарий", "callback_data": "tmpl_new"},
-         {"text": "Сценарии", "callback_data": "menu_templates"}],
-        [{"text": "Активный сценарий", "callback_data": "menu_current"},
-         {"text": "Проверить вакансии", "callback_data": "run_now"}],
-        [{"text": "Автопоиск", "callback_data": "menu_status"},
+        [{"text": "Создать шаблон", "callback_data": "tmpl_new"},
+         {"text": "Мои шаблоны", "callback_data": "menu_templates"}],
+        [{"text": "Текущий шаблон", "callback_data": "menu_current"},
+         {"text": "Проверить сейчас", "callback_data": "run_now"}],
+        [{"text": "Автопроверка", "callback_data": "menu_status"},
          {"text": "Помощь", "callback_data": "menu_help"}],
     ]}
 
 
 def _current_search_keyboard(data):
     return {"inline_keyboard": [
-        [{"text": "Проверить вакансии", "callback_data": "run_now"},
+        [{"text": "Проверить сейчас", "callback_data": "run_now"},
          {"text": "Предпросмотр", "callback_data": "preview_now"}],
         [{"text": "Редактировать", "callback_data": f"tmpl_edit_{data.get('active_template_id') or ''}"},
-         {"text": "Автопоиск", "callback_data": "toggle"}],
-        [{"text": "Очистить отправленные", "callback_data": "reset_sent"}],
-        [{"text": "Сценарии", "callback_data": "menu_templates"},
+         {"text": "Очистить историю", "callback_data": "reset_sent"}],
+        [{"text": "Мои шаблоны", "callback_data": "menu_templates"},
          {"text": "Главное меню", "callback_data": "menu_home"}],
     ]}
+
+
+def _rerun_fresh_keyboard(data):
+    return {"inline_keyboard": [
+        [{"text": "Пройтись заново", "callback_data": "rerun_fresh"}],
+        [{"text": "Текущий шаблон", "callback_data": "menu_current"},
+         {"text": "Главное меню", "callback_data": "menu_home"}],
+    ]}
+
+
+def _search_summary_keyboard(data, session_id=None):
+    buttons = []
+    if session_id:
+        buttons.append([{"text": "Открыть список", "callback_data": f"res_{session_id}_0"}])
+    buttons.extend(_current_search_keyboard(data).get("inline_keyboard", []))
+    return {"inline_keyboard": buttons}
+
+
+def _template_view_keyboard(template_id, is_active):
+    if is_active:
+        return {"inline_keyboard": [
+            [{"text": "Проверить сейчас", "callback_data": "run_now"},
+             {"text": "Предпросмотр", "callback_data": "preview_now"}],
+            [{"text": "Редактировать", "callback_data": f"tmpl_edit_{template_id}"},
+             {"text": "Очистить историю", "callback_data": "reset_sent"}],
+            [{"text": "Мои шаблоны", "callback_data": "menu_templates"},
+             {"text": "Главное меню", "callback_data": "menu_home"}],
+        ]}
+
+    return {"inline_keyboard": [
+        [{"text": "Сделать текущим", "callback_data": f"tmpl_select_{template_id}"},
+         {"text": "Редактировать", "callback_data": f"tmpl_edit_{template_id}"}],
+        [{"text": "Удалить", "callback_data": f"tmpl_delete_{template_id}"}],
+        [{"text": "Мои шаблоны", "callback_data": "menu_templates"},
+         {"text": "Главное меню", "callback_data": "menu_home"}],
+    ]}
+
+
+def _send_template_details(chat_id, data, tmpl, is_active=False):
+    title = "<b>Текущий шаблон</b>" if is_active else "<b>Шаблон</b>"
+    note = (
+        "Текущий шаблон — это набор фильтров, который бот использует сейчас.\n"
+        "Автопроверка — это автоматический запуск текущего шаблона по расписанию.\n\n"
+        if is_active else ""
+    )
+    text = title + "\n\n" + note + _format_template_summary(tmpl, detailed=True)
+    send_msg(chat_id, text, reply_markup=_template_view_keyboard(tmpl["id"], is_active))
 
 
 def cmd_menu(chat_id, data):
@@ -2042,10 +2770,11 @@ def cmd_menu(chat_id, data):
         chat_id,
         "<b>Главное меню</b>\n"
         "Выберите действие:\n"
-        "• создать новый сценарий\n"
-        "• открыть сохранённые сценарии\n"
-        "• посмотреть активный сценарий\n"
-        "• проверить вакансии прямо сейчас",
+        "• создать новый шаблон\n"
+        "• открыть сохранённые шаблоны\n"
+        "• посмотреть текущий шаблон\n"
+        "• проверить вакансии сразу\n"
+        "• включить или выключить автопроверку",
         reply_markup=_menu_reply_markup(),
     )
 
@@ -2055,18 +2784,22 @@ def cmd_start(chat_id, data):
     save_data(data)
     send_msg(chat_id,
         "<b>HH.ru Vacancy Bot</b>\n\n"
-        "Отслеживаю вакансии на hh.ru и присылаю новые по вашим критериям.\n\n"
+        "Отслеживаю вакансии на hh.ru и присылаю новые по вашим критериям.\n"
+        "Почти всё можно делать кнопками, без ручного ввода команд.\n\n"
+        "Шаблон — это сохранённый набор фильтров.\n"
+        "Текущий шаблон — тот, который бот использует сейчас.\n"
+        "Автопроверка — автоматический запуск текущего шаблона по расписанию.\n\n"
         "<b>Команды:</b>\n"
         "/menu      — главное меню\n"
-        "/new       — создать новый сценарий\n"
-        "/templates — открыть сохранённые сценарии\n"
-        "/current   — показать активный сценарий\n"
+        "/new       — создать новый шаблон\n"
+        "/templates — открыть сохранённые шаблоны\n"
+        "/current   — показать текущий шаблон\n"
         "/run       — проверить вакансии прямо сейчас\n"
         "/preview   — предпросмотр без сохранения в историю\n"
-        "/reset_sent — очистить историю отправок активного сценария\n"
-        "/toggle    — включить/выключить автопоиск\n"
+        "/reset_sent — очистить историю отправок текущего шаблона\n"
+        "/toggle    — включить/выключить автопроверку\n"
         "/status    — статус и статистика\n"
-        "/help      — подробная справка"
+        "/help      — краткая помощь"
         ,
         reply_markup=_menu_reply_markup()
     )
@@ -2074,13 +2807,17 @@ def cmd_start(chat_id, data):
 def cmd_help(chat_id):
     send_msg(chat_id,
         "<b>Как пользоваться</b>\n\n"
-        "1. <b>/new</b> — создайте сценарий через мастер\n"
-        "2. <b>/templates</b> — выберите или отредактируйте сохранённый сценарий\n"
+        "1. <b>/new</b> — создайте шаблон через пошаговый мастер\n"
+        "2. <b>/templates</b> — выберите, откройте или отредактируйте сохранённый шаблон\n"
         "3. <b>/run</b> — немедленно проверю новые вакансии\n"
         "4. <b>/preview</b> — покажу результат без записи в историю\n"
-        "5. <b>/toggle</b> — пауза или запуск автопоиска\n"
-        "6. <b>/current</b> — полная сводка активного сценария\n"
-        "7. <b>/reset_sent</b> — очистка истории отправок активного сценария\n\n"
+        "5. <b>/toggle</b> — пауза или запуск автопроверки\n"
+        "6. <b>/current</b> — полная сводка текущего шаблона\n"
+        "7. <b>/reset_sent</b> — очистка истории отправок текущего шаблона\n\n"
+        "<b>Что как называется:</b>\n"
+        "• Шаблон — сохранённые настройки поиска\n"
+        "• Текущий шаблон — какой шаблон бот использует сейчас\n"
+        "• Автопроверка — автоматический запуск текущего шаблона по расписанию\n\n"
         "<b>Доступные фильтры:</b>\n"
         "• География: страны и города на включение и исключение\n"
         "• Опыт: любые HH-варианты, можно несколько\n"
@@ -2099,9 +2836,9 @@ def cmd_current(chat_id, data):
     save_data(data)
     tmpl = _active_template(data)
     if not tmpl:
-        send_msg(chat_id, "Активный сценарий ещё не выбран. Создайте его через /new.", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
+        send_msg(chat_id, "Текущий шаблон ещё не выбран. Создайте его или выберите в разделе «Мои шаблоны».", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
         return
-    send_msg(chat_id, _format_template_summary(tmpl, detailed=True), reply_markup=_current_search_keyboard(data))
+    _send_template_details(chat_id, data, tmpl, is_active=True)
 
 
 def cmd_reset_sent(chat_id, data):
@@ -2109,45 +2846,70 @@ def cmd_reset_sent(chat_id, data):
     tmpl = _active_template(data)
     if not tmpl:
         save_data(data)
-        send_msg(chat_id, "Нет активного сценария. Очищать пока нечего.")
+        send_msg(chat_id, "Нет текущего шаблона. Очищать пока нечего.")
         return
 
     _set_template_sent_ids(data, tmpl["id"], [])
     save_data(data)
-    send_msg(chat_id, f"История отправок для сценария <b>{_esc(tmpl['name'])}</b> очищена.", reply_markup=_current_search_keyboard(data))
+    send_msg(chat_id, f"История отправок для шаблона <b>{_esc(tmpl['name'])}</b> очищена.", reply_markup=_current_search_keyboard(data))
+
+
+def cmd_rerun_fresh(chat_id, data):
+    data["chat_id"] = chat_id
+    tmpl = _active_template(data)
+    if not tmpl:
+        save_data(data)
+        send_msg(chat_id, "Нет текущего шаблона. Сначала создайте его или выберите в разделе «Мои шаблоны».", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
+        return
+
+    _set_template_sent_ids(data, tmpl["id"], [])
+    save_data(data)
+    send_msg(
+        chat_id,
+        "История текущего шаблона очищена.\n"
+        "Запускаю повторный проход, чтобы показать вакансии заново.",
+    )
+    cmd_run(chat_id, data)
+
 
 def cmd_toggle(chat_id, data):
     data["chat_id"] = chat_id
     if not _active_template(data):
         save_data(data)
-        send_msg(chat_id, "Нет активного сценария. Сначала создайте или выберите его.", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
+        send_msg(chat_id, "Нет текущего шаблона. Сначала создайте его или выберите в разделе «Мои шаблоны».", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
         return
 
     data["searching"] = not data.get("searching", False)
     save_data(data)
     if data["searching"]:
-        send_msg(chat_id, "<b>Автопоиск включён</b>\nНовые вакансии будут приходить по расписанию.", reply_markup=_current_search_keyboard(data))
+        send_msg(chat_id, "<b>Автопроверка включена</b>\nТекущий шаблон будет запускаться по расписанию.", reply_markup=_current_search_keyboard(data))
     else:
-        send_msg(chat_id, "<b>Автопоиск на паузе</b>\n/run — ручной запуск в любой момент.", reply_markup=_current_search_keyboard(data))
+        send_msg(chat_id, "<b>Автопроверка выключена</b>\nТекущий шаблон можно проверить вручную в любой момент.", reply_markup=_current_search_keyboard(data))
 
 def cmd_status(chat_id, data):
     data["chat_id"] = chat_id
     save_data(data)
 
     tmpl     = _active_template(data)
-    icon     = "Вкл." if data.get("searching") else "Пауза"
-    st_text  = "активен" if data.get("searching") else "на паузе"
+    icon     = "Включена" if data.get("searching") else "Выключена"
+    st_text  = "включена" if data.get("searching") else "выключена"
     last_ts  = data.get("last_check", 0)
     last_str = datetime.fromtimestamp(last_ts).strftime("%d.%m %H:%M") if last_ts else "никогда"
     current_sent = len(_template_sent_ids(data, tmpl["id"])) if tmpl else 0
     total_sent = len(data.get("sent_ids", []))
 
     text = (
-        f"{icon} <b>Статус: {st_text}</b>\n\n"
-        f"Активный сценарий: <b>{_esc(tmpl['name']) if tmpl else 'не выбран'}</b>\n"
+        f"{icon} <b>Автопроверка: {st_text}</b>\n\n"
+        f"Текущий шаблон: <b>{_esc(tmpl['name']) if tmpl else 'не выбран'}</b>\n"
         f"Последняя проверка: {last_str}\n"
-        f"Отправлено по активному сценарию: {current_sent}\n"
+        f"Отправлено по текущему шаблону: {current_sent}\n"
         f"Отправлено всего: {total_sent}\n"
+    )
+
+    text += (
+        "\nШаблон — это сохранённые фильтры.\n"
+        "Текущий шаблон — тот, который бот использует сейчас.\n"
+        "Автопроверка — автоматический запуск текущего шаблона по расписанию.\n"
     )
 
     if tmpl and data.get("searching"):
@@ -2157,11 +2919,11 @@ def cmd_status(chat_id, data):
             text += f"Следующая проверка через: {remaining // 60} мин {remaining % 60} сек\n"
 
     kb = {"inline_keyboard": [
-        [{"text": "Пауза" if data.get("searching") else "Включить",
+        [{"text": "Выключить" if data.get("searching") else "Включить",
           "callback_data": "toggle"},
-         {"text": "Проверить вакансии", "callback_data": "run_now"}],
-        [{"text": "Активный сценарий", "callback_data": "menu_current"},
-         {"text": "Сценарии", "callback_data": "menu_templates"}],
+         {"text": "Проверить сейчас", "callback_data": "run_now"}],
+        [{"text": "Текущий шаблон", "callback_data": "menu_current"},
+         {"text": "Мои шаблоны", "callback_data": "menu_templates"}],
         [{"text": "Главное меню", "callback_data": "menu_home"}],
     ]}
     send_msg(chat_id, text, reply_markup=kb)
@@ -2171,7 +2933,7 @@ def cmd_templates(chat_id, data, page=0):
     save_data(data)
     tmpls = data.get("templates", [])
     if not tmpls:
-        send_msg(chat_id, "Сохранённых сценариев пока нет. Создайте первый через /new.", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
+        send_msg(chat_id, "Сохранённых шаблонов пока нет. Создайте первый через /new.", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
         return
 
     per_page = 4
@@ -2180,20 +2942,39 @@ def cmd_templates(chat_id, data, page=0):
     start = page * per_page
     current_items = tmpls[start:start + per_page]
 
-    text = f"<b>Сценарии поиска</b>\nСтраница <b>{page + 1}/{total_pages}</b>\n\n"
+    text = (
+        f"<b>Мои шаблоны</b>\n"
+        f"Страница <b>{page + 1}/{total_pages}</b>\n\n"
+        "Шаблон — это сохранённый набор фильтров.\n"
+        "Текущий шаблон — тот, который бот использует сейчас.\n\n"
+    )
     buttons = []
     for index, t in enumerate(current_items, start=start + 1):
-        mark = "Активный" if t["id"] == data.get("active_template_id") else "Сохранён"
+        work_formats = [get_work_format_options().get(code, code) for code in t.get("work_formats", [])]
+        exp_names = [EXPERIENCE_OPTIONS.get(code, code) for code in t.get("experience", [])]
+        include_names = t.get("included_area_names", [])
+        exclude_names = t.get("excluded_area_names", [])
+        geo_text = ", ".join(include_names[:2]) if include_names else "Все страны"
+        if len(include_names) > 2:
+            geo_text += f" +{len(include_names) - 2}"
+        if exclude_names:
+            excluded_preview = ", ".join(exclude_names[:2])
+            if len(exclude_names) > 2:
+                excluded_preview += f" +{len(exclude_names) - 2}"
+            geo_text += f" · кроме {excluded_preview}"
+        status_text = "Текущий шаблон" if t["id"] == data.get("active_template_id") else "Сохранённый шаблон"
         text += (
             f"<b>{index}. {_esc(t['name'])}</b>\n"
-            f"Статус: {mark}\n"
-            f"Запросов: {len(t.get('queries', []))} · Интервал: {t.get('interval', 30)} мин\n"
-            f"Страниц: {t.get('max_pages', 5)} · Лимит: {t.get('max_results', 50)} · В выдаче: {t.get('delivery_page_size', 5)}\n\n"
+            f"Что ищем: {_esc(_compact_preview(t.get('queries', []), limit=2, empty_text='—'))}\n"
+            f"Где ищем: {_esc(geo_text)}\n"
+            f"Опыт: {_esc(', '.join(exp_names[:2]) or 'Не важно')}\n"
+            f"Формат: {_esc(', '.join(work_formats[:2]) or 'Любой')}\n"
+            f"Статус: {status_text}\n\n"
         )
         buttons.append([
-            {"text": f"{index}. Открыть", "callback_data": f"tmpl_select_{t['id']}"},
-            {"text": f"{index}. Изм.", "callback_data": f"tmpl_edit_{t['id']}"},
-            {"text": f"{index}. Удал.", "callback_data": f"tmpl_delete_{t['id']}"},
+            {"text": f"{index}. Открыть", "callback_data": f"tmpl_open_{t['id']}"},
+            {"text": f"{index}. Сделать текущим", "callback_data": f"tmpl_select_{t['id']}"},
+            {"text": f"{index}. Удалить", "callback_data": f"tmpl_delete_{t['id']}"},
         ])
     nav_row = []
     if page > 0:
@@ -2202,7 +2983,7 @@ def cmd_templates(chat_id, data, page=0):
         nav_row.append({"text": "Далее", "callback_data": f"tmpl_page_{page + 1}"})
     if nav_row:
         buttons.append(nav_row)
-    buttons.append([{"text": "Создать сценарий", "callback_data": "tmpl_new"}])
+    buttons.append([{"text": "Создать шаблон", "callback_data": "tmpl_new"}])
     buttons.extend(_back_home_row("menu_home"))
     send_msg(chat_id, text, reply_markup={"inline_keyboard": buttons})
 
@@ -2211,7 +2992,7 @@ def cmd_run(chat_id, data):
     save_data(data)
     tmpl = _active_template(data)
     if not tmpl:
-        send_msg(chat_id, "Нет активного сценария. Создайте его через /new.", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
+        send_msg(chat_id, "Нет текущего шаблона. Создайте его через /new или выберите в разделе «Мои шаблоны».", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
         return
     send_msg(chat_id, _format_launch_message(tmpl, preview=False))
     _run_search(chat_id, data, tmpl, persist=True)
@@ -2222,7 +3003,7 @@ def cmd_preview(chat_id, data):
     save_data(data)
     tmpl = _active_template(data)
     if not tmpl:
-        send_msg(chat_id, "Нет активного сценария. Создайте его через /new.", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
+        send_msg(chat_id, "Нет текущего шаблона. Создайте его через /new или выберите в разделе «Мои шаблоны».", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
         return
     send_msg(chat_id, _format_launch_message(tmpl, preview=True))
     _run_search(chat_id, data, tmpl, persist=False)
@@ -2267,7 +3048,104 @@ def _execute_search_result(data, tmpl, persist=True):
     }
 
 
+def _run_search_live(chat_id, data, tmpl):
+    initial_sent_ids = list(_template_sent_ids(data, tmpl["id"]))
+    initial_sent_set = set(initial_sent_ids)
+    instant_limit = max(1, int(tmpl.get("delivery_page_size", 5) or 5))
+    instant_sent_ids = []
+    instant_sent_set = set()
+
+    def _on_batch(batch_vacancies):
+        newly_streamed_ids = []
+        if len(instant_sent_ids) >= instant_limit:
+            return newly_streamed_ids
+
+        for vacancy in batch_vacancies:
+            vacancy_id = str(vacancy.get("id", ""))
+            if not vacancy_id:
+                continue
+            if vacancy_id in initial_sent_set or vacancy_id in instant_sent_set:
+                continue
+            send_msg(chat_id, format_vacancy(vacancy))
+            instant_sent_set.add(vacancy_id)
+            instant_sent_ids.append(vacancy_id)
+            newly_streamed_ids.append(vacancy_id)
+            if len(instant_sent_ids) >= instant_limit:
+                break
+
+        return newly_streamed_ids
+
+    result = fetch_vacancies(tmpl, on_batch=_on_batch)
+    fetched_vacancies = result.get("vacancies", [])
+    fetch_errors = result.get("errors", [])
+
+    visible_vacancies = []
+    sent_ids = list(initial_sent_ids)
+    sent_set = set(initial_sent_set)
+    for vacancy in fetched_vacancies:
+        vacancy_id = str(vacancy.get("id", ""))
+        if not vacancy_id or vacancy_id in sent_set:
+            continue
+        visible_vacancies.append(vacancy)
+        sent_set.add(vacancy_id)
+        sent_ids.append(vacancy_id)
+
+    if not visible_vacancies:
+        reason_lines = []
+        if fetched_vacancies:
+            reason_lines.append("По фильтрам вакансии есть, но они уже были отправлены раньше.")
+        else:
+            reason_lines.append("По текущим фильтрам ничего не найдено.")
+        if fetch_errors:
+            reason_lines.append(_friendly_fetch_error_summary(fetch_errors))
+        reason_lines.append("Проверьте запросы, опыт, географию, формат работы и слова для исключения.")
+        reply_markup = _rerun_fresh_keyboard(data) if fetched_vacancies else _current_search_keyboard(data)
+        send_msg(chat_id, "\n".join(reason_lines), reply_markup=reply_markup)
+        return {
+            "total_found": len(fetched_vacancies),
+            "sent_now": 0,
+            "new_count": 0,
+            "persist": True,
+            "errors": fetch_errors,
+        }
+
+    data["last_check"] = time.time()
+    _set_template_sent_ids(data, tmpl["id"], sent_ids)
+
+    hidden_count = max(0, len(visible_vacancies) - len(instant_sent_ids))
+    session_id = None
+    if hidden_count > 0:
+        session_id = _store_result_session(data, tmpl, visible_vacancies, True, fetch_errors)
+
+    save_data(data)
+
+    header_lines = [
+        "<b>Поиск завершён</b>",
+        f"Поиск: <b>{_esc(tmpl['name'])}</b>",
+        f"Показано сразу: <b>{len(instant_sent_ids)}</b>",
+        f"Всего новых вакансий: <b>{len(visible_vacancies)}</b>",
+        f"Всего найдено по фильтрам: <b>{len(fetched_vacancies)}</b>",
+    ]
+    if hidden_count > 0:
+        header_lines.append(f"Осталось в списке: <b>{hidden_count}</b>")
+    if fetch_errors:
+        header_lines.append(_friendly_fetch_error_summary(fetch_errors))
+
+    send_msg(chat_id, "\n".join(header_lines), reply_markup=_search_summary_keyboard(data, session_id))
+
+    return {
+        "total_found": len(fetched_vacancies),
+        "sent_now": len(visible_vacancies),
+        "new_count": len(visible_vacancies),
+        "persist": True,
+        "errors": fetch_errors,
+    }
+
+
 def _run_search(chat_id, data, tmpl, persist=True):
+    if persist:
+        return _run_search_live(chat_id, data, tmpl)
+
     result = _execute_search_result(data, tmpl, persist=persist)
     fetched_vacancies = result["fetched_vacancies"]
     visible_vacancies = result["visible_vacancies"]
@@ -2280,9 +3158,10 @@ def _run_search(chat_id, data, tmpl, persist=True):
         else:
             reason_lines.append("По текущим фильтрам ничего не найдено.")
         if fetch_errors:
-            reason_lines.append(f"Ошибка запроса: <code>{_esc('; '.join(fetch_errors[:2]))}</code>")
+            reason_lines.append(_friendly_fetch_error_summary(fetch_errors))
         reason_lines.append("Проверьте запросы, опыт, географию, формат работы и слова для исключения.")
-        send_msg(chat_id, "\n".join(reason_lines), reply_markup=_current_search_keyboard(data))
+        reply_markup = _rerun_fresh_keyboard(data) if fetched_vacancies and persist else _current_search_keyboard(data)
+        send_msg(chat_id, "\n".join(reason_lines), reply_markup=reply_markup)
         return {
             "total_found": len(fetched_vacancies),
             "sent_now": 0,
@@ -2302,7 +3181,7 @@ def _run_search(chat_id, data, tmpl, persist=True):
         f"Всего найдено по фильтрам: <b>{len(fetched_vacancies)}</b>",
     ]
     if fetch_errors:
-        header_lines.append(f"Ошибки: <code>{_esc('; '.join(fetch_errors[:2]))}</code>")
+        header_lines.append(_friendly_fetch_error_summary(fetch_errors))
     send_msg(chat_id, "\n".join(header_lines), reply_markup=_current_search_keyboard(data))
     send_msg(chat_id, text, reply_markup=markup)
 
@@ -2355,14 +3234,24 @@ def run_manual_search_tick(persist=True):
 def _show_wizard_step(chat_id, state):
     step = state.get("step")
     draft = state.get("draft", {})
+    mode = state.get("mode", "create")
+    title = "Редактирование шаблона" if mode == "edit" else "Создание шаблона"
 
     if step == "queries":
+        current_queries = ", ".join(draft.get("queries", [])[:6])
+        current_note = ""
+        if mode == "edit" and current_queries:
+            current_note = (
+                f"Текущие запросы: <code>{_esc(current_queries)}</code>\n"
+                "Напишите <code>ok</code>, чтобы оставить их без изменений.\n\n"
+            )
         send_msg(
             chat_id,
-            "<b>Мастер настройки поиска</b>\n\n"
-            "<b>Запросы</b>\n"
-            "Введите названия вакансий через запятую.\n"
+            f"<b>{title}</b>\n\n"
+            "<b>Шаг 1. Что ищем</b>\n"
+            "Введите основную вакансию и синонимы через запятую.\n"
             "Или напишите <code>default</code>.\n\n"
+            + current_note +
             "Пример: <code>data analyst, product analyst</code>",
             reply_markup={"inline_keyboard": _back_home_row()},
         )
@@ -2377,25 +3266,28 @@ def _show_wizard_step(chat_id, state):
         _send_area_scope_kb(chat_id)
         return
     if step == "include_areas":
-        _send_include_area_prompt(chat_id)
+        _send_include_area_prompt(chat_id, draft.get("included_area_names", []), mode)
         return
     if step == "exclude_areas":
-        _send_exclude_area_prompt(chat_id)
+        _send_exclude_area_prompt(chat_id, draft.get("excluded_area_names", []), mode)
         return
     if step == "include_kw":
-        _send_include_kw_prompt(chat_id)
+        _send_include_kw_prompt(chat_id, draft.get("include_keywords", []), mode)
         return
     if step == "include_in":
         _send_include_in_kb(chat_id)
         return
     if step == "exclude_kw":
-        _send_exclude_kw_prompt(chat_id)
+        _send_exclude_kw_prompt(chat_id, draft.get("exclude_keywords", []), mode)
         return
     if step == "exclude_in":
         _send_exclude_in_kb(chat_id)
         return
     if step == "work_formats":
         _send_work_formats_kb(chat_id, draft.get("work_formats", []))
+        return
+    if step == "area_work_formats":
+        _send_area_work_formats_prompt(chat_id, draft.get("area_work_format_rules", []), mode)
         return
     if step == "employment":
         _send_employment_kb(chat_id, draft.get("employment_types", []))
@@ -2411,7 +3303,7 @@ def _show_wizard_step(chat_id, state):
         )
         return
     if step == "employers":
-        _send_employers_prompt(chat_id)
+        _send_employers_prompt(chat_id, draft.get("excluded_employers", []), mode)
         return
     if step == "sort":
         _send_sort_kb(chat_id)
@@ -2434,9 +3326,10 @@ def _show_wizard_step(chat_id, state):
     if step == "name":
         send_msg(
             chat_id,
-            "<b>Название поиска</b>\n"
-            f"Текущее название: <code>{_esc(draft.get('name', 'Новый сценарий'))}</code>\n\n"
-            "Введите новое название или <code>ok</code>, чтобы оставить текущее.",
+            "<b>Название шаблона</b>\n"
+            f"Текущее название: <code>{_esc(draft.get('name', 'Новый поиск'))}</code>\n\n"
+            "Введите новое название или <code>ok</code>, чтобы оставить текущее.\n"
+            "После этого покажу итоговое подтверждение.",
             reply_markup={"inline_keyboard": _back_home_row("wiz_back")},
         )
         return
@@ -2502,6 +3395,11 @@ def handle_callback(cb, data):
         cmd_reset_sent(chat_id, data)
         return
 
+    if cdata == "rerun_fresh":
+        data = load_data()
+        cmd_rerun_fresh(chat_id, data)
+        return
+
     if cdata == "wiz_back":
         history = state.get("history", [])
         if not history:
@@ -2536,16 +3434,25 @@ def handle_callback(cb, data):
         cmd_templates(chat_id, data, int(cdata[len("tmpl_page_"):]))
         return
 
+    if cdata.startswith("tmpl_open_"):
+        tmpl_id = cdata[len("tmpl_open_"):]
+        data = load_data()
+        tmpl = next((t for t in data["templates"] if t["id"] == tmpl_id), None)
+        if not tmpl:
+            send_msg(chat_id, "Шаблон не найден.", reply_markup={"inline_keyboard": _back_home_row("menu_templates")})
+            return
+        _send_template_details(chat_id, data, tmpl, is_active=(tmpl_id == data.get("active_template_id")))
+        return
+
     if cdata.startswith("tmpl_select_"):
         tmpl_id = cdata[len("tmpl_select_"):]
         data["active_template_id"] = tmpl_id
-        data["searching"]          = True
         data.setdefault("sent_ids_by_template", {}).setdefault(str(tmpl_id), [])
         save_data(data)
         tmpl = next((t for t in data["templates"] if t["id"] == tmpl_id), None)
         send_msg(
             chat_id,
-            f"Активный сценарий: <b>{_esc(tmpl['name'])}</b>\nАвтопоиск включён.",
+            f"Текущий шаблон: <b>{_esc(tmpl['name'])}</b>",
             reply_markup=_current_search_keyboard(data),
         )
         return
@@ -2564,7 +3471,7 @@ def handle_callback(cb, data):
             data["active_template_id"] = None
             data["searching"]          = False
         save_data(data)
-        send_msg(chat_id, "Поиск удалён.")
+        send_msg(chat_id, "Шаблон удалён.")
         data = load_data()
         cmd_templates(chat_id, data)
         return
@@ -2604,11 +3511,7 @@ def handle_callback(cb, data):
         if code in selected:
             selected.remove(code)
         else:
-            if code == ANY_EXPERIENCE:
-                selected = [ANY_EXPERIENCE]
-            else:
-                selected = [item for item in selected if item != ANY_EXPERIENCE]
-                selected.append(code)
+            selected.append(code)
         draft["experience"] = _unique_list(selected) or [ANY_EXPERIENCE]
         state["draft"] = draft
         save_data(data)
@@ -2637,11 +3540,11 @@ def handle_callback(cb, data):
             draft["included_area_names"] = []
             _wizard_move_to(state, "exclude_areas")
             save_data(data)
-            _send_exclude_area_prompt(chat_id)
+            _send_exclude_area_prompt(chat_id, draft.get("excluded_area_names", []), state.get("mode", "create"))
         else:
             _wizard_move_to(state, "include_areas")
             save_data(data)
-            _send_include_area_prompt(chat_id)
+            _send_include_area_prompt(chat_id, draft.get("included_area_names", []), state.get("mode", "create"))
         return
 
     # ── Wizard: Include in ────────────────────────────────
@@ -2650,7 +3553,7 @@ def handle_callback(cb, data):
         state["draft"] = draft
         _wizard_move_to(state, "exclude_kw")
         save_data(data)
-        _send_exclude_kw_prompt(chat_id)
+        _send_exclude_kw_prompt(chat_id, draft.get("exclude_keywords", []), state.get("mode", "create"))
         return
 
     # ── Wizard: Exclude in ────────────────────────────────
@@ -2684,9 +3587,9 @@ def handle_callback(cb, data):
         return
 
     if cdata == "wf_done":
-        _wizard_move_to(state, "employment")
+        _wizard_move_to(state, "area_work_formats")
         save_data(data)
-        _send_employment_kb(chat_id, draft.get("employment_types", []))
+        _send_area_work_formats_prompt(chat_id, draft.get("area_work_format_rules", []), state.get("mode", "create"))
         return
 
     # ── Wizard: Employment ────────────────────────────────
@@ -2723,7 +3626,7 @@ def handle_callback(cb, data):
         state["draft"] = draft
         _wizard_move_to(state, "employers")
         save_data(data)
-        _send_employers_prompt(chat_id)
+        _send_employers_prompt(chat_id, draft.get("excluded_employers", []), state.get("mode", "create"))
         return
 
     if cdata == "sal_only":
@@ -2732,7 +3635,7 @@ def handle_callback(cb, data):
         state["draft"] = draft
         _wizard_move_to(state, "employers")
         save_data(data)
-        _send_employers_prompt(chat_id)
+        _send_employers_prompt(chat_id, draft.get("excluded_employers", []), state.get("mode", "create"))
         return
 
     if cdata == "sal_min":
@@ -2796,38 +3699,57 @@ def handle_callback(cb, data):
         _wizard_move_to(state, "name")
         save_data(data)
         send_msg(chat_id,
-            "<b>Название поиска</b>\n"
-            f"Текущее название: <code>{_esc(draft.get('name', 'Новый сценарий'))}</code>\n\n"
-            "Введите новое название или <code>ok</code> чтобы оставить текущее.",
+            "<b>Название шаблона</b>\n"
+            f"Текущее название: <code>{_esc(draft.get('name', 'Новый поиск'))}</code>\n\n"
+            "Введите новое название или <code>ok</code>, чтобы оставить текущее.\n"
+            "После этого покажу итоговое подтверждение.",
             reply_markup={"inline_keyboard": _back_home_row("wiz_back")}
         )
         return
 
     # ── Wizard: Confirm / Cancel ──────────────────────────
-    if cdata == "confirm_save":
-        tmpl     = state.get("draft", {})
+    if cdata in ("confirm_save", "confirm_activate"):
+        tmpl = _normalize_template(state.get("draft", {}))
         existing = [t for t in data["templates"] if t["id"] != tmpl["id"]]
         existing.append(tmpl)
-        data["templates"]          = existing
-        data["active_template_id"] = tmpl["id"]
-        data["searching"]          = True
+        data["templates"] = existing
         data.setdefault("sent_ids_by_template", {}).setdefault(str(tmpl["id"]), [])
+
+        if cdata == "confirm_activate":
+            data["active_template_id"] = tmpl["id"]
+        elif data.get("active_template_id") == tmpl["id"]:
+            data["active_template_id"] = tmpl["id"]
+
         if str(chat_id) in data["user_states"]:
             del data["user_states"][str(chat_id)]
         save_data(data)
-        send_msg(chat_id,
-            f"<b>Поиск «{_esc(tmpl['name'])}» сохранён.</b>\n"
-            "Автопоиск включён.\n"
-            "/run — запустить поиск прямо сейчас.",
-            reply_markup=_current_search_keyboard(data)
-        )
+
+        if cdata == "confirm_activate":
+            send_msg(
+                chat_id,
+                f"<b>Шаблон «{_esc(tmpl['name'])}» сохранён и сделан текущим.</b>",
+                reply_markup=_current_search_keyboard(data),
+            )
+        else:
+            send_msg(
+                chat_id,
+                f"<b>Шаблон «{_esc(tmpl['name'])}» сохранён.</b>\nОткрыть его можно в разделе «Мои шаблоны».",
+                reply_markup={"inline_keyboard": [
+                    [{"text": "Мои шаблоны", "callback_data": "menu_templates"},
+                     {"text": "Главное меню", "callback_data": "menu_home"}]
+                ]},
+            )
         return
 
     if cdata == "confirm_cancel":
         if str(chat_id) in data["user_states"]:
+            mode = data["user_states"][str(chat_id)].get("mode", "create")
             del data["user_states"][str(chat_id)]
+        else:
+            mode = "create"
         save_data(data)
-        send_msg(chat_id, "Создание поиска отменено.", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
+        text = "Редактирование шаблона отменено." if mode == "edit" else "Создание шаблона отменено."
+        send_msg(chat_id, text, reply_markup={"inline_keyboard": _back_home_row("menu_home")})
         return
 
 
@@ -2841,7 +3763,7 @@ def _create_default_template():
         "name":               "Аналитик — все страны кроме России",
         "queries":            DEFAULT_QUERIES[:],
         "search_fields":      ["name", "company_name", "description"],
-        "experience":         ["noExperience", "between1And3"],
+        "experience":         [ANY_EXPERIENCE, "noExperience", "between1And3"],
         "included_area_ids":  [],
         "included_area_names": [],
         "excluded_area_ids":  [str(RUSSIA_AREA_ID)],
@@ -2851,6 +3773,7 @@ def _create_default_template():
         "exclude_keywords":   DEFAULT_EXCLUDE_KEYWORDS[:],
         "exclude_in":         "both",
         "work_formats":       [],
+        "area_work_format_rules": _default_area_work_format_rules(),
         "employment_types":   [],
         "period_days":        3,
         "only_with_salary":   False,
@@ -2909,7 +3832,7 @@ def process_update(upd):
     state = data["user_states"].get(str(chat_id))
     if state and not text.startswith("/"):
         if state["step"] == "name" and text.lower() in ("ok", "ок"):
-            text = state["draft"].get("name", "Новый сценарий")
+            text = state["draft"].get("name", "Новый поиск")
         try:
             wizard_handle_text(chat_id, text, data)
         except Exception as e:
@@ -3077,21 +4000,23 @@ def _web_ui_html():
       font: 15px/1.5 "Segoe UI", "Helvetica Neue", sans-serif;
     }
     .page {
-      max-width: 1500px;
+      max-width: 1560px;
       margin: 0 auto;
-      padding: 24px 18px 44px;
+      padding: 18px 16px 40px;
     }
-    .panel, .topbar, .stat-card {
+    .panel, .app-header, .stat-card {
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: var(--radius);
       box-shadow: var(--shadow);
     }
-    .topbar {
-      padding: 24px 26px;
-      margin-bottom: 18px;
+    .app-header {
+      padding: 18px 20px;
+      margin-bottom: 16px;
       display: grid;
-      gap: 14px;
+      gap: 18px;
+      grid-template-columns: minmax(0, 1.45fr) minmax(320px, 0.85fr);
+      align-items: start;
     }
     .eyebrow {
       display: inline-flex;
@@ -3106,26 +4031,110 @@ def _web_ui_html():
       letter-spacing: 0.04em;
       text-transform: uppercase;
     }
-    .topbar h1 {
+    .app-header-main {
+      display: grid;
+      gap: 10px;
+      min-width: 0;
+    }
+    .app-header-side {
+      display: grid;
+      gap: 12px;
+      min-width: 0;
+    }
+    .header-note {
+      padding: 14px 16px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: rgba(238, 243, 255, 0.72);
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.55;
+      overflow-wrap: anywhere;
+    }
+    .header-note strong {
+      color: var(--text);
+    }
+    .app-header h1 {
       margin: 0;
-      font-size: 34px;
-      line-height: 1.08;
+      font-size: 32px;
+      line-height: 1.12;
       letter-spacing: -0.03em;
     }
-    .topbar p {
+    .app-header p {
       margin: 0;
-      max-width: 920px;
       color: var(--muted);
+      max-width: 880px;
+      overflow-wrap: anywhere;
     }
-    .status-strip {
+    .token-box {
+      display: none;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      padding: 14px 16px;
+      border: 1px dashed var(--line-strong);
+      border-radius: 16px;
+      background: #fff;
+    }
+    .token-box.visible {
+      display: flex;
+    }
+    .workspace {
       display: grid;
-      gap: 14px;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      margin-bottom: 14px;
+      gap: 18px;
+      grid-template-columns: 380px minmax(0, 1fr);
+      align-items: start;
+    }
+    .sidebar-column,
+    .content-column {
+      display: grid;
+      gap: 16px;
+      min-width: 0;
+    }
+    .panel {
+      padding: 18px;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .panel h2,
+    .sidebar-head h2,
+    .section-head h2,
+    .results-toolbar h2 {
+      margin: 0;
+      font-size: 22px;
+      line-height: 1.15;
+      letter-spacing: -0.02em;
+    }
+    .panel h3 {
+      margin: 0 0 12px;
+      font-size: 13px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .sidebar-head,
+    .section-head,
+    .results-toolbar {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      flex-wrap: wrap;
+      min-width: 0;
+    }
+    .section-head p,
+    .sidebar-head p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
     }
     .stat-card {
-      padding: 16px 18px;
-      min-height: 108px;
+      padding: 16px;
+      min-height: 96px;
+      min-width: 0;
+      overflow: hidden;
     }
     .stat-card strong {
       display: block;
@@ -3140,70 +4149,25 @@ def _web_ui_html():
       font-size: 18px;
       font-weight: 700;
       line-height: 1.3;
-      word-break: break-word;
+      overflow-wrap: anywhere;
+    }
+    .status-grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
     .quick-actions {
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
-      margin-bottom: 18px;
     }
-    .token-box {
-      display: none;
-      gap: 10px;
-      align-items: center;
-      flex-wrap: wrap;
-      padding-top: 10px;
-      border-top: 1px dashed var(--line-strong);
-    }
-    .token-box.visible {
-      display: flex;
-    }
-    .layout {
+    .overview-panel,
+    .results-panel,
+    .save-panel,
+    .filter-panel,
+    .scenario-panel {
       display: grid;
-      gap: 18px;
-      grid-template-columns: 340px minmax(0, 1fr);
-      align-items: start;
-    }
-    .panel {
-      padding: 20px;
-    }
-    .sidebar {
-      position: sticky;
-      top: 18px;
-    }
-    .sidebar-head,
-    .section-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      align-items: flex-start;
-      flex-wrap: wrap;
-      margin-bottom: 14px;
-    }
-    .section-head h2,
-    .sidebar-head h2,
-    .panel h2 {
-      margin: 0;
-      font-size: 20px;
-      letter-spacing: -0.02em;
-    }
-    .section-head p,
-    .sidebar-head p {
-      margin: 0;
-      color: var(--muted);
-      font-size: 14px;
-    }
-    .panel h3 {
-      margin: 0 0 12px;
-      font-size: 13px;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-    }
-    .stack {
-      display: grid;
-      gap: 18px;
+      gap: 16px;
     }
     .grid-2 {
       display: grid;
@@ -3220,10 +4184,13 @@ def _web_ui_html():
       gap: 7px;
       font-weight: 600;
       color: var(--text);
+      min-width: 0;
     }
     .field small {
       color: var(--muted);
       font-weight: 400;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
     }
     input[type="text"],
     input[type="number"],
@@ -3248,6 +4215,7 @@ def _web_ui_html():
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
+      min-width: 0;
     }
     .check-pill {
       display: inline-flex;
@@ -3259,6 +4227,8 @@ def _web_ui_html():
       background: #fff;
       color: var(--text);
       font-weight: 500;
+      max-width: 100%;
+      overflow-wrap: anywhere;
     }
     .field-row {
       display: flex;
@@ -3270,6 +4240,11 @@ def _web_ui_html():
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
+      min-width: 0;
+    }
+    .actions > * {
+      max-width: 100%;
+      min-width: 0;
     }
     button {
       border: 0;
@@ -3292,6 +4267,9 @@ def _web_ui_html():
     .template-list {
       display: grid;
       gap: 10px;
+      max-height: 420px;
+      overflow: auto;
+      padding-right: 2px;
     }
     .template-card {
       border: 1px solid var(--line);
@@ -3300,11 +4278,19 @@ def _web_ui_html():
       padding: 15px;
       display: grid;
       gap: 10px;
+      min-width: 0;
     }
     .template-card.active {
       border-color: var(--accent);
       background: #fff;
       box-shadow: inset 0 0 0 1px rgba(53, 109, 255, 0.18);
+    }
+    .template-card .actions button {
+      flex: 1 1 calc(50% - 10px);
+      padding-inline: 12px;
+    }
+    .template-card .actions .danger {
+      flex-basis: 100%;
     }
     .template-card h4 {
       margin: 0;
@@ -3314,7 +4300,7 @@ def _web_ui_html():
       color: var(--muted);
       font-size: 13px;
       white-space: pre-line;
-      word-break: break-word;
+      overflow-wrap: anywhere;
     }
     .message {
       display: none;
@@ -3322,7 +4308,8 @@ def _web_ui_html():
       border-radius: 14px;
       font-weight: 600;
       white-space: pre-line;
-      word-break: break-word;
+      overflow-wrap: anywhere;
+      margin-bottom: 16px;
     }
     .message.info { display: block; background: #e6effc; color: #214d8e; }
     .message.success { display: block; background: #dbf0dc; color: #1c5d22; }
@@ -3330,46 +4317,119 @@ def _web_ui_html():
     .hint {
       color: var(--muted);
       font-size: 13px;
-    }
-    .results-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      align-items: center;
-      flex-wrap: wrap;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
     }
     .results-list {
       display: grid;
       gap: 12px;
-      margin-top: 14px;
     }
     .result-card {
       border: 1px solid var(--line);
-      border-radius: 16px;
-      padding: 16px;
-      background: #fff;
+      border-radius: 18px;
+      padding: 18px;
+      background: linear-gradient(180deg, #ffffff 0%, #fbfcff 100%);
       display: grid;
-      gap: 7px;
+      gap: 12px;
+      min-width: 0;
+      overflow: hidden;
     }
     .result-card h4 {
       margin: 0;
-      font-size: 17px;
+      font-size: 20px;
+      line-height: 1.28;
+      overflow-wrap: anywhere;
     }
-    .result-meta {
+    .result-top {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 14px;
+      align-items: flex-start;
+      min-width: 0;
+    }
+    .result-order {
+      width: 34px;
+      height: 34px;
+      border-radius: 12px;
+      background: var(--accent-soft);
+      color: var(--accent-2);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      flex: 0 0 auto;
+    }
+    .result-main {
+      display: grid;
+      gap: 10px;
+      min-width: 0;
+    }
+    .result-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      min-width: 0;
+    }
+    .meta-pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: var(--panel-soft);
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.35;
+      max-width: 100%;
+      overflow-wrap: anywhere;
+    }
+    .result-snippet {
+      margin: 0;
       color: var(--muted);
       font-size: 14px;
+      line-height: 1.6;
+      overflow-wrap: anywhere;
+    }
+    .result-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 10px 14px;
+      border-radius: 12px;
+      background: var(--accent);
+      color: #fff;
+      text-decoration: none;
+      font-weight: 700;
+      white-space: nowrap;
     }
     .filters-grid {
       display: grid;
       gap: 18px;
     }
+    .filter-panel {
+      background: rgba(255, 255, 255, 0.95);
+    }
+    .summary-shell {
+      display: grid;
+      gap: 10px;
+    }
+    .summary-title {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
     .pager {
       display: flex;
       gap: 10px;
       align-items: center;
-      justify-content: flex-end;
+      justify-content: space-between;
       flex-wrap: wrap;
-      margin-top: 16px;
+      min-width: 0;
+    }
+    .save-panel .actions button {
+      flex: 1 1 190px;
     }
     .summary-box {
       background: var(--panel-soft);
@@ -3378,101 +4438,113 @@ def _web_ui_html():
       padding: 15px;
       font-size: 14px;
       white-space: pre-line;
-      word-break: break-word;
+      overflow-wrap: anywhere;
+      max-height: 280px;
+      overflow: auto;
     }
     .empty-sidebar {
       color: var(--muted);
       font-size: 14px;
       padding: 10px 2px 0;
     }
+    .empty-results {
+      display: grid;
+      gap: 8px;
+      padding: 22px;
+      border: 1px dashed var(--line-strong);
+      border-radius: 18px;
+      background: rgba(248, 250, 252, 0.92);
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+    }
     @media (max-width: 1180px) {
-      .status-strip {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+      .app-header,
+      .workspace {
+        grid-template-columns: 1fr;
       }
-      .layout { grid-template-columns: 1fr; }
-      .sidebar { position: static; }
+      .content-column {
+        order: 1;
+      }
+      .sidebar-column {
+        order: 2;
+      }
     }
     @media (max-width: 780px) {
-      .grid-2, .grid-4, .status-strip { grid-template-columns: 1fr; }
-      .page { padding: 16px 12px 28px; }
-      .topbar { padding: 18px; }
-      .topbar h1 { font-size: 28px; }
-      .panel { padding: 16px; }
+      .grid-2,
+      .grid-4,
+      .status-grid {
+        grid-template-columns: 1fr;
+      }
+      .page {
+        padding: 14px 10px 28px;
+      }
+      .app-header h1 {
+        font-size: 28px;
+      }
+      .panel,
+      .app-header {
+        padding: 16px;
+      }
+      .result-top {
+        grid-template-columns: 1fr;
+      }
+      .result-link {
+        width: 100%;
+      }
     }
   </style>
 </head>
 <body>
   <div class="page">
-    <section class="topbar">
-      <span class="eyebrow">HH.ru</span>
-      <div>
+    <section class="app-header">
+      <div class="app-header-main">
+        <span class="eyebrow">HH.ru</span>
         <h1>Поиск вакансий</h1>
         <p>
-          Управляйте сохранёнными сценариями поиска без Telegram: настраивайте фильтры,
-          включайте автопроверку, делайте ручную проверку и просматривайте найденные вакансии в одном месте.
+          Панель построена по логике HH: слева мои шаблоны и фильтры, справа текущий шаблон,
+          автопроверка, результаты поиска и пагинация. Все ключевые действия доступны без Telegram.
         </p>
       </div>
-      <div id="tokenBox" class="token-box">
-        <input id="authToken" type="text" placeholder="Токен доступа для панели">
-        <button id="saveTokenBtn" class="primary" type="button">Сохранить токен</button>
-        <span class="hint">Нужен только если на сервере задан HH_WEB_ADMIN_TOKEN.</span>
+      <div class="app-header-side">
+        <div class="header-note">
+          <strong>Что видно сразу:</strong> текущий шаблон, автопроверка, результаты, ошибки и переход по страницам.
+          Если данные не загрузятся, страница покажет явную ошибку вместо бесконечного <code>Загрузка...</code>.
+        </div>
+        <div id="tokenBox" class="token-box">
+          <input id="authToken" type="text" placeholder="Токен доступа для панели">
+          <button id="saveTokenBtn" class="primary" type="button">Сохранить токен</button>
+          <span class="hint">Нужен только если на сервере задан HH_WEB_ADMIN_TOKEN.</span>
+        </div>
       </div>
     </section>
 
     <div id="messageBox" class="message"></div>
 
-    <section class="status-strip">
-      <article class="stat-card">
-        <strong>Автопоиск</strong>
-        <div id="statusSearch" class="stat-value">Загрузка...</div>
-      </article>
-      <article class="stat-card">
-        <strong>Активный сценарий</strong>
-        <div id="statusTemplate" class="stat-value">Загрузка...</div>
-      </article>
-      <article class="stat-card">
-        <strong>Telegram</strong>
-        <div id="statusChat" class="stat-value">Загрузка...</div>
-      </article>
-      <article class="stat-card">
-        <strong>Последняя проверка</strong>
-        <div id="statusLastCheck" class="stat-value">Загрузка...</div>
-      </article>
-    </section>
-
-    <section class="quick-actions">
-      <button id="refreshBtn" class="ghost" type="button">Обновить данные</button>
-      <button id="toggleBtn" class="secondary" type="button">Пауза автопоиска</button>
-      <button id="runBtn" class="primary" type="button">Проверить вакансии</button>
-      <button id="previewBtn" class="ghost" type="button">Предпросмотр выдачи</button>
-    </section>
-
-    <section class="layout">
-      <aside class="panel sidebar">
+    <section class="workspace">
+      <aside class="sidebar-column">
+        <section class="panel scenario-panel">
         <div class="sidebar-head">
           <div>
-            <h2>Сценарии поиска</h2>
-            <p>Выберите существующий или создайте новый.</p>
+            <h2>Мои шаблоны</h2>
+            <p>Шаблон — это сохранённый набор фильтров. Текущий шаблон — тот, который используется сейчас.</p>
           </div>
-          <button id="newSearchBtn" class="primary" type="button">Создать сценарий</button>
+          <button id="newSearchBtn" class="primary" type="button">Создать шаблон</button>
         </div>
         <div id="templateList" class="template-list"></div>
-      </aside>
+        </section>
 
-      <div class="stack">
-        <section class="panel">
+        <section class="panel filter-panel">
           <div class="section-head">
             <div>
-              <h2>Редактор сценария</h2>
-              <p>Настройте, какие вакансии искать, где искать и как показывать результаты.</p>
+              <h2>Основное</h2>
+              <p>Базовые параметры шаблона: название, запросы и опыт.</p>
             </div>
           </div>
           <div class="filters-grid">
-            <div>
-              <h3>Что ищем</h3>
               <div class="grid-2">
                 <label class="field">
-                  Название сценария
+                  Название шаблона
                   <input id="name" type="text" maxlength="50" placeholder="Например: Product / Data Analyst">
                 </label>
                 <label class="field">
@@ -3489,27 +4561,38 @@ def _web_ui_html():
                 Опыт работы
                 <div id="experienceGroup" class="check-grid"></div>
               </div>
-            </div>
+          </div>
+        </section>
 
+        <section class="panel filter-panel">
+          <div class="section-head">
             <div>
-              <h3>Где ищем</h3>
-              <div class="grid-2">
-                <label class="field">
-                  Включить регионы
-                  <textarea id="includedAreas" placeholder="Например: Грузия, Казахстан, Тбилиси"></textarea>
-                  <small>Если оставить пустым, поиск идёт по всем регионам.</small>
-                </label>
-                <label class="field">
-                  Исключить регионы
-                  <textarea id="excludedAreas" placeholder="Например: Россия, Москва"></textarea>
-                  <small>Если исключаете страну, её города тоже исключаются автоматически.</small>
-                </label>
-              </div>
-              <div class="summary-box" id="areaHint"></div>
+              <h2>География</h2>
+              <p>Включайте страны и города, исключайте отдельные регионы и сразу видьте подсказки по вводу.</p>
             </div>
+          </div>
+          <div class="grid-2">
+            <label class="field">
+              Включить регионы
+              <textarea id="includedAreas" placeholder="Например: Грузия, Казахстан, Тбилиси"></textarea>
+              <small>Если оставить пустым, поиск идёт по всем регионам.</small>
+            </label>
+            <label class="field">
+              Исключить регионы
+              <textarea id="excludedAreas" placeholder="Например: Россия, Москва"></textarea>
+              <small>Если исключаете страну, её города тоже исключаются автоматически.</small>
+            </label>
+          </div>
+          <div class="summary-box" id="areaHint"></div>
+        </section>
 
+        <section class="panel filter-panel">
+          <div class="section-head">
             <div>
-              <h3>Фильтры</h3>
+              <h2>Слова и исключения</h2>
+              <p>Уточняйте поиск обязательными словами, исключайте лишние темы и компании.</p>
+            </div>
+          </div>
               <div class="grid-2">
                 <label class="field">
                   Обязательные слова
@@ -3542,14 +4625,24 @@ def _web_ui_html():
                 Исключить работодателей
                 <textarea id="excludedEmployers" placeholder="Например: lenkep recruitment"></textarea>
               </label>
-            </div>
+        </section>
 
+        <section class="panel filter-panel">
+          <div class="section-head">
             <div>
-              <h3>Формат и деньги</h3>
+              <h2>Формат работы и зарплата</h2>
+              <p>Выберите формат, занятость и ограничения по зарплате.</p>
+            </div>
+          </div>
               <div class="field">
                 Формат работы
                 <div id="workFormatsGroup" class="check-grid"></div>
               </div>
+              <label class="field" style="margin-top: 14px;">
+                Формат по странам и городам
+                <textarea id="areaWorkFormats" placeholder="Например: Россия = удалённо&#10;Беларусь = удалённо"></textarea>
+                <small>Эти правила заменяют общий формат для выбранных стран или городов.</small>
+              </label>
               <div class="field" style="margin-top: 14px;">
                 Тип занятости
                 <div id="employmentGroup" class="check-grid"></div>
@@ -3567,10 +4660,15 @@ def _web_ui_html():
                   </span>
                 </label>
               </div>
-            </div>
+        </section>
 
+        <section class="panel filter-panel">
+          <div class="section-head">
             <div>
-              <h3>Как показывать результаты</h3>
+              <h2>Выдача и расписание</h2>
+              <p>Настройте сортировку, глубину поиска, размер страницы и интервал автопроверки.</p>
+            </div>
+          </div>
               <div class="grid-4">
                 <label class="field">
                   Сортировка
@@ -3597,44 +4695,84 @@ def _web_ui_html():
                   <input id="interval" type="number" min="5" max="1440">
                 </label>
               </div>
-            </div>
-          </div>
         </section>
 
-        <section class="panel">
+        <section class="panel save-panel">
           <div class="section-head">
             <div>
-              <h2>Сохранение и управление</h2>
-              <p>Сохраняйте изменения, делайте сценарий активным и очищайте историю отправок.</p>
+              <h2>Управление шаблоном</h2>
+              <p>Сохраните изменения, сделайте шаблон текущим или очистите историю отправок.</p>
             </div>
           </div>
           <div class="actions">
-            <button id="saveBtn" class="primary" type="button">Сохранить изменения</button>
-            <button id="saveActivateBtn" class="secondary" type="button">Сохранить и включить</button>
-            <button id="activateBtn" class="ghost" type="button">Сделать активным</button>
-            <button id="resetSentBtn" class="ghost" type="button">Очистить отправленные</button>
-            <button id="deleteBtn" class="danger" type="button">Удалить сценарий</button>
+            <button id="saveBtn" class="primary" type="button">Сохранить шаблон</button>
+            <button id="saveActivateBtn" class="secondary" type="button">Сохранить и сделать текущим</button>
+            <button id="activateBtn" class="ghost" type="button">Сделать текущим</button>
+            <button id="resetSentBtn" class="ghost" type="button">Очистить историю</button>
+            <button id="deleteBtn" class="danger" type="button">Удалить шаблон</button>
           </div>
-          <div id="currentSummary" class="summary-box" style="margin-top: 14px;"></div>
+        </section>
+      </aside>
+
+      <main class="content-column">
+        <section class="panel overview-panel">
+          <div class="section-head">
+            <div>
+              <h2>Текущий шаблон и автопроверка</h2>
+              <p>Текущий шаблон — это выбранный набор фильтров. Автопроверка — его автоматический запуск по расписанию.</p>
+            </div>
+          </div>
+          <div class="status-grid">
+            <article class="stat-card">
+              <strong>Автопроверка</strong>
+              <div id="statusSearch" class="stat-value">Загрузка...</div>
+            </article>
+            <article class="stat-card">
+              <strong>Текущий шаблон</strong>
+              <div id="statusTemplate" class="stat-value">Загрузка...</div>
+            </article>
+            <article class="stat-card">
+              <strong>Telegram</strong>
+              <div id="statusChat" class="stat-value">Загрузка...</div>
+            </article>
+            <article class="stat-card">
+              <strong>Последняя проверка</strong>
+              <div id="statusLastCheck" class="stat-value">Загрузка...</div>
+            </article>
+          </div>
+          <div class="quick-actions">
+            <button id="refreshBtn" class="ghost" type="button">Обновить данные</button>
+            <button id="toggleBtn" class="secondary" type="button">Пауза автопроверки</button>
+            <button id="runBtn" class="primary" type="button">Проверить сейчас</button>
+            <button id="previewBtn" class="ghost" type="button">Предпросмотр</button>
+          </div>
+          <div class="summary-shell">
+            <div class="summary-title">Сводка шаблона</div>
+            <div id="currentSummary" class="summary-box"></div>
+          </div>
         </section>
 
-        <section class="panel">
-          <div class="results-head">
+        <section class="panel results-panel">
+          <div class="results-toolbar">
             <div>
-              <h2 style="margin-bottom: 6px;">Найденные вакансии</h2>
-              <div id="resultsMeta" class="hint">Сначала запустите проверку или предпросмотр.</div>
+              <h2>Результаты поиска</h2>
+              <div id="resultsMeta" class="hint">После проверки найденные вакансии появятся именно в этом блоке.</div>
             </div>
-            <div class="actions">
-              <button id="resultsPrev" class="ghost" type="button">Назад</button>
-              <button id="resultsNext" class="ghost" type="button">Далее</button>
+            <div class="pager">
+              <span id="resultsPage" class="hint"></span>
+              <div class="actions">
+                <button id="resultsPrev" class="ghost" type="button">Назад</button>
+                <button id="resultsNext" class="ghost" type="button">Далее</button>
+              </div>
             </div>
           </div>
-          <div id="resultsList" class="results-list"></div>
-          <div class="pager">
-            <span id="resultsPage" class="hint"></span>
+          <div id="resultsList" class="results-list">
+            <div class="empty-results">
+              Здесь появятся найденные вакансии после нажатия на «Проверить сейчас» или «Предпросмотр».
+            </div>
           </div>
         </section>
-      </div>
+      </main>
     </section>
   </div>
 
@@ -3668,6 +4806,24 @@ def _web_ui_html():
         .replaceAll('>', '&gt;')
         .replaceAll('"', '&quot;')
         .replaceAll("'", '&#39;');
+    }
+
+    function optionLabel(options, id) {
+      const value = String(id || '');
+      const item = (options || []).find((entry) => String(entry.id) === value);
+      return item ? item.label : value;
+    }
+
+    function previewList(values, emptyText, limit = 2) {
+      const items = (values || []).filter(Boolean);
+      if (!items.length) {
+        return emptyText;
+      }
+      const shown = items.slice(0, limit).join(', ');
+      if (items.length > limit) {
+        return shown + ' +' + (items.length - limit);
+      }
+      return shown;
     }
 
     function formatDate(ts) {
@@ -3762,10 +4918,10 @@ def _web_ui_html():
       els.statusChat.textContent = 'Данные недоступны';
       els.statusLastCheck.textContent = 'Данные недоступны';
       els.areaHint.textContent = 'Если страница открылась, а данные не подгрузились, значит не ответил API панели.';
-      els.templateList.innerHTML = '<div class="empty-sidebar">Не удалось загрузить список сценариев.</div>';
+      els.templateList.innerHTML = '<div class="empty-sidebar">Не удалось загрузить список шаблонов.</div>';
       els.currentSummary.innerHTML = '';
       els.resultsMeta.textContent = 'Данные не загружены.';
-      els.resultsList.innerHTML = '<div class="hint">После исправления ошибки нажмите «Обновить данные».</div>';
+      els.resultsList.innerHTML = '<div class="empty-results">После исправления ошибки нажмите «Обновить данные».</div>';
       els.resultsPage.textContent = '';
       els.resultsPrev.disabled = true;
       els.resultsNext.disabled = true;
@@ -3774,33 +4930,44 @@ def _web_ui_html():
 
     function renderStatus() {
       const status = state.data.status;
-      els.statusSearch.textContent = status.searching ? 'Автопоиск включён' : 'Автопоиск на паузе';
+      els.statusSearch.textContent = status.searching ? 'Автопроверка включена' : 'Автопроверка на паузе';
       els.statusTemplate.textContent = status.active_template_name || 'не выбран';
       els.statusChat.textContent = status.chat_configured ? 'Чат подключён' : 'Чат ещё не подключён';
       els.statusLastCheck.textContent = formatDate(status.last_check);
-      els.toggleBtn.textContent = status.searching ? 'Поставить на паузу' : 'Включить автопоиск';
+      els.toggleBtn.textContent = status.searching ? 'Поставить на паузу' : 'Включить автопроверку';
       els.areaHint.textContent = 'Подсказка: популярные регионы для быстрого ввода — ' + state.data.options.popular_areas.join(', ');
     }
 
     function renderTemplateList() {
       const templates = currentTemplates();
       if (!templates.length) {
-        els.templateList.innerHTML = '<div class="empty-sidebar">Сохранённых сценариев пока нет.</div>';
+        els.templateList.innerHTML = '<div class="empty-sidebar">Сохранённых шаблонов пока нет.</div>';
         return;
       }
       els.templateList.innerHTML = templates.map((template) => {
         const isActive = template.id === state.data.active_template_id;
         const isSelected = template.id === state.selectedTemplateId;
+        const experienceLabels = (template.experience || []).map((item) => optionLabel(state.data.options.experience, item));
+        const workFormatLabels = (template.work_formats || []).map((item) => optionLabel(state.data.options.work_formats, item));
+        const areaRuleLabels = (template.area_work_format_rules || []).map((rule) => {
+          const labels = (rule.work_formats || []).map((item) => optionLabel(state.data.options.work_formats, item));
+          return (rule.area_name || rule.area_id || 'Регион') + ': ' + (labels.join(', ') || '—');
+        });
+        let geographyText = previewList(template.included_area_names || [], 'Все страны');
+        if ((template.excluded_area_names || []).length) {
+          geographyText += ' · кроме ' + previewList(template.excluded_area_names || [], '—');
+        }
         const classes = ['template-card'];
         if (isActive || isSelected) {
           classes.push('active');
         }
         const meta = [
-          'Запросов: ' + template.queries.length,
-          'Интервал: ' + template.interval + ' мин',
-          'Страниц: ' + template.max_pages,
-          'На странице: ' + template.delivery_page_size,
-          isActive ? 'Сейчас автопоиск использует этот сценарий' : 'Сохранён для ручного запуска'
+          'Что ищем: ' + ((template.queries || []).slice(0, 2).join(', ') || '—'),
+          'Где ищем: ' + geographyText,
+          'Опыт: ' + previewList(experienceLabels, 'Не важно'),
+          'Формат: ' + previewList(workFormatLabels, 'Любой'),
+          'Формат по регионам: ' + previewList(areaRuleLabels, 'нет'),
+          isActive ? 'Сейчас используется как текущий шаблон' : 'Сохранён как отдельный шаблон'
         ].join('\\n');
         return (
           '<div class="' + classes.join(' ') + '">' +
@@ -3810,7 +4977,7 @@ def _web_ui_html():
             '</div>' +
             '<div class="actions">' +
               '<button class="ghost" type="button" onclick="selectTemplate(\\'' + template.id + '\\')">Открыть</button>' +
-              '<button class="ghost" type="button" onclick="activateTemplate(\\'' + template.id + '\\')">' + (isActive ? 'Активен' : 'Сделать активным') + '</button>' +
+              '<button class="ghost" type="button" onclick="activateTemplate(\\'' + template.id + '\\')">' + (isActive ? 'Текущий шаблон' : 'Сделать текущим') + '</button>' +
               '<button class="danger" type="button" onclick="deleteTemplate(\\'' + template.id + '\\')">Удалить</button>' +
             '</div>' +
           '</div>'
@@ -3835,6 +5002,7 @@ def _web_ui_html():
       els.excludeIn.value = current.exclude_in || 'both';
       els.excludedEmployers.value = (current.excluded_employers || []).join('\\n');
       renderCheckGroup(els.workFormatsGroup, options.work_formats, current.work_formats || []);
+      els.areaWorkFormats.value = current.area_work_format_rules_text || '';
       renderCheckGroup(els.employmentGroup, options.employment_types, current.employment_types || []);
       els.onlyWithSalary.checked = !!current.only_with_salary;
       els.salaryMin.value = current.salary_min || 0;
@@ -3861,6 +5029,7 @@ def _web_ui_html():
         exclude_keywords: splitValues(els.excludeKeywords.value),
         exclude_in: els.excludeIn.value,
         work_formats: readCheckedValues(els.workFormatsGroup),
+        area_work_format_rules_text: els.areaWorkFormats.value,
         employment_types: readCheckedValues(els.employmentGroup),
         only_with_salary: els.onlyWithSalary.checked,
         salary_min: els.salaryMin.value,
@@ -3877,8 +5046,8 @@ def _web_ui_html():
     function renderResults() {
       const result = state.result;
       if (!result) {
-        els.resultsMeta.textContent = 'Нажмите «Проверить вакансии» или «Предпросмотр выдачи».';
-        els.resultsList.innerHTML = '';
+        els.resultsMeta.textContent = 'После проверки найденные вакансии появятся именно в этом блоке.';
+        els.resultsList.innerHTML = '<div class="empty-results">Нажмите «Проверить сейчас» или «Предпросмотр», чтобы увидеть результаты здесь.</div>';
         els.resultsPage.textContent = '';
         els.resultsPrev.disabled = true;
         els.resultsNext.disabled = true;
@@ -3910,27 +5079,32 @@ def _web_ui_html():
       els.resultsMeta.textContent = parts.join(' · ');
 
       if (!pageItems.length) {
-        els.resultsList.innerHTML = '<div class="hint">Нет вакансий для отображения.</div>';
+        els.resultsList.innerHTML = '<div class="empty-results">На этой странице нет вакансий для отображения.</div>';
       } else {
         els.resultsList.innerHTML = pageItems.map((vacancy, index) => {
           const number = start + index + 1;
-          const meta = [
+          const primaryMeta = [
             vacancy.employer,
             vacancy.area
-          ].filter(Boolean).join(' · ');
-          const extra = [
+          ].filter(Boolean).map((item) => '<span class="meta-pill">' + escapeHtml(item) + '</span>').join('');
+          const extraMeta = [
             vacancy.experience ? 'Опыт: ' + vacancy.experience : '',
             vacancy.salary ? 'Зарплата: ' + vacancy.salary : '',
             vacancy.work_formats && vacancy.work_formats.length ? 'Формат: ' + vacancy.work_formats.join(', ') : '',
             vacancy.schedule ? 'График: ' + vacancy.schedule : ''
-          ].filter(Boolean).join(' · ');
+          ].filter(Boolean).map((item) => '<span class="meta-pill">' + escapeHtml(item) + '</span>').join('');
           return (
             '<article class="result-card">' +
-              '<h4>' + number + '. ' + escapeHtml(vacancy.name) + '</h4>' +
-              '<div class="result-meta">' + escapeHtml(meta) + '</div>' +
-              '<div class="result-meta">' + escapeHtml(extra) + '</div>' +
-              (vacancy.snippet ? '<div>' + escapeHtml(vacancy.snippet) + '</div>' : '') +
-              (vacancy.url ? '<div><a href="' + escapeHtml(vacancy.url) + '" target="_blank" rel="noreferrer">Открыть вакансию на hh.ru</a></div>' : '') +
+              '<div class="result-top">' +
+                '<div class="result-order">' + number + '</div>' +
+                '<div class="result-main">' +
+                  '<h4>' + escapeHtml(vacancy.name) + '</h4>' +
+                  (primaryMeta ? '<div class="result-tags">' + primaryMeta + '</div>' : '') +
+                  (extraMeta ? '<div class="result-tags">' + extraMeta + '</div>' : '') +
+                  (vacancy.snippet ? '<p class="result-snippet">' + escapeHtml(vacancy.snippet) + '</p>' : '') +
+                '</div>' +
+                (vacancy.url ? '<a class="result-link" href="' + escapeHtml(vacancy.url) + '" target="_blank" rel="noreferrer">Открыть</a>' : '') +
+              '</div>' +
             '</article>'
           );
         }).join('');
@@ -3981,43 +5155,43 @@ def _web_ui_html():
       if (payload.warnings && payload.warnings.length) {
         messages.push(payload.warnings.join('\\n'));
       }
-      messages.unshift('Сценарий сохранён.');
+      messages.unshift('Шаблон сохранён.');
       showMessage(messages.join('\\n'), payload.warnings && payload.warnings.length ? 'info' : 'success');
     }
 
     async function activateTemplate(id) {
       const targetId = id || state.selectedTemplateId;
       if (!targetId) {
-        showMessage('Сначала сохраните поиск.', 'error');
+        showMessage('Сначала сохраните шаблон.', 'error');
         return;
       }
       await api('/api/web-template-activate?template_id=' + encodeURIComponent(targetId), { method: 'POST' });
       state.result = null;
       state.resultPage = 0;
       await loadState(targetId);
-      showMessage('Активный сценарий обновлён.', 'success');
+      showMessage('Текущий шаблон обновлён.', 'success');
     }
 
     async function deleteTemplate(id) {
       const targetId = id || state.selectedTemplateId;
       if (!targetId) {
-        showMessage('Нет выбранного поиска для удаления.', 'error');
+        showMessage('Нет выбранного шаблона для удаления.', 'error');
         return;
       }
-      if (!window.confirm('Удалить этот поиск?')) {
+      if (!window.confirm('Удалить этот шаблон?')) {
         return;
       }
       await api('/api/web-template-delete?template_id=' + encodeURIComponent(targetId), { method: 'POST' });
       state.result = null;
       state.resultPage = 0;
       await loadState();
-      showMessage('Сценарий удалён.', 'success');
+      showMessage('Шаблон удалён.', 'success');
     }
 
     async function resetSent() {
       const targetId = state.selectedTemplateId;
       if (!targetId) {
-        showMessage('Сначала сохраните или выберите поиск.', 'error');
+        showMessage('Сначала сохраните или выберите шаблон.', 'error');
         return;
       }
       await api('/api/web-template-reset-sent?template_id=' + encodeURIComponent(targetId), { method: 'POST' });
@@ -4032,13 +5206,13 @@ def _web_ui_html():
         body: JSON.stringify({ searching: nextStatus })
       });
       await loadState(state.selectedTemplateId);
-      showMessage(nextStatus ? 'Автопоиск включён.' : 'Автопоиск поставлен на паузу.', 'success');
+      showMessage(nextStatus ? 'Автопроверка включена.' : 'Автопроверка поставлена на паузу.', 'success');
     }
 
     async function runSearch(persist) {
       const form = gatherForm();
       if (persist && !form.id) {
-        showMessage('Сначала сохраните поиск, потом запускайте обычный режим.', 'error');
+        showMessage('Сначала сохраните шаблон, потом запускайте обычный режим.', 'error');
         return;
       }
       const path = persist ? '/api/web-search-run' : '/api/web-search-preview';
@@ -4078,7 +5252,7 @@ def _web_ui_html():
       fillForm(state.data.new_template);
       renderTemplateList();
       renderResults();
-      showMessage('Открыт чистый сценарий. Заполните поля и сохраните его.', 'info');
+      showMessage('Открыт новый шаблон. Заполните поля и сохраните его.', 'info');
     }
 
     function bindEvents() {
@@ -4140,6 +5314,7 @@ def _web_ui_html():
       els.excludeIn = qs('excludeIn');
       els.excludedEmployers = qs('excludedEmployers');
       els.workFormatsGroup = qs('workFormatsGroup');
+      els.areaWorkFormats = qs('areaWorkFormats');
       els.employmentGroup = qs('employmentGroup');
       els.onlyWithSalary = qs('onlyWithSalary');
       els.salaryMin = qs('salaryMin');
@@ -4255,7 +5430,7 @@ if FastAPI is not None:
         data = load_data()
         tmpl = next((item for item in data.get("templates", []) if item.get("id") == template_id), None)
         if not tmpl:
-            return JSONResponse({"ok": False, "error": "Поиск не найден"}, status_code=404)
+            return JSONResponse({"ok": False, "error": "Шаблон не найден"}, status_code=404)
         data["active_template_id"] = template_id
         data.setdefault("sent_ids_by_template", {}).setdefault(str(template_id), [])
         save_data(data)
@@ -4269,7 +5444,7 @@ if FastAPI is not None:
         data = load_data()
         tmpl = next((item for item in data.get("templates", []) if item.get("id") == template_id), None)
         if not tmpl:
-            return JSONResponse({"ok": False, "error": "Поиск не найден"}, status_code=404)
+            return JSONResponse({"ok": False, "error": "Шаблон не найден"}, status_code=404)
         _set_template_sent_ids(data, template_id, [])
         save_data(data)
         return {"ok": True, "state": _build_web_state(data)}
@@ -4283,7 +5458,7 @@ if FastAPI is not None:
         before = len(data.get("templates", []))
         data["templates"] = [item for item in data.get("templates", []) if item.get("id") != template_id]
         if len(data["templates"]) == before:
-            return JSONResponse({"ok": False, "error": "Поиск не найден"}, status_code=404)
+            return JSONResponse({"ok": False, "error": "Шаблон не найден"}, status_code=404)
         data.get("sent_ids_by_template", {}).pop(str(template_id), None)
         if data.get("active_template_id") == template_id:
             data["active_template_id"] = data["templates"][0]["id"] if data["templates"] else None
@@ -4300,7 +5475,7 @@ if FastAPI is not None:
         payload = await _read_request_json(request)
         data = load_data()
         if not _active_template(data):
-            return JSONResponse({"ok": False, "error": "Нет активного сценария"}, status_code=400)
+            return JSONResponse({"ok": False, "error": "Нет текущего шаблона"}, status_code=400)
         data["searching"] = _coerce_bool(payload.get("searching"))
         save_data(data)
         return {"ok": True, "state": _build_web_state(data)}
@@ -4315,7 +5490,7 @@ if FastAPI is not None:
         template_id = str(payload.get("template_id") or "").strip()
         tmpl = next((item for item in data.get("templates", []) if item.get("id") == template_id), None)
         if not tmpl:
-            return JSONResponse({"ok": False, "error": "Сначала сохраните поиск, потом запускайте обычный режим"}, status_code=400)
+            return JSONResponse({"ok": False, "error": "Сначала сохраните шаблон, потом запускайте обычный режим"}, status_code=400)
         result = _web_search_response(data, tmpl, persist=True)
         save_data(data)
         return {
@@ -4340,7 +5515,7 @@ if FastAPI is not None:
         elif template_id:
             tmpl = next((item for item in data.get("templates", []) if item.get("id") == template_id), None)
             if tmpl is None:
-                return JSONResponse({"ok": False, "error": "Поиск не найден"}, status_code=404)
+                return JSONResponse({"ok": False, "error": "Шаблон не найден"}, status_code=404)
         else:
             return JSONResponse({"ok": False, "error": "Нет данных для предпросмотра"}, status_code=400)
         result = _web_search_response(data, tmpl, persist=False)
