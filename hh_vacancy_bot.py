@@ -21,6 +21,8 @@ HH.ru Smart Vacancy Bot v2
 Запуск: python3 hh_vacancy_bot.py
 """
 
+import base64
+import gzip
 import requests
 import json
 import time
@@ -28,8 +30,22 @@ import uuid
 import re
 import html
 import os
+import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
+
+try:
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse
+except Exception:
+    FastAPI = None
+    Request = None
+    JSONResponse = None
+
+try:
+    from vercel.functions import RuntimeCache
+except Exception:
+    RuntimeCache = None
 
 # ═══════════════════════════════════════════════════════════
 #  КОНФИГ
@@ -43,22 +59,31 @@ except Exception:
     WEBHOOK_HOST = os.getenv("HH_TELEGRAM_WEBHOOK_HOST", "0.0.0.0").strip() or "0.0.0.0"
     WEBHOOK_PORT = int(os.getenv("HH_TELEGRAM_WEBHOOK_PORT", "8080") or 8080)
 
-if not BOT_TOKEN:
-    raise RuntimeError(
-        "Не найден BOT_TOKEN. Укажите его в файле bot_local_config.py "
-        "или в переменной окружения HH_TELEGRAM_BOT_TOKEN."
-    )
-
 WEBHOOK_URL = (WEBHOOK_URL or "").strip().rstrip("/")
 WEBHOOK_HOST = (WEBHOOK_HOST or "0.0.0.0").strip() or "0.0.0.0"
 WEBHOOK_PORT = int(WEBHOOK_PORT or 8080)
 USE_WEBHOOK = bool(WEBHOOK_URL)
+IS_VERCEL = bool(os.getenv("VERCEL") or os.getenv("VERCEL_ENV"))
+CRON_SECRET = (os.getenv("CRON_SECRET") or os.getenv("HH_CRON_SECRET") or "").strip()
+STATE_TTL_SECONDS = int(os.getenv("HH_STATE_TTL_SECONDS", str(60 * 60 * 24 * 30)) or (60 * 60 * 24 * 30))
+AREAS_TTL_SECONDS = int(os.getenv("HH_AREAS_TTL_SECONDS", str(60 * 60 * 24 * 30)) or (60 * 60 * 24 * 30))
 
-DATA_FILE   = "bot_data.json"
-AREAS_CACHE = "areas_cache.json"
+DATA_FILE = os.path.join(tempfile.gettempdir(), "bot_data.json") if IS_VERCEL else "bot_data.json"
+AREAS_CACHE = os.path.join(tempfile.gettempdir(), "areas_cache.json") if IS_VERCEL else "areas_cache.json"
 
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 HH_API = "https://api.hh.ru"
+
+STATE_CACHE_KEY = "bot_data"
+AREAS_CACHE_KEY = "areas_tree_gzip"
+DICTS_CACHE_KEY = "hh_dictionaries"
+
+_runtime_cache = None
+if IS_VERCEL and RuntimeCache is not None:
+    try:
+        _runtime_cache = RuntimeCache(namespace="hh_vacancy_bot")
+    except Exception as e:
+        print(f"⚠️ Runtime Cache недоступен: {e}")
 
 # ─── HH.ru опции ────────────────────────────────────────────
 ANY_EXPERIENCE = "any"
@@ -187,7 +212,61 @@ DEFAULT_QUERIES = [
 #  ХРАНИЛИЩЕ ДАННЫХ
 # ═══════════════════════════════════════════════════════════
 
+def ensure_bot_token():
+    if BOT_TOKEN:
+        return BOT_TOKEN
+    raise RuntimeError(
+        "Не найден BOT_TOKEN. Укажите его в файле bot_local_config.py "
+        "или в переменной окружения HH_TELEGRAM_BOT_TOKEN."
+    )
+
+
+def _runtime_cache_available():
+    return _runtime_cache is not None
+
+
+def _cache_get(key):
+    if not _runtime_cache_available():
+        return None
+    try:
+        return _runtime_cache.get(key)
+    except Exception as e:
+        print(f"⚠️ Ошибка чтения Runtime Cache ({key}): {e}")
+        return None
+
+
+def _cache_set(key, value, ttl_seconds, tags=None):
+    if not _runtime_cache_available():
+        return False
+    try:
+        options = {"ttl": int(ttl_seconds)}
+        if tags:
+            options["tags"] = list(tags)
+        _runtime_cache.set(key, value, options)
+        return True
+    except Exception as e:
+        print(f"⚠️ Ошибка записи Runtime Cache ({key}): {e}")
+        return False
+
+
+def _pack_json(value):
+    raw = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(gzip.compress(raw, compresslevel=6)).decode("ascii")
+
+
+def _unpack_json(payload):
+    if payload is None:
+        return None
+    if isinstance(payload, (dict, list)):
+        return payload
+    raw = gzip.decompress(base64.b64decode(str(payload).encode("ascii")))
+    return json.loads(raw.decode("utf-8"))
+
 def load_data():
+    cached = _cache_get(STATE_CACHE_KEY)
+    if cached is not None:
+        return _normalize_data(cached)
+
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -202,7 +281,9 @@ def load_data():
             "last_check":         0,
             "user_states":        {},
         }
-    return _normalize_data(data)
+    normalized = _normalize_data(data)
+    _cache_set(STATE_CACHE_KEY, normalized, STATE_TTL_SECONDS, tags=["bot-state"])
+    return normalized
 
 def save_data(data):
     sent_ids_by_template = {}
@@ -221,6 +302,8 @@ def save_data(data):
 
     data["sent_ids_by_template"] = sent_ids_by_template
     data["sent_ids"] = all_sent_ids
+    if _cache_set(STATE_CACHE_KEY, data, STATE_TTL_SECONDS, tags=["bot-state"]):
+        return
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -356,7 +439,25 @@ def _esc(value):
 #  TELEGRAM API
 # ═══════════════════════════════════════════════════════════
 
+def get_public_base_url(request=None):
+    explicit_url = (WEBHOOK_URL or "").strip().rstrip("/")
+    if explicit_url:
+        return explicit_url
+    if request is not None:
+        return str(request.base_url).rstrip("/")
+    return ""
+
+
+def get_telegram_webhook_target(request=None):
+    base_url = get_public_base_url(request)
+    if not base_url:
+        return ""
+    return f"{base_url}/api/telegram/webhook"
+
 def tg_call(method, **kwargs):
+    if not TG_API:
+        print(f"❌ Telegram API недоступен: не задан BOT_TOKEN ({method})")
+        return {"ok": False, "description": "BOT_TOKEN missing"}
     try:
         r = requests.post(f"{TG_API}/{method}", json=kwargs, timeout=15)
         return r.json()
@@ -384,6 +485,9 @@ def answer_cb(cb_id, text=""):
     tg_call("answerCallbackQuery", callback_query_id=cb_id, text=text)
 
 def get_updates(offset=0):
+    if not TG_API:
+        print("❌ getUpdates недоступен: не задан BOT_TOKEN")
+        return []
     try:
         r = requests.post(f"{TG_API}/getUpdates",
                           json={"offset": offset, "timeout": 3, "limit": 20},
@@ -426,6 +530,15 @@ def get_area_tree():
     global _area_tree
     if _area_tree is not None:
         return _area_tree
+
+    cached_tree = _cache_get(AREAS_CACHE_KEY)
+    if cached_tree is not None:
+        try:
+            _area_tree = _unpack_json(cached_tree)
+            return _area_tree
+        except Exception as e:
+            print(f"⚠️ Не удалось распаковать areas из Runtime Cache: {e}")
+
     try:
         with open(AREAS_CACHE, "r", encoding="utf-8") as f:
             _area_tree = json.load(f)
@@ -434,9 +547,14 @@ def get_area_tree():
         pass
     try:
         r = requests.get(f"{HH_API}/areas", timeout=20)
+        r.raise_for_status()
         _area_tree = r.json()
-        with open(AREAS_CACHE, "w", encoding="utf-8") as f:
-            json.dump(_area_tree, f, ensure_ascii=False)
+        _cache_set(AREAS_CACHE_KEY, _pack_json(_area_tree), AREAS_TTL_SECONDS, tags=["hh-areas"])
+        try:
+            with open(AREAS_CACHE, "w", encoding="utf-8") as f:
+                json.dump(_area_tree, f, ensure_ascii=False)
+        except Exception as e:
+            print(f"⚠️ Не удалось сохранить areas_cache локально: {e}")
         return _area_tree
     except Exception as e:
         print(f"❌ Ошибка загрузки дерева регионов: {e}")
@@ -447,10 +565,17 @@ def get_hh_dictionaries():
     global _hh_dictionaries
     if _hh_dictionaries is not None:
         return _hh_dictionaries
+
+    cached_dicts = _cache_get(DICTS_CACHE_KEY)
+    if cached_dicts is not None:
+        _hh_dictionaries = cached_dicts
+        return _hh_dictionaries
+
     try:
         response = requests.get(f"{HH_API}/dictionaries", timeout=20)
         response.raise_for_status()
         _hh_dictionaries = response.json()
+        _cache_set(DICTS_CACHE_KEY, _hh_dictionaries, AREAS_TTL_SECONDS, tags=["hh-dictionaries"])
     except Exception as e:
         print(f"⚠️ Не удалось загрузить словари HH: {e}")
         _hh_dictionaries = {}
@@ -1577,6 +1702,50 @@ def _run_search(chat_id, data, tmpl, persist=True):
         else:
             send_msg(chat_id, f"Предпросмотр завершён: показано <b>{sent_now}</b> вакансий без записи в историю.")
 
+    return {
+        "total_found": len(vacancies),
+        "sent_now": sent_now,
+        "new_count": new_count,
+        "persist": bool(persist),
+    }
+
+
+def _build_runtime_status():
+    data = load_data()
+    tmpl = _active_template(data)
+    return {
+        "service": "hh-vacancy-bot",
+        "platform": "vercel" if IS_VERCEL else "local",
+        "searching": bool(data.get("searching", False)),
+        "chat_configured": bool(data.get("chat_id")),
+        "active_template_id": tmpl.get("id") if tmpl else None,
+        "active_template_name": tmpl.get("name") if tmpl else None,
+        "templates_count": len(data.get("templates", [])),
+        "last_check": int(data.get("last_check", 0) or 0),
+        "uses_runtime_cache": _runtime_cache_available(),
+        "webhook_target": get_telegram_webhook_target() if get_public_base_url() else None,
+    }
+
+
+def run_manual_search_tick(persist=True):
+    data = load_data()
+    chat_id = data.get("chat_id")
+    tmpl = _active_template(data)
+
+    if not chat_id:
+        return {"ok": False, "status": "skipped", "reason": "chat_not_configured"}
+    if not tmpl:
+        return {"ok": False, "status": "skipped", "reason": "no_active_template"}
+
+    result = _run_search(chat_id, data, tmpl, persist=persist)
+    return {
+        "ok": True,
+        "status": "done",
+        "template_id": tmpl["id"],
+        "template_name": tmpl["name"],
+        **result,
+    }
+
 
 # ═══════════════════════════════════════════════════════════
 #  ОБРАБОТКА CALLBACK QUERY (нажатие кнопок)
@@ -2047,29 +2216,141 @@ def process_update(upd):
         print(f"❌ Ошибка команды {cmd}: {e}")
 
 
-def run_scheduled_search_tick():
+def run_scheduled_search_tick(force=False):
     data = load_data()
     chat_id = data.get("chat_id")
 
     if not (data.get("searching") and data.get("active_template_id") and chat_id):
-        return
+        return {"ok": False, "status": "skipped", "reason": "inactive_or_chat_missing"}
 
     tmpl = _active_template(data)
     if not tmpl:
-        return
+        return {"ok": False, "status": "skipped", "reason": "no_active_template"}
 
     interval = tmpl.get("interval", 30) * 60
     last_chk = data.get("last_check", 0)
-    if time.time() - last_chk < interval:
-        return
+    if not force and time.time() - last_chk < interval:
+        remaining = max(0, int(last_chk + interval - time.time()))
+        return {
+            "ok": True,
+            "status": "skipped",
+            "reason": "interval_not_reached",
+            "remaining_seconds": remaining,
+            "template_id": tmpl["id"],
+            "template_name": tmpl["name"],
+        }
 
     print(f"🔍 Плановый поиск: {tmpl['name']}")
     try:
-        _run_search(chat_id, data, tmpl)
+        result = _run_search(chat_id, data, tmpl)
+        return {
+            "ok": True,
+            "status": "done",
+            "template_id": tmpl["id"],
+            "template_name": tmpl["name"],
+            **result,
+        }
     except Exception as e:
         print(f"❌ Ошибка планового поиска: {e}")
         data["last_check"] = time.time()
         save_data(data)
+        return {"ok": False, "status": "error", "reason": str(e)}
+
+
+def _cron_request_authorized(auth_header="", query_secret=""):
+    if not CRON_SECRET:
+        return True
+    if auth_header == f"Bearer {CRON_SECRET}":
+        return True
+    if query_secret and query_secret == CRON_SECRET:
+        return True
+    return False
+
+
+if FastAPI is not None:
+    app = FastAPI(title="HH Vacancy Bot")
+
+    @app.get("/")
+    def api_root():
+        return {
+            **_build_runtime_status(),
+            "message": "HH bot is alive",
+            "hobby_note": "На Vercel Hobby cron ограничен. Для частого автопоиска используйте ручной /run или внешний scheduler на /api/cron.",
+        }
+
+    @app.get("/api/status")
+    def api_status():
+        return _build_runtime_status()
+
+    @app.get("/api/webhook/info")
+    def api_webhook_info(request: Request):
+        if not TG_API:
+            return JSONResponse(
+                {"ok": False, "error": "BOT_TOKEN missing", "status": _build_runtime_status()},
+                status_code=500,
+            )
+        return {
+            "ok": True,
+            "target": get_telegram_webhook_target(request),
+            "telegram": get_webhook_info(),
+            "status": _build_runtime_status(),
+        }
+
+    @app.get("/api/webhook/register")
+    def api_register_webhook(request: Request):
+        if not TG_API:
+            return JSONResponse(
+                {"ok": False, "error": "BOT_TOKEN missing", "status": _build_runtime_status()},
+                status_code=500,
+            )
+
+        target = get_telegram_webhook_target(request)
+        if not target:
+            return JSONResponse({"ok": False, "error": "Cannot resolve public webhook URL"}, status_code=400)
+
+        response = set_webhook(target)
+        status_code = 200 if response.get("ok") else 500
+        return JSONResponse(
+            {
+                "ok": bool(response.get("ok")),
+                "target": target,
+                "telegram": response,
+                "status": _build_runtime_status(),
+            },
+            status_code=status_code,
+        )
+
+    @app.post("/api/telegram/webhook")
+    async def api_telegram_webhook(request: Request):
+        try:
+            update = await request.json()
+        except Exception as e:
+            print(f"❌ Некорректный webhook payload: {e}")
+            return JSONResponse({"ok": False, "error": "bad request"}, status_code=400)
+
+        try:
+            process_update(update)
+        except Exception as e:
+            print(f"❌ Ошибка обработки webhook update: {e}")
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+        return {"ok": True}
+
+    @app.get("/api/cron")
+    def api_cron(request: Request, force: int = 0, secret: str = ""):
+        auth_header = request.headers.get("authorization", "")
+        if not _cron_request_authorized(auth_header, secret):
+            return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
+        return run_scheduled_search_tick(force=bool(force))
+
+    @app.get("/api/run-now")
+    def api_run_now(request: Request, persist: int = 1, secret: str = ""):
+        auth_header = request.headers.get("authorization", "")
+        if not _cron_request_authorized(auth_header, secret):
+            return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
+        return run_manual_search_tick(persist=bool(persist))
+else:
+    app = None
 
 
 class TelegramWebhookHandler(BaseHTTPRequestHandler):
@@ -2128,11 +2409,12 @@ def run_polling():
 
 def run_webhook():
     print("✅ Режим: webhook")
-    response = set_webhook(WEBHOOK_URL)
+    target = get_telegram_webhook_target()
+    response = set_webhook(target)
     if not response.get("ok"):
         print(f"❌ Не удалось зарегистрировать webhook: {response}")
     else:
-        print(f"✅ Webhook зарегистрирован: {WEBHOOK_URL}")
+        print(f"✅ Webhook зарегистрирован: {target}")
 
     server = ThreadingHTTPServer((WEBHOOK_HOST, WEBHOOK_PORT), TelegramWebhookHandler)
     server.timeout = 1
@@ -2144,6 +2426,7 @@ def run_webhook():
 
 
 def main():
+    ensure_bot_token()
     bootstrap_bot()
     if USE_WEBHOOK:
         run_webhook()
