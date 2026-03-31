@@ -3538,7 +3538,7 @@ def _web_ui_html():
 
     function splitValues(value) {
       return String(value || '')
-        .split(/[\n,;]+/)
+        .split(/[\\n,;]+/)
         .map((item) => item.trim())
         .filter(Boolean);
     }
@@ -3813,7 +3813,7 @@ def _web_ui_html():
     }
 
     async function loadState(preferredTemplateId) {
-      const payload = await api('/api/web/state');
+      const payload = await api('/api/web-state');
       state.data = payload.state;
       const templateIds = new Set(currentTemplates().map((item) => item.id));
       if (preferredTemplateId && templateIds.has(preferredTemplateId)) {
@@ -3831,7 +3831,7 @@ def _web_ui_html():
     }
 
     async function saveTemplate(activate) {
-      const payload = await api('/api/web/template/save', {
+      const payload = await api('/api/web-template-save', {
         method: 'POST',
         body: JSON.stringify({
           template: gatherForm(),
@@ -3855,7 +3855,7 @@ def _web_ui_html():
         showMessage('Сначала сохраните поиск.', 'error');
         return;
       }
-      await api('/api/web/template/' + targetId + '/activate', { method: 'POST' });
+      await api('/api/web-template-activate?template_id=' + encodeURIComponent(targetId), { method: 'POST' });
       state.result = null;
       state.resultPage = 0;
       await loadState(targetId);
@@ -3871,7 +3871,7 @@ def _web_ui_html():
       if (!window.confirm('Удалить этот поиск?')) {
         return;
       }
-      await api('/api/web/template/' + targetId, { method: 'DELETE' });
+      await api('/api/web-template-delete?template_id=' + encodeURIComponent(targetId), { method: 'POST' });
       state.result = null;
       state.resultPage = 0;
       await loadState();
@@ -3884,14 +3884,14 @@ def _web_ui_html():
         showMessage('Сначала сохраните или выберите поиск.', 'error');
         return;
       }
-      await api('/api/web/template/' + targetId + '/reset-sent', { method: 'POST' });
+      await api('/api/web-template-reset-sent?template_id=' + encodeURIComponent(targetId), { method: 'POST' });
       await loadState(targetId);
       showMessage('История отправок очищена.', 'success');
     }
 
     async function toggleSearching() {
       const nextStatus = !state.data.status.searching;
-      await api('/api/web/searching', {
+      await api('/api/web-searching', {
         method: 'POST',
         body: JSON.stringify({ searching: nextStatus })
       });
@@ -3905,7 +3905,7 @@ def _web_ui_html():
         showMessage('Сначала сохраните поиск, потом запускайте обычный режим.', 'error');
         return;
       }
-      const path = persist ? '/api/web/search/run' : '/api/web/search/preview';
+      const path = persist ? '/api/web-search-run' : '/api/web-search-preview';
       const payload = await api(path, {
         method: 'POST',
         body: JSON.stringify({
@@ -4085,6 +4085,7 @@ if FastAPI is not None:
         return _build_runtime_status()
 
     @app.get("/api/web/state")
+    @app.get("/api/web-state")
     def api_web_state(request: Request):
         if not _web_request_authorized(request):
             return _web_unauthorized_response()
@@ -4092,6 +4093,7 @@ if FastAPI is not None:
         return {"ok": True, "state": _build_web_state(data)}
 
     @app.post("/api/web/template/save")
+    @app.post("/api/web-template-save")
     async def api_web_template_save(request: Request):
         if not _web_request_authorized(request):
             return _web_unauthorized_response()
@@ -4110,7 +4112,8 @@ if FastAPI is not None:
         }
 
     @app.post("/api/web/template/{template_id}/activate")
-    def api_web_template_activate(template_id: str, request: Request):
+    @app.post("/api/web-template-activate")
+    def api_web_template_activate(request: Request, template_id: str = ""):
         if not _web_request_authorized(request):
             return _web_unauthorized_response()
         data = load_data()
@@ -4123,7 +4126,8 @@ if FastAPI is not None:
         return {"ok": True, "state": _build_web_state(data)}
 
     @app.post("/api/web/template/{template_id}/reset-sent")
-    def api_web_template_reset_sent(template_id: str, request: Request):
+    @app.post("/api/web-template-reset-sent")
+    def api_web_template_reset_sent(request: Request, template_id: str = ""):
         if not _web_request_authorized(request):
             return _web_unauthorized_response()
         data = load_data()
@@ -4135,7 +4139,8 @@ if FastAPI is not None:
         return {"ok": True, "state": _build_web_state(data)}
 
     @app.delete("/api/web/template/{template_id}")
-    def api_web_template_delete(template_id: str, request: Request):
+    @app.post("/api/web-template-delete")
+    def api_web_template_delete(request: Request, template_id: str = ""):
         if not _web_request_authorized(request):
             return _web_unauthorized_response()
         data = load_data()
@@ -4152,6 +4157,7 @@ if FastAPI is not None:
         return {"ok": True, "state": _build_web_state(data)}
 
     @app.post("/api/web/searching")
+    @app.post("/api/web-searching")
     async def api_web_searching(request: Request):
         if not _web_request_authorized(request):
             return _web_unauthorized_response()
@@ -4164,6 +4170,7 @@ if FastAPI is not None:
         return {"ok": True, "state": _build_web_state(data)}
 
     @app.post("/api/web/search/run")
+    @app.post("/api/web-search-run")
     async def api_web_search_run(request: Request):
         if not _web_request_authorized(request):
             return _web_unauthorized_response()
@@ -4183,6 +4190,7 @@ if FastAPI is not None:
         }
 
     @app.post("/api/web/search/preview")
+    @app.post("/api/web-search-preview")
     async def api_web_search_preview(request: Request):
         if not _web_request_authorized(request):
             return _web_unauthorized_response()
