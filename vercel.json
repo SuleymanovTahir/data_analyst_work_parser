@@ -3,11 +3,27 @@
   "rewrites": [
     {
       "source": "/",
-      "destination": "/api/status"
+      "destination": "/api/ui"
+    },
+    {
+      "source": "/ui",
+      "destination": "/api/ui"
+    },
+    {
+      "source": "/index",
+      "destination": "/api/ui"
+    },
+    {
+      "source": "/index.html",
+      "destination": "/api/ui"
     },
     {
       "source": "/status",
       "destination": "/api/status"
+    },
+    {
+      "source": "/health",
+      "destination": "/api/health"
     },
     {
       "source": "/webhook-info",
@@ -16,6 +32,14 @@
     {
       "source": "/webhook-register",
       "destination": "/api/webhook-register"
+    },
+    {
+      "source": "/hh/oauth/start",
+      "destination": "/api/hh/oauth/start"
+    },
+    {
+      "source": "/hh/oauth/callback",
+      "destination": "/api/hh/oauth/callback"
     },
     {
       "source": "/telegram-webhook",
@@ -32,7 +56,9 @@
   ],
   "functions": {
     "api/**/*.py": {
-      "excludeFiles": "{__pycache__/**,areas_cache.json,bot_data.json,bot_local_config.py,.git/**,.vercel/**}"
+      "excludeFiles": "{__pycache__/**,areas_cache.json,bot_data.json,bot_local_config.py,.git/**,.vercel/**}",
+      "maxDuration": 300,
+      "regions": ["iad1"]
     }
   },
   "crons": [

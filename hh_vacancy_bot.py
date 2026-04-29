@@ -32,6 +32,7 @@ import os
 import tempfile
 import hashlib
 import threading
+from urllib.parse import urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
@@ -39,12 +40,13 @@ from requests.adapters import HTTPAdapter
 
 try:
     from fastapi import FastAPI, Request
-    from fastapi.responses import HTMLResponse, JSONResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 except Exception:
     FastAPI = None
     Request = None
     HTMLResponse = None
     JSONResponse = None
+    RedirectResponse = None
 
 try:
     from vercel.functions import RuntimeCache
@@ -77,27 +79,52 @@ WEBHOOK_PORT = int(WEBHOOK_PORT or 8080)
 USE_WEBHOOK = bool(WEBHOOK_URL)
 CRON_SECRET = (os.getenv("CRON_SECRET") or os.getenv("HH_CRON_SECRET") or "").strip()
 WEB_ADMIN_TOKEN = (os.getenv("HH_WEB_ADMIN_TOKEN") or "").strip()
+LINKEDIN_COOKIE = (os.getenv("HH_LINKEDIN_COOKIE") or "").strip()
+HH_CLIENT_ID = (os.getenv("HH_CLIENT_ID") or "").strip()
+HH_CLIENT_SECRET = (os.getenv("HH_CLIENT_SECRET") or "").strip()
+HH_REDIRECT_URI = (os.getenv("HH_REDIRECT_URI") or "").strip()
+HH_ACCESS_TOKEN = (os.getenv("HH_ACCESS_TOKEN") or "").strip()
+HH_REFRESH_TOKEN = (os.getenv("HH_REFRESH_TOKEN") or "").strip()
 STATE_TTL_SECONDS = int(os.getenv("HH_STATE_TTL_SECONDS", str(60 * 60 * 24 * 30)) or (60 * 60 * 24 * 30))
 AREAS_TTL_SECONDS = int(os.getenv("HH_AREAS_TTL_SECONDS", str(60 * 60 * 24 * 30)) or (60 * 60 * 24 * 30))
-SEARCH_RESULT_TTL_SECONDS = int(os.getenv("HH_SEARCH_RESULT_TTL_SECONDS", "90") or 90)
-HH_SEARCH_WORKERS = max(1, int(os.getenv("HH_SEARCH_WORKERS", "4") or 4))
+SEARCH_RESULT_TTL_SECONDS = int(os.getenv("HH_SEARCH_RESULT_TTL_SECONDS", "900") or 900)
+HH_SEARCH_WORKERS = max(1, int(os.getenv("HH_SEARCH_WORKERS", "1") or 1))
 HTTP_POOL_SIZE = max(4, int(os.getenv("HH_HTTP_POOL_SIZE", "16") or 16))
 HTTP_CONNECT_TIMEOUT = max(2, int(os.getenv("HH_HTTP_CONNECT_TIMEOUT", "5") or 5))
 HTTP_READ_TIMEOUT = max(4, int(os.getenv("HH_HTTP_READ_TIMEOUT", "15") or 15))
-HH_REQUEST_RETRIES = max(0, int(os.getenv("HH_REQUEST_RETRIES", "2") or 2))
-HH_RETRY_BASE_DELAY_SECONDS = max(0.5, float(os.getenv("HH_RETRY_BASE_DELAY_SECONDS", "1.5") or 1.5))
-HH_403_COOLDOWN_SECONDS = max(2.0, float(os.getenv("HH_403_COOLDOWN_SECONDS", "8") or 8))
+HH_API_CONNECT_TIMEOUT = max(2, int(os.getenv("HH_API_CONNECT_TIMEOUT", "3") or 3))
+HH_API_READ_TIMEOUT = max(4, int(os.getenv("HH_API_READ_TIMEOUT", "5") or 5))
+HH_REQUEST_RETRIES = max(0, int(os.getenv("HH_REQUEST_RETRIES", "0") or 0))
+HH_RETRY_BASE_DELAY_SECONDS = max(1.0, float(os.getenv("HH_RETRY_BASE_DELAY_SECONDS", "2.0") or 2.0))
+HH_403_COOLDOWN_SECONDS = max(30.0, float(os.getenv("HH_403_COOLDOWN_SECONDS", "120") or 120))
+HH_BLOCK_FORBIDDEN_SECONDS = max(60, int(os.getenv("HH_BLOCK_FORBIDDEN_SECONDS", "600") or 600))
+HH_BLOCK_RATE_LIMIT_SECONDS = max(60, int(os.getenv("HH_BLOCK_RATE_LIMIT_SECONDS", "300") or 300))
+HH_BLOCK_TRIGGER_COUNT = max(1, int(os.getenv("HH_BLOCK_TRIGGER_COUNT", "3") or 3))
+HH_MAX_REQUESTS_PER_RUN = max(1, int(os.getenv("HH_MAX_REQUESTS_PER_RUN", "1") or 1))
+HH_MAX_QUERY_TASKS_PER_RUN = max(1, int(os.getenv("HH_MAX_QUERY_TASKS_PER_RUN", "1") or 1))
+HH_SAFE_MAX_PAGES = max(1, int(os.getenv("HH_SAFE_MAX_PAGES", "1") or 1))
+HH_BATCH_DEADLINE_SECONDS = max(5, int(os.getenv("HH_BATCH_DEADLINE_SECONDS", "8") or 8))
+HH_RUN_DEADLINE_SECONDS = max(6, int(os.getenv("HH_RUN_DEADLINE_SECONDS", "10") or 10))
+LINKEDIN_REQUEST_RETRIES = max(1, int(os.getenv("HH_LINKEDIN_REQUEST_RETRIES", "3") or 3))
+LINKEDIN_RETRY_BASE_DELAY_SECONDS = max(1.0, float(os.getenv("HH_LINKEDIN_RETRY_BASE_DELAY_SECONDS", "2.0") or 2.0))
+LINKEDIN_429_COOLDOWN_SECONDS = max(4.0, float(os.getenv("HH_LINKEDIN_429_COOLDOWN_SECONDS", "12") or 12))
 
 DATA_FILE = os.path.join(tempfile.gettempdir(), "bot_data.json") if IS_VERCEL else "bot_data.json"
 AREAS_CACHE = os.path.join(tempfile.gettempdir(), "areas_cache.json") if IS_VERCEL else "areas_cache.json"
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 HH_API = "https://api.hh.ru"
+HH_OAUTH_AUTHORIZE_URL = "https://hh.ru/oauth/authorize"
+HH_OAUTH_TOKEN_URL = f"{HH_API}/token"
 
 STATE_CACHE_KEY = "bot_data"
 AREAS_CACHE_KEY = "areas_tree_gzip"
 DICTS_CACHE_KEY = "hh_dictionaries"
 SEARCH_CACHE_PREFIX = "hh_search_result_v3:"
+RESULT_SESSION_CACHE_PREFIX = "hh_result_session_v1:"
+GROUP_TOKEN_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+GROUP_TOKEN_BASE = len(GROUP_TOKEN_ALPHABET)
+GROUP_TOKEN_WIDTH = 5
 
 _runtime_cache = None
 if IS_VERCEL and RuntimeCache is not None:
@@ -113,6 +140,7 @@ _web_options_cache = None
 _state_local_snapshot = None
 _hh_backoff_lock = threading.Lock()
 _hh_backoff_until = 0.0
+_default_hh_excluded_areas_cache = None
 
 # ─── HH.ru опции ────────────────────────────────────────────
 ANY_EXPERIENCE = "any"
@@ -163,18 +191,24 @@ INTERVAL_OPTIONS = {
 
 MAX_PAGES_OPTIONS = {
     1:  "1 страница",
-    3:  "3 страницы",
-    5:  "5 страниц",
-    10: "10 страниц",
 }
 
 PERIOD_OPTIONS = {
+    0:  "Без периода",
     1:  "За 1 день",
     3:  "За 3 дня",
     7:  "За 7 дней",
     14: "За 14 дней",
     30: "За 30 дней",
 }
+
+
+def _period_label(period_days):
+    try:
+        period_code = int(period_days or 0)
+    except Exception:
+        period_code = 0
+    return PERIOD_OPTIONS.get(period_code, "Без периода")
 
 MAX_RESULTS_OPTIONS = {
     20:  "20 вакансий",
@@ -192,6 +226,37 @@ PAGE_SIZE_OPTIONS = {
 SKIP_WORDS = {"нет", "no", "none", "-", "skip"}
 KEEP_WORDS = {"ok", "ок", "оставить", "как есть"}
 
+# ─── LinkedIn-константы ────────────────────────────────────
+LINKEDIN_API_BASE   = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+LINKEDIN_PAGE_SIZE  = 25   # LinkedIn отдаёт максимум 25 за запрос
+
+LINKEDIN_EXPERIENCE_OPTIONS = {
+    "2": "Начинающий (Entry Level)",
+    "3": "Младший специалист (Associate)",
+    "4": "Средний / Старший (Mid-Senior)",
+    "5": "Директор (Director)",
+    "6": "Топ-менеджер (Executive)",
+}
+
+LINKEDIN_REMOTE_OPTIONS = {
+    "":  "Любой формат",
+    "2": "Удалённо (Remote)",
+    "3": "Гибрид (Hybrid)",
+    "1": "В офисе (On-site)",
+}
+
+LINKEDIN_PERIOD_OPTIONS = {
+    "r86400":   "За 1 день",
+    "r604800":  "За 7 дней",
+    "r2592000": "За 30 дней",
+    "":         "За всё время",
+}
+
+LINKEDIN_SORT_OPTIONS = {
+    "DD": "По дате",
+    "R":  "По релевантности",
+}
+
 RUSSIA_AREA_ID = 113
 MOSCOW_AREA_ID = 1
 
@@ -202,10 +267,49 @@ POPULAR_AREA_NAMES = [
     "ОАЭ", "Израиль", "Латвия", "Литва", "Эстония", "Финляндия",
 ]
 
+DEFAULT_BLOCKED_COUNTRY_NAMES_RU = [
+    "Камбоджа", "Лаос", "Мьянма", "Непал", "Индия", "Индонезия", "Вьетнам", "Таиланд", "Малайзия", "Филиппины", "Украина",
+    "Северная Корея", "КНДР", "Восточный Тимор", "Гаити",
+    "Кирибати", "Соломоновы Острова", "Тувалу",
+    "Алжир", "Ангола", "Бенин", "Ботсвана", "Буркина-Фасо", "Бурунди",
+    "Габон", "Гамбия", "Гана", "Гвинея", "Гвинея-Бисау", "Джибути",
+    "Замбия", "Зимбабве", "Кабо-Верде", "Камерун", "Кения", "Коморы",
+    "Конго", "Демократическая Республика Конго", "Кот-д'Ивуар", "Лесото",
+    "Либерия", "Ливия", "Маврикий", "Мавритания", "Мадагаскар", "Малави",
+    "Мали", "Мозамбик", "Намибия", "Нигер", "Нигерия", "Руанда",
+    "Сан-Томе и Принсипи", "Сенегал", "Сейшельские Острова", "Сомали",
+    "Судан", "Сьерра-Леоне", "Танзания", "Того", "Тунис", "Уганда",
+    "Центральноафриканская Республика", "Чад", "Экваториальная Гвинея",
+    "Эритрея", "Эсватини", "Эфиопия", "ЮАР", "Южный Судан",
+]
+
+DEFAULT_LINKEDIN_EXCLUDED_LOCATIONS = [
+    "Cambodia", "Laos", "Lao PDR", "Lao People's Democratic Republic",
+    "India", "Индия", "Indonesia", "Индонезия", "Vietnam", "Viet Nam", "Вьетнам",
+    "Malaysia", "Малайзия", "Philippines", "Филиппины",
+    "Ukraine", "Украина", "Україна",
+    "Thailand", "Таиланд", "North Korea", "DPRK", "Democratic People's Republic of Korea",
+    "Северная Корея", "КНДР",
+    "Myanmar", "Burma", "Nepal", "East Timor", "Timor-Leste", "Haiti",
+    "Kiribati", "Solomon Islands", "Tuvalu",
+    "Algeria", "Angola", "Benin", "Botswana", "Burkina Faso", "Burundi",
+    "Cameroon", "Cape Verde", "Cabo Verde", "Central African Republic",
+    "Chad", "Comoros", "Congo", "Democratic Republic of the Congo", "DR Congo",
+    "Djibouti", "Equatorial Guinea", "Eritrea", "Eswatini", "Swaziland",
+    "Ethiopia", "Gabon", "Gambia", "Ghana", "Guinea", "Guinea-Bissau",
+    "Ivory Coast", "Cote d'Ivoire", "Côte d'Ivoire", "Kenya", "Lesotho",
+    "Liberia", "Libya", "Madagascar", "Malawi", "Mali", "Mauritania",
+    "Mauritius", "Mozambique", "Namibia", "Niger", "Nigeria", "Rwanda",
+    "Sao Tome and Principe", "Senegal", "Seychelles", "Sierra Leone",
+    "Somalia", "South Africa", "South Sudan", "Sudan", "Tanzania", "Togo",
+    "Tunisia", "Uganda", "Zambia", "Zimbabwe",
+]
+
 # ─── Ключевые слова для фильтрации гемблинга ──────────────
 DEFAULT_EXCLUDE_KEYWORDS = [
     # Английские
     "igaming", "i-gaming", "i gaming", "gaming", "gambl", "casino",
+    "games",
     "betting", "sportsbook", "lottery", "bingo", "poker", "slot",
     "esports", "e-sports", "cyber sport", "online casino", "live casino",
     "jackpot", "roulette", "blackjack", "wager", "bookmaker", "freebet",
@@ -225,6 +329,7 @@ DEFAULT_EXCLUDE_KEYWORDS = [
     "ставка на спорт", "букмекерская", "пари матч", "леон бет",
     "форбет", "мостбет", "мелбет", "арбитраж трафика", "трафик-менеджер",
     "медиабайер", "байер трафика", "геминг", "гейминг", "игровая индустрия",
+    "геймз", "геймс",
     "игровые автоматы", "беттинг", "букмекерская компания",
 ]
 
@@ -254,6 +359,50 @@ DEFAULT_QUERIES = [
     "веб-аналитик", "аналитик продукта и данных", "аналитик бизнес-процессов",
 ]
 
+# LinkedIn: более широкие запросы, чтобы не упираться в пустую выдачу из-за python в каждом ключе
+DEFAULT_LINKEDIN_QUERIES = [
+    "data analyst",
+    "product analyst",
+    "business analyst",
+    "bi analyst",
+    "analytics engineer",
+    "python analyst",
+    "python data analyst",
+]
+
+# LinkedIn: маркеры требований к знанию иных языков (кроме RU/EN)
+# Если в заголовке/описании карточки встречается — вакансия отфильтровывается
+DEFAULT_LINKEDIN_EXCLUDE_LANGUAGES = [
+    # Немецкий
+    "deutsch", "deutschkenntnisse", "german required", "german language",
+    "german speaking", "fließend deutsch",
+    # Французский
+    "français", "french required", "french language", "french speaking",
+    "maîtrise du français",
+    # Испанский
+    "español", "spanish required", "spanish language", "spanish speaking",
+    "se requiere español",
+    # Итальянский
+    "italiano", "italian required", "italian language", "italian speaking",
+    # Португальский
+    "português", "portuguese required", "portuguese language", "portuguese speaking",
+    # Китайский
+    "mandarin", "mandarin required", "chinese required", "cantonese",
+    "mandarin speaking", "chinese language",
+    # Японский
+    "japanese required", "japanese language", "japanese speaking", "日本語",
+    # Корейский
+    "korean required", "korean language", "korean speaking", "한국어",
+    # Арабский
+    "arabic required", "arabic language", "arabic speaking",
+    # Нидерландский
+    "dutch required", "dutch language", "dutch speaking", "nederlands",
+    # Польский
+    "polish required", "polish language", "polish speaking",
+    # Турецкий
+    "turkish required", "turkish language", "turkish speaking",
+]
+
 
 # ═══════════════════════════════════════════════════════════
 #  ХРАНИЛИЩЕ ДАННЫХ
@@ -272,11 +421,25 @@ def _runtime_cache_available():
     return _runtime_cache is not None
 
 
+def _debug_log(label, **kwargs):
+    parts = []
+    for key, value in kwargs.items():
+        try:
+            parts.append(f"{key}={value}")
+        except Exception:
+            parts.append(f"{key}=<unprintable>")
+    suffix = f" | {'; '.join(parts)}" if parts else ""
+    print(f"🔧 {label}{suffix}")
+
+
 def _cache_get(key):
     if not _runtime_cache_available():
         return None
     try:
-        return _runtime_cache.get(key)
+        value = _runtime_cache.get(key)
+        if isinstance(value, str) and value.startswith("gzjson:"):
+            return _unpack_json(value[len("gzjson:"):])
+        return value
     except Exception as e:
         print(f"⚠️ Ошибка чтения Runtime Cache ({key}): {e}")
         return None
@@ -289,7 +452,10 @@ def _cache_set(key, value, ttl_seconds, tags=None):
         options = {"ttl": int(ttl_seconds)}
         if tags:
             options["tags"] = list(tags)
-        _runtime_cache.set(key, value, options)
+        payload = value
+        if isinstance(value, (dict, list)):
+            payload = "gzjson:" + _pack_json(value)
+        _runtime_cache.set(key, payload, options)
         return True
     except Exception as e:
         print(f"⚠️ Ошибка записи Runtime Cache ({key}): {e}")
@@ -311,6 +477,45 @@ def _state_saved_at(value):
         return float(value.get("_saved_at", 0) or 0)
     except Exception:
         return 0.0
+
+
+def _result_session_cache_key(session_id):
+    return f"{RESULT_SESSION_CACHE_PREFIX}{str(session_id or '').strip()}"
+
+
+def _persist_result_session(session_id, session):
+    session_id = str(session_id or "").strip()
+    if not session_id or not isinstance(session, dict):
+        return
+    _debug_log(
+        "persist_result_session",
+        session_id=session_id,
+        template_id=session.get("template_id"),
+        vacancies=len(session.get("vacancies", []) or []),
+        resume_page=session.get("resume_page", 0),
+        current_page=session.get("current_page", 0),
+    )
+    _cache_set(_result_session_cache_key(session_id), session, STATE_TTL_SECONDS, tags=["bot-result-session"])
+
+
+def _restore_result_session(data, session_id):
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return None
+    restored = _cache_get(_result_session_cache_key(session_id))
+    if not isinstance(restored, dict):
+        _debug_log("restore_result_session_miss", session_id=session_id)
+        return None
+    data.setdefault("result_sessions", {})[session_id] = restored
+    _debug_log(
+        "restore_result_session_hit",
+        session_id=session_id,
+        template_id=restored.get("template_id"),
+        vacancies=len(restored.get("vacancies", []) or []),
+        resume_page=restored.get("resume_page", 0),
+        current_page=restored.get("current_page", 0),
+    )
+    return restored
 
 
 def _pack_json(value):
@@ -350,6 +555,199 @@ def _http_timeout():
     return (HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT)
 
 
+def _hh_http_timeout():
+    return (HH_API_CONNECT_TIMEOUT, HH_API_READ_TIMEOUT)
+
+
+def _default_hh_oauth_state():
+    return {
+        "access_token": HH_ACCESS_TOKEN,
+        "refresh_token": HH_REFRESH_TOKEN,
+        "expires_at": 0,
+        "token_type": "Bearer" if HH_ACCESS_TOKEN else "",
+        "authorized_at": 0,
+        "last_error": "",
+        "oauth_state": "",
+        "oauth_state_expires_at": 0,
+    }
+
+
+def _normalize_hh_oauth_state(value):
+    base = _default_hh_oauth_state()
+    if not isinstance(value, dict):
+        return base
+    base.update({
+        "access_token": str(value.get("access_token") or base["access_token"] or "").strip(),
+        "refresh_token": str(value.get("refresh_token") or base["refresh_token"] or "").strip(),
+        "expires_at": float(value.get("expires_at") or 0),
+        "token_type": str(value.get("token_type") or base["token_type"] or "").strip(),
+        "authorized_at": float(value.get("authorized_at") or 0),
+        "last_error": str(value.get("last_error") or "").strip(),
+        "oauth_state": str(value.get("oauth_state") or "").strip(),
+        "oauth_state_expires_at": float(value.get("oauth_state_expires_at") or 0),
+    })
+    if base["access_token"] and not base["token_type"]:
+        base["token_type"] = "Bearer"
+    return base
+
+
+def _get_hh_redirect_uri(request=None):
+    if HH_REDIRECT_URI:
+        return HH_REDIRECT_URI
+    public_base_url = get_public_base_url(request)
+    return public_base_url.rstrip("/") if public_base_url else ""
+
+
+def _hh_oauth_ready():
+    return bool(HH_CLIENT_ID and HH_CLIENT_SECRET)
+
+
+def _hh_access_token_from_state(data=None):
+    if HH_ACCESS_TOKEN:
+        return HH_ACCESS_TOKEN
+    source = data if isinstance(data, dict) else _state_local_snapshot
+    normalized = _normalize_hh_oauth_state((source or {}).get("hh_oauth") if isinstance(source, dict) else None)
+    return normalized.get("access_token", "")
+
+
+def _hh_auth_headers(data=None):
+    token = _hh_access_token_from_state(data)
+    if not token:
+        return None
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _hh_request_get(path, *, params=None, timeout=None, data=None):
+    headers = _hh_auth_headers(data)
+    session = _get_http_session()
+    response = session.get(
+        f"{HH_API}{path}",
+        params=params,
+        headers=headers,
+        timeout=timeout or _hh_http_timeout(),
+    )
+    if response.status_code != 401 or HH_ACCESS_TOKEN:
+        return response
+    try:
+        latest_data = data if isinstance(data, dict) else load_data()
+        if _refresh_hh_oauth_token(latest_data):
+            return session.get(
+                f"{HH_API}{path}",
+                params=params,
+                headers=_hh_auth_headers(latest_data),
+                timeout=timeout or _hh_http_timeout(),
+            )
+    except Exception as e:
+        if isinstance(data, dict):
+            _save_hh_oauth_error(data, e)
+        print(f"⚠️ HH OAuth token refresh после 401 не удался: {e}")
+    return response
+
+
+def _save_hh_oauth_error(data, error):
+    data["hh_oauth"] = _normalize_hh_oauth_state(data.get("hh_oauth"))
+    data["hh_oauth"]["last_error"] = str(error or "").strip()
+    save_data(data)
+
+
+def _apply_hh_token_payload(data, payload):
+    token_data = _normalize_hh_oauth_state(data.get("hh_oauth"))
+    access_token = str(payload.get("access_token") or "").strip()
+    refresh_token = str(payload.get("refresh_token") or token_data.get("refresh_token") or "").strip()
+    expires_in = int(payload.get("expires_in") or 0)
+    if not access_token:
+        raise ValueError("HH OAuth не вернул access_token")
+    token_data.update({
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_at": time.time() + max(0, expires_in - 60) if expires_in else 0,
+        "token_type": str(payload.get("token_type") or "Bearer").strip() or "Bearer",
+        "authorized_at": time.time(),
+        "last_error": "",
+        "oauth_state": "",
+        "oauth_state_expires_at": 0,
+    })
+    data["hh_oauth"] = token_data
+    save_data(data)
+    return token_data
+
+
+def _exchange_hh_oauth_code(data, code, redirect_uri):
+    response = _get_http_session().post(
+        HH_OAUTH_TOKEN_URL,
+        data={
+            "grant_type": "authorization_code",
+            "client_id": HH_CLIENT_ID,
+            "client_secret": HH_CLIENT_SECRET,
+            "code": code,
+            "redirect_uri": redirect_uri,
+        },
+        timeout=_http_timeout(),
+    )
+    response.raise_for_status()
+    return _apply_hh_token_payload(data, response.json())
+
+
+def _fetch_hh_application_token(data):
+    if not _hh_oauth_ready():
+        return False
+    response = _get_http_session().post(
+        HH_OAUTH_TOKEN_URL,
+        data={
+            "grant_type": "client_credentials",
+            "client_id": HH_CLIENT_ID,
+            "client_secret": HH_CLIENT_SECRET,
+        },
+        timeout=_http_timeout(),
+    )
+    response.raise_for_status()
+    _apply_hh_token_payload(data, response.json())
+    return True
+
+
+def _refresh_hh_oauth_token(data):
+    token_data = _normalize_hh_oauth_state(data.get("hh_oauth"))
+    refresh_token = token_data.get("refresh_token") or HH_REFRESH_TOKEN
+    if not refresh_token or not _hh_oauth_ready():
+        return False
+    response = _get_http_session().post(
+        HH_OAUTH_TOKEN_URL,
+        data={
+            "grant_type": "refresh_token",
+            "client_id": HH_CLIENT_ID,
+            "client_secret": HH_CLIENT_SECRET,
+            "refresh_token": refresh_token,
+        },
+        timeout=_http_timeout(),
+    )
+    response.raise_for_status()
+    _apply_hh_token_payload(data, response.json())
+    return True
+
+
+def _ensure_hh_oauth_token_fresh(data):
+    token_data = _normalize_hh_oauth_state(data.get("hh_oauth"))
+    data["hh_oauth"] = token_data
+    if HH_ACCESS_TOKEN:
+        return False
+    expires_at = float(token_data.get("expires_at") or 0)
+    if not token_data.get("access_token"):
+        try:
+            return _fetch_hh_application_token(data)
+        except Exception as e:
+            _save_hh_oauth_error(data, e)
+            print(f"⚠️ Не удалось получить HH application token: {e}")
+            return False
+    if not expires_at or expires_at > time.time() + 60:
+        return False
+    try:
+        return _refresh_hh_oauth_token(data)
+    except Exception as e:
+        _save_hh_oauth_error(data, e)
+        print(f"⚠️ Не удалось обновить HH OAuth token: {e}")
+        return False
+
+
 def _wait_hh_backoff():
     while True:
         with _hh_backoff_lock:
@@ -369,6 +767,16 @@ def _push_hh_backoff(seconds):
 
 def _format_hh_request_error(query, exp_label, page, status_code, raw_error=None):
     page_text = f"страница {page + 1}"
+    raw_text = str(raw_error or "").strip()
+    raw_text_lower = raw_text.lower()
+    if raw_text == "__hh_timeout__":
+        return f"{query} / {exp_label}: HH не ответил вовремя, {page_text}"
+    if raw_text == "__hh_batch_deadline__":
+        return f"{query} / {exp_label}: HH отвечает слишком медленно, остановил долгий запрос, {page_text}"
+    if raw_text == "__hh_run_deadline__":
+        return f"{query} / {exp_label}: HH отвечает слишком медленно, остановил текущий запуск, {page_text}"
+    if "timed out" in raw_text_lower or "timeout" in raw_text_lower:
+        return f"{query} / {exp_label}: HH не ответил вовремя, {page_text}"
     if status_code == 403:
         return f"{query} / {exp_label}: HH временно ограничил запросы (403), {page_text}"
     if status_code == 429:
@@ -423,9 +831,10 @@ def _build_search_cache_key(template):
         "salary_min": int(template.get("salary_min", 0) or 0),
         "excluded_employers": template.get("excluded_employers", []),
         "sort": template.get("sort", "publication_time"),
-        "max_pages": int(template.get("max_pages", 5) or 5),
-        "period_days": int(template.get("period_days", 1) or 1),
+        "max_pages": int(template.get("max_pages", 1) or 1),
+        "period_days": int(template.get("period_days", 0) or 0),
         "max_results": int(template.get("max_results", 50) or 50),
+        "runtime_key": str(template.get("_hh_runtime_key") or ""),
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
@@ -441,12 +850,23 @@ def load_data():
     candidates = [item for item in (memory_state, file_state, cached) if isinstance(item, dict)]
     if candidates:
         data = max(candidates, key=_state_saved_at)
+        chosen_source = (
+            "memory" if data is memory_state else
+            "file" if data is file_state else
+            "cache"
+        )
     else:
         data = {
             "chat_id":            None,
             "templates":          [],
             "active_template_id": None,
+            "current_source":     "hh",
             "searching":          False,
+            "linkedin_searching": False,
+            "hh_oauth":          _default_hh_oauth_state(),
+            "hh_block_until":     0,
+            "hh_block_reason":    "",
+            "hh_template_runtime": {},
             "run_in_progress":    False,
             "run_started_at":     0,
             "run_mode":           "",
@@ -455,11 +875,23 @@ def load_data():
             "last_check":         0,
             "user_states":        {},
             "result_sessions":    {},
+            "live_group_runs":    {},
             "_saved_at":          0,
         }
+        chosen_source = "default"
 
     normalized = _normalize_data(data)
-    if _ensure_templates_ready(normalized):
+    _debug_log(
+        "load_data",
+        source=chosen_source,
+        saved_at=round(_state_saved_at(data), 3),
+        sessions=len((normalized.get("result_sessions") or {}).keys()),
+        active_template=normalized.get("active_template_id"),
+        chat_id=normalized.get("chat_id"),
+    )
+    changed = _ensure_templates_ready(normalized)
+    changed = _ensure_linkedin_templates_ready(normalized) or changed
+    if changed:
         save_data(normalized)
         return normalized
     _state_local_snapshot = json.loads(json.dumps(normalized, ensure_ascii=False))
@@ -486,6 +918,13 @@ def save_data(data):
     data["sent_ids"] = all_sent_ids
     data["_saved_at"] = time.time()
     _state_local_snapshot = json.loads(json.dumps(data, ensure_ascii=False))
+    _debug_log(
+        "save_data",
+        saved_at=round(data["_saved_at"], 3),
+        sessions=len((data.get("result_sessions") or {}).keys()),
+        active_template=data.get("active_template_id"),
+        chat_id=data.get("chat_id"),
+    )
     _cache_set(STATE_CACHE_KEY, data, STATE_TTL_SECONDS, tags=["bot-state"])
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -556,6 +995,64 @@ def _default_area_work_format_rules():
                 "work_formats": ["REMOTE"],
             })
     return _normalize_area_work_format_rules(rules)
+
+
+def _default_hh_excluded_areas():
+    global _default_hh_excluded_areas_cache
+    if isinstance(_default_hh_excluded_areas_cache, dict):
+        return {
+            "ids": list(_default_hh_excluded_areas_cache.get("ids") or []),
+            "names": list(_default_hh_excluded_areas_cache.get("names") or []),
+        }
+
+    area_ids = []
+    area_names = []
+    seen_ids = set()
+    for area_name in ["Россия"] + DEFAULT_BLOCKED_COUNTRY_NAMES_RU:
+        area_id = find_area_id(area_name)
+        if not area_id:
+            continue
+        area_id = str(area_id)
+        if area_id in seen_ids:
+            continue
+        seen_ids.add(area_id)
+        area_ids.append(area_id)
+        area_names.append(get_area_name(area_id) or area_name)
+
+    _default_hh_excluded_areas_cache = {
+        "ids": list(area_ids),
+        "names": list(area_names),
+    }
+    return {
+        "ids": list(area_ids),
+        "names": list(area_names),
+    }
+
+
+def _normalize_linkedin_excluded_locations(values):
+    seen = set()
+    result = []
+    for value in values or []:
+        clean = " ".join(str(value or "").split()).strip()
+        if not clean:
+            continue
+        key = clean.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(clean)
+    return result
+
+
+def _linkedin_location_is_excluded(location, excluded_locations):
+    normalized_location = _normalize_text(location or "")
+    if not normalized_location:
+        return False
+    for item in _normalize_linkedin_excluded_locations(excluded_locations):
+        normalized_item = _normalize_text(item)
+        if normalized_item and normalized_item in normalized_location:
+            return True
+    return False
 
 
 def _area_work_format_rules_text(rules):
@@ -666,7 +1163,7 @@ def _normalize_template(template):
     tmpl["work_formats"] = _unique_list(tmpl.get("work_formats", []))
     tmpl["area_work_format_rules"] = _normalize_area_work_format_rules(tmpl.get("area_work_format_rules", []))
     tmpl["employment_types"] = _unique_list(tmpl.get("employment_types", []))
-    tmpl["period_days"] = int(tmpl.get("period_days", 1) or 1)
+    tmpl["period_days"] = max(0, int(tmpl.get("period_days", 0) or 0))
     tmpl["only_with_salary"] = bool(tmpl.get("only_with_salary", False))
     tmpl["salary_min"] = max(0, int(tmpl.get("salary_min", 0) or 0))
     tmpl["excluded_employers"] = [k.strip().lower() for k in tmpl.get("excluded_employers", []) if k and k.strip()]
@@ -674,7 +1171,7 @@ def _normalize_template(template):
     tmpl["delivery_page_size"] = max(1, int(tmpl.get("delivery_page_size", 5) or 5))
     tmpl["sort"] = tmpl.get("sort", "publication_time")
     tmpl["interval"] = int(tmpl.get("interval", 30) or 30)
-    tmpl["max_pages"] = int(tmpl.get("max_pages", 5) or 5)
+    tmpl["max_pages"] = max(1, int(tmpl.get("max_pages", 1) or 1))
     tmpl["name"] = (tmpl.get("name") or "Новый поиск")[:50]
     tmpl["id"] = str(tmpl.get("id") or str(uuid.uuid4())[:8])
 
@@ -684,11 +1181,19 @@ def _normalize_template(template):
             tmpl["name"] = "Аналитик — все страны кроме России"
             tmpl["excluded_area_ids"] = [str(RUSSIA_AREA_ID)]
             tmpl["excluded_area_names"] = ["Россия"]
+        default_excluded = _default_hh_excluded_areas()
+        tmpl["excluded_area_ids"] = _unique_list(tmpl.get("excluded_area_ids", []) + default_excluded.get("ids", []))
+        tmpl["excluded_area_names"] = _unique_list(tmpl.get("excluded_area_names", []) + default_excluded.get("names", []))
         tmpl["experience"] = _effective_experience_codes(tmpl.get("experience", []))
         tmpl["include_keywords"] = _unique_list(tmpl.get("include_keywords", []) + DEFAULT_ANALYST_INCLUDE_KEYWORDS)
+        tmpl["exclude_keywords"] = _unique_list(tmpl.get("exclude_keywords", []) + DEFAULT_EXCLUDE_KEYWORDS)
         tmpl["include_in"] = "description"
+        if int(tmpl.get("period_days", 0) or 0) != 0:
+            tmpl["period_days"] = 0
         if tmpl.get("sort") in {"", "match_desc", "relevance"}:
             tmpl["sort"] = "publication_time"
+        if int(tmpl.get("max_pages", 1) or 1) != 1:
+            tmpl["max_pages"] = 1
         existing_rules = list(tmpl.get("area_work_format_rules", []))
         existing_rule_area_ids = {str(rule.get("area_id") or "") for rule in existing_rules}
         for rule in _default_area_work_format_rules():
@@ -715,7 +1220,13 @@ def _normalize_data(data):
         "chat_id":            data.get("chat_id"),
         "templates":          [_normalize_template(t) for t in data.get("templates", [])],
         "active_template_id": data.get("active_template_id"),
+        "current_source":     "linkedin" if str(data.get("current_source") or "") == "linkedin" else "hh",
         "searching":          bool(data.get("searching", False)),
+        "linkedin_searching": bool(data.get("linkedin_searching", False)),
+        "hh_oauth":          _normalize_hh_oauth_state(data.get("hh_oauth")),
+        "hh_block_until":     float(data.get("hh_block_until", 0) or 0),
+        "hh_block_reason":    str(data.get("hh_block_reason") or ""),
+        "hh_template_runtime": dict(data.get("hh_template_runtime", {}) or {}),
         "run_in_progress":    bool(data.get("run_in_progress", False)),
         "run_started_at":     int(data.get("run_started_at", 0) or 0),
         "run_mode":           str(data.get("run_mode") or ""),
@@ -724,6 +1235,13 @@ def _normalize_data(data):
         "last_check":         data.get("last_check", 0),
         "user_states":        data.get("user_states", {}),
         "result_sessions":    data.get("result_sessions", {}) or {},
+        "live_group_runs":    data.get("live_group_runs", {}) or {},
+        # ─── LinkedIn state ───────────────────────────────
+        "linkedin_templates":            list(data.get("linkedin_templates") or []),
+        "linkedin_active_template_id":   data.get("linkedin_active_template_id"),
+        "linkedin_sent_ids_by_template": dict(data.get("linkedin_sent_ids_by_template") or {}),
+        "linkedin_last_check":           data.get("linkedin_last_check", 0),
+        "linkedin_result_sessions":      dict(data.get("linkedin_result_sessions") or {}),
         "_saved_at":          float(data.get("_saved_at", 0) or 0),
     }
 
@@ -733,7 +1251,10 @@ def _normalize_data(data):
             state_map.pop(chat_id, None)
             continue
         if "draft" in state:
-            state["draft"] = _normalize_template(state.get("draft", {}))
+            if state.get("source") == "linkedin":
+                state["draft"] = _normalize_linkedin_template(state.get("draft", {}))
+            else:
+                state["draft"] = _normalize_template(state.get("draft", {}))
         history = state.get("history")
         if not isinstance(history, list):
             state["history"] = []
@@ -750,9 +1271,51 @@ def _normalize_data(data):
         session["page_size"] = max(1, int(session.get("page_size", 5) or 5))
         session["current_page"] = max(0, int(session.get("current_page", 0) or 0))
         session["resume_page"] = max(0, int(session.get("resume_page", 0) or 0))
+        session["resume_enabled"] = bool(session.get("resume_enabled", False))
         session["template_name"] = str(session.get("template_name") or "Поиск")
         session["mode"] = "preview" if session.get("mode") == "preview" else "run"
         session["errors"] = [str(item) for item in (session.get("errors") or []) if str(item).strip()]
+
+    live_group_runs = normalized["live_group_runs"]
+    for template_id, run in list(live_group_runs.items()):
+        if not isinstance(run, dict):
+            live_group_runs.pop(template_id, None)
+            continue
+        groups = run.get("groups") or {}
+        if not isinstance(groups, dict):
+            groups = {}
+        normalized_groups = {}
+        for page_key, group in groups.items():
+            if not isinstance(group, dict):
+                continue
+            page_index = max(2, int(page_key))
+            vacancy_ids = [str(item).strip() for item in (group.get("vacancy_ids") or []) if str(item).strip()]
+            if not vacancy_ids:
+                continue
+            normalized_groups[str(page_index)] = {
+                "vacancy_ids": vacancy_ids,
+                "message_id": int(group.get("message_id", 0) or 0),
+                "render_signature": str(group.get("render_signature") or ""),
+                "result_message_id": int(group.get("result_message_id", 0) or 0),
+                "result_keyboard_signature": str(group.get("result_keyboard_signature") or ""),
+                "opened": bool(group.get("opened", False)),
+                "opened_at": float(group.get("opened_at", 0) or 0),
+            }
+        run["groups"] = normalized_groups
+        run["page_size"] = max(1, int(run.get("page_size", 5) or 5))
+        run["next_group_to_announce"] = max(2, int(run.get("next_group_to_announce", 2) or 2))
+        run["completed"] = bool(run.get("completed", False))
+        run["chat_id"] = run.get("chat_id")
+        run["run_id"] = str(run.get("run_id") or "")
+        run["updated_at"] = float(run.get("updated_at", 0) or 0)
+
+    hh_template_runtime = normalized["hh_template_runtime"]
+    for template_id, runtime in list(hh_template_runtime.items()):
+        if not isinstance(runtime, dict):
+            hh_template_runtime.pop(template_id, None)
+            continue
+        runtime["query_cursor"] = max(0, int(runtime.get("query_cursor", 0) or 0))
+        runtime["last_run_at"] = float(runtime.get("last_run_at", 0) or 0)
 
     return normalized
 
@@ -774,6 +1337,33 @@ def _append_template_sent_ids(data, template_id, vacancy_ids):
     merged_ids = _unique_list(existing_ids + [str(item) for item in (vacancy_ids or []) if str(item or "").strip()])
     _set_template_sent_ids(data, template_id, merged_ids)
     return merged_ids
+
+
+def _live_group_run(data, template_id):
+    template_id = str(template_id or "")
+    return (data.get("live_group_runs", {}) or {}).get(template_id)
+
+
+def _set_live_group_run(data, template_id, run_state):
+    template_id = str(template_id or "")
+    data.setdefault("live_group_runs", {})[template_id] = run_state
+
+
+def _clear_live_group_run(data, template_id):
+    template_id = str(template_id or "")
+    data.setdefault("live_group_runs", {}).pop(template_id, None)
+
+
+def _new_live_group_run(chat_id, template_id, page_size):
+    return {
+        "run_id": str(uuid.uuid4())[:8],
+        "chat_id": chat_id,
+        "page_size": max(1, int(page_size or 5)),
+        "next_group_to_announce": 2,
+        "completed": False,
+        "updated_at": time.time(),
+        "groups": {},
+    }
 
 
 def _ensure_templates_ready(data):
@@ -799,9 +1389,24 @@ def _ensure_templates_ready(data):
             template["experience"] = normalized_experience
             changed = True
 
+        default_excluded = _default_hh_excluded_areas()
+        merged_excluded_ids = _unique_list(template.get("excluded_area_ids", []) + default_excluded.get("ids", []))
+        merged_excluded_names = _unique_list(template.get("excluded_area_names", []) + default_excluded.get("names", []))
+        if list(template.get("excluded_area_ids", [])) != merged_excluded_ids:
+            template["excluded_area_ids"] = merged_excluded_ids
+            changed = True
+        if list(template.get("excluded_area_names", [])) != merged_excluded_names:
+            template["excluded_area_names"] = merged_excluded_names
+            changed = True
+
         merged_include_keywords = _unique_list(template.get("include_keywords", []) + DEFAULT_ANALYST_INCLUDE_KEYWORDS)
         if list(template.get("include_keywords", [])) != merged_include_keywords:
             template["include_keywords"] = merged_include_keywords
+            changed = True
+
+        merged_exclude_keywords = _unique_list(template.get("exclude_keywords", []) + DEFAULT_EXCLUDE_KEYWORDS)
+        if list(template.get("exclude_keywords", [])) != merged_exclude_keywords:
+            template["exclude_keywords"] = merged_exclude_keywords
             changed = True
 
         if template.get("include_in") != "description":
@@ -874,6 +1479,26 @@ def _result_session_next_page(session):
     return None
 
 
+def _chunk_buttons(buttons, per_row=5):
+    per_row = max(1, int(per_row or 1))
+    return [buttons[index:index + per_row] for index in range(0, len(buttons), per_row)]
+
+
+def _page_picker_rows(page_numbers, current_page_number, callback_builder, per_row=5):
+    page_buttons = []
+    for page_number in page_numbers:
+        try:
+            page_int = int(page_number)
+        except Exception:
+            continue
+        callback_data = callback_builder(page_int)
+        if not callback_data:
+            continue
+        label = f"[{page_int}]" if page_int == int(current_page_number or 0) else str(page_int)
+        page_buttons.append({"text": label, "callback_data": callback_data})
+    return _chunk_buttons(page_buttons, per_row=per_row)
+
+
 def _find_open_result_session(data, template_id):
     template_id = str(template_id or "")
     sessions = list((data.get("result_sessions", {}) or {}).items())
@@ -885,6 +1510,8 @@ def _find_open_result_session(data, template_id):
         if str(session.get("template_id") or "") != template_id:
             continue
         if session.get("mode") != "run":
+            continue
+        if not session.get("resume_enabled"):
             continue
         next_page = _result_session_next_page(session)
         if next_page is None:
@@ -913,6 +1540,143 @@ def _set_run_in_progress(data, value, mode=""):
     data["run_in_progress"] = bool(value)
     data["run_started_at"] = int(time.time()) if value else 0
     data["run_mode"] = str(mode or "") if value else ""
+
+
+def _hh_block_remaining_seconds(data):
+    try:
+        block_until = float((data or {}).get("hh_block_until", 0) or 0)
+    except Exception:
+        block_until = 0.0
+    return max(0, int(block_until - time.time()))
+
+
+def _hh_clear_temporary_block(data):
+    if not isinstance(data, dict):
+        return False
+    changed = False
+    if float(data.get("hh_block_until", 0) or 0) > 0:
+        data["hh_block_until"] = 0
+        changed = True
+    if str(data.get("hh_block_reason") or ""):
+        data["hh_block_reason"] = ""
+        changed = True
+    return changed
+
+
+def _hh_is_temporarily_blocked(data):
+    remaining = _hh_block_remaining_seconds(data)
+    if remaining > 0:
+        return True
+    if isinstance(data, dict) and (float(data.get("hh_block_until", 0) or 0) > 0 or str(data.get("hh_block_reason") or "")):
+        _hh_clear_temporary_block(data)
+    return False
+
+
+def _hh_set_temporary_block(data, reason="", seconds=HH_BLOCK_FORBIDDEN_SECONDS):
+    if not isinstance(data, dict):
+        return 0
+    seconds_int = max(300, int(seconds or HH_BLOCK_FORBIDDEN_SECONDS))
+    block_until = time.time() + seconds_int
+    data["hh_block_until"] = block_until
+    data["hh_block_reason"] = str(reason or "")
+    _debug_log(
+        "hh_temporary_block",
+        seconds=seconds_int,
+        until=int(block_until),
+        reason=(str(reason or "")[:120] or "403"),
+    )
+    return seconds_int
+
+
+def _hh_block_message(data):
+    remaining = _hh_block_remaining_seconds(data)
+    if remaining <= 0:
+        return ""
+    minutes = max(1, (remaining + 59) // 60)
+    block_until = float((data or {}).get("hh_block_until", 0) or 0)
+    until_text = datetime.fromtimestamp(block_until).strftime("%d.%m %H:%M") if block_until else "позже"
+    reason = str((data or {}).get("hh_block_reason") or "").strip()
+    lines = [
+        f"HH-поиск временно стоит на паузе примерно на <b>{minutes}</b> мин.",
+        f"Следующая попытка после <b>{until_text}</b>.",
+    ]
+    if reason:
+        lines.append(f"Причина: <code>{_esc(reason)}</code>")
+    lines.append("Я не отправляю новые HH-запросы в этот период, чтобы не усиливать блокировку IP.")
+    return "\n".join(lines)
+
+
+def _hh_template_runtime_entry(data, template_id):
+    if not isinstance(data, dict):
+        return {"query_cursor": 0, "last_run_at": 0.0}
+    template_id = str(template_id or "").strip()
+    runtime_map = data.setdefault("hh_template_runtime", {})
+    runtime = runtime_map.get(template_id)
+    if not isinstance(runtime, dict):
+        runtime = {"query_cursor": 0, "last_run_at": 0.0}
+        runtime_map[template_id] = runtime
+    runtime["query_cursor"] = max(0, int(runtime.get("query_cursor", 0) or 0))
+    runtime["last_run_at"] = float(runtime.get("last_run_at", 0) or 0)
+    return runtime
+
+
+def _hh_runtime_options(data, tmpl, advance_cursor=True):
+    template_id = str((tmpl or {}).get("id") or "").strip()
+    runtime = _hh_template_runtime_entry(data, template_id)
+    task_cursor = max(0, int(runtime.get("query_cursor", 0) or 0))
+    task_limit = max(1, int(HH_MAX_QUERY_TASKS_PER_RUN or 1))
+    return {
+        "task_cursor": task_cursor,
+        "task_limit": task_limit,
+        "advance_cursor": bool(advance_cursor),
+        "runtime_key": f"hh-window:{task_cursor}:{task_limit}",
+    }
+
+
+def _hh_finalize_runtime(data, tmpl, fetch_result, advance_cursor=True):
+    if not isinstance(data, dict) or not isinstance(fetch_result, dict):
+        return False
+    runtime = _hh_template_runtime_entry(data, (tmpl or {}).get("id"))
+    changed = False
+    if not fetch_result.get("from_cache"):
+        runtime["last_run_at"] = time.time()
+        changed = True
+    if advance_cursor and not fetch_result.get("from_cache"):
+        total_task_count = max(0, int(fetch_result.get("total_task_count", 0) or 0))
+        selected_task_count = max(0, int(fetch_result.get("selected_task_count", 0) or 0))
+        if total_task_count > 0 and selected_task_count > 0:
+            runtime["query_cursor"] = (int(runtime.get("query_cursor", 0) or 0) + selected_task_count) % total_task_count
+            changed = True
+    return changed
+
+
+def _hh_window_note(fetch_result):
+    if not isinstance(fetch_result, dict):
+        return ""
+    total_task_count = max(0, int(fetch_result.get("total_task_count", 0) or 0))
+    selected_task_count = max(0, int(fetch_result.get("selected_task_count", 0) or 0))
+    if total_task_count > selected_task_count > 0:
+        return (
+            f"В этом безопасном HH-запуске проверено <b>{selected_task_count}</b> "
+            f"из <b>{total_task_count}</b> комбинаций. Следующий запуск продолжит дальше."
+        )
+    return ""
+
+
+def _hh_guard_before_search(data):
+    if not isinstance(data, dict):
+        return ""
+    max_block_seconds = max(HH_BLOCK_FORBIDDEN_SECONDS, HH_BLOCK_RATE_LIMIT_SECONDS)
+    try:
+        block_until = float(data.get("hh_block_until", 0) or 0)
+    except Exception:
+        block_until = 0.0
+    remaining = max(0, int(block_until - time.time()))
+    if remaining > max_block_seconds and block_until > 0:
+        data["hh_block_until"] = time.time() + max_block_seconds
+    if _hh_is_temporarily_blocked(data):
+        return _hh_block_message(data)
+    return ""
 
 
 def _dispatch_async_run(persist=True):
@@ -1039,8 +1803,8 @@ def _template_to_web_payload(template, include_summary=True):
         "salary_min": int(tmpl.get("salary_min", 0) or 0),
         "excluded_employers": list(tmpl.get("excluded_employers", [])),
         "sort": tmpl.get("sort", "publication_time"),
-        "period_days": int(tmpl.get("period_days", 1) or 1),
-        "max_pages": int(tmpl.get("max_pages", 5) or 5),
+        "period_days": int(tmpl.get("period_days", 0) or 0),
+        "max_pages": int(tmpl.get("max_pages", 1) or 1),
         "max_results": int(tmpl.get("max_results", 50) or 50),
         "delivery_page_size": int(tmpl.get("delivery_page_size", 5) or 5),
         "interval": int(tmpl.get("interval", 30) or 30),
@@ -1158,8 +1922,8 @@ def _build_template_from_payload(payload):
         "salary_min": _coerce_int(payload.get("salary_min"), default=0, min_value=0),
         "excluded_employers": [item.lower() for item in _split_text_values(payload.get("excluded_employers"))],
         "sort": sort_code,
-        "period_days": _coerce_int(payload.get("period_days"), default=1, min_value=1, max_value=30),
-        "max_pages": _coerce_int(payload.get("max_pages"), default=5, min_value=1, max_value=20),
+        "period_days": _coerce_int(payload.get("period_days"), default=0, min_value=0, max_value=30),
+        "max_pages": _coerce_int(payload.get("max_pages"), default=1, min_value=1, max_value=20),
         "max_results": _coerce_int(payload.get("max_results"), default=50, min_value=1, max_value=500),
         "delivery_page_size": _coerce_int(payload.get("delivery_page_size"), default=5, min_value=1, max_value=50),
         "interval": _coerce_int(payload.get("interval"), default=30, min_value=5, max_value=1440),
@@ -1236,6 +2000,115 @@ def _message_id_from_response(response):
         return int(message_id)
     except Exception:
         return None
+
+
+def _tg_not_modified(response):
+    if not isinstance(response, dict):
+        return False
+    description = str(response.get("description") or "").lower()
+    return "message is not modified" in description
+
+
+def _encode_group_vacancy_id(vacancy_id):
+    try:
+        value = int(str(vacancy_id or "").strip())
+    except Exception:
+        return ""
+    if value < 0:
+        return ""
+    chars = ["0"] * GROUP_TOKEN_WIDTH
+    for index in range(GROUP_TOKEN_WIDTH - 1, -1, -1):
+        chars[index] = GROUP_TOKEN_ALPHABET[value % GROUP_TOKEN_BASE]
+        value //= GROUP_TOKEN_BASE
+    if value:
+        return ""
+    return "".join(chars)
+
+
+def _decode_group_vacancy_id(token):
+    token = str(token or "").strip()
+    if not token:
+        return ""
+    value = 0
+    for char in token:
+        pos = GROUP_TOKEN_ALPHABET.find(char)
+        if pos < 0:
+            return ""
+        value = value * GROUP_TOKEN_BASE + pos
+    return str(value)
+
+
+def _encode_group_vacancy_ids(vacancy_ids):
+    tokens = []
+    for vacancy_id in vacancy_ids or []:
+        encoded = _encode_group_vacancy_id(vacancy_id)
+        if not encoded:
+            return ""
+        tokens.append(encoded)
+    return "".join(tokens)
+
+
+def _decode_group_vacancy_ids(token):
+    token = str(token or "").strip()
+    if not token or token == "-":
+        return []
+    if len(token) % GROUP_TOKEN_WIDTH != 0:
+        return []
+    values = []
+    for index in range(0, len(token), GROUP_TOKEN_WIDTH):
+        vacancy_id = _decode_group_vacancy_id(token[index:index + GROUP_TOKEN_WIDTH])
+        if not vacancy_id:
+            return []
+        values.append(vacancy_id)
+    return values
+
+
+def _group_callback_data(page_index, vacancy_ids):
+    encoded = _encode_group_vacancy_ids(vacancy_ids)
+    if not encoded:
+        return ""
+    return f"grp:{int(page_index)}:{encoded}"
+
+
+def _parse_group_callback_data(cdata):
+    raw = str(cdata or "").strip()
+    if not raw.startswith("grp:"):
+        return None, []
+    parts = raw.split(":", 2)
+    if len(parts) != 3:
+        return None, []
+    try:
+        page_index = max(1, int(parts[1]))
+    except Exception:
+        return None, []
+    vacancy_ids = _decode_group_vacancy_ids(parts[2])
+    return page_index, vacancy_ids
+
+
+def _hh_group_page_callback_data(template_id, page_index):
+    template_id = str(template_id or "").strip()
+    if not template_id:
+        return ""
+    try:
+        safe_page = max(1, int(page_index or 1))
+    except Exception:
+        safe_page = 1
+    return f"hgrp:{template_id}:{safe_page}"
+
+
+def _parse_hh_group_page_callback_data(cdata):
+    raw = str(cdata or "").strip()
+    if not raw.startswith("hgrp:"):
+        return "", 0
+    parts = raw.split(":", 2)
+    if len(parts) != 3:
+        return "", 0
+    template_id = str(parts[1] or "").strip()
+    try:
+        page_index = max(1, int(parts[2] or 1))
+    except Exception:
+        page_index = 0
+    return template_id, page_index
 
 
 def edit_reply_markup(chat_id, message_id, reply_markup):
@@ -1322,7 +2195,7 @@ def get_area_tree():
     except Exception:
         pass
     try:
-        r = _get_http_session().get(f"{HH_API}/areas", timeout=_http_timeout())
+        r = _hh_request_get("/areas", timeout=_http_timeout())
         r.raise_for_status()
         _area_tree = r.json()
         _cache_set(AREAS_CACHE_KEY, _pack_json(_area_tree), AREAS_TTL_SECONDS, tags=["hh-areas"])
@@ -1348,7 +2221,7 @@ def get_hh_dictionaries():
         return _hh_dictionaries
 
     try:
-        response = _get_http_session().get(f"{HH_API}/dictionaries", timeout=_http_timeout())
+        response = _hh_request_get("/dictionaries", timeout=_http_timeout())
         response.raise_for_status()
         _hh_dictionaries = response.json()
         _cache_set(DICTS_CACHE_KEY, _hh_dictionaries, AREAS_TTL_SECONDS, tags=["hh-dictionaries"])
@@ -1536,18 +2409,76 @@ def _vacancy_text_parts(vacancy):
 
 
 def _keyword_hit(parts, keywords, where):
+    return _keyword_hit_extended(parts, keywords, where, include_employer=False)
+
+
+def _keyword_hit_extended(parts, keywords, where, include_employer=False):
     if not keywords:
         return False
 
     title_text = parts["title"]
     desc_text = parts["description"]
+    employer_text = parts.get("employer", "")
 
     for keyword in keywords:
         hit_title = where in ("title", "both") and keyword in title_text
         hit_desc = where in ("description", "both") and keyword in desc_text
-        if hit_title or hit_desc:
+        hit_employer = include_employer and where in ("title", "both") and keyword in employer_text
+        if hit_title or hit_desc or hit_employer:
             return True
     return False
+
+
+def _empty_filter_stats():
+    return {
+        "scanned": 0,
+        "outside_included_regions": 0,
+        "excluded_regions": 0,
+        "missing_required_keywords": 0,
+        "excluded_by_keywords": 0,
+        "excluded_by_company_name": 0,
+        "excluded_by_employer": 0,
+        "excluded_by_work_format": 0,
+        "excluded_by_employment": 0,
+        "excluded_without_salary": 0,
+        "excluded_below_salary": 0,
+        "accepted": 0,
+    }
+
+
+def _merge_filter_stats(base_stats, batch_stats):
+    merged = dict(base_stats or {})
+    for key, value in (batch_stats or {}).items():
+        merged[key] = int(merged.get(key, 0) or 0) + int(value or 0)
+    return merged
+
+
+def _format_filter_stats_brief(filter_stats):
+    if not filter_stats:
+        return ""
+
+    labels = [
+        ("missing_required_keywords", "без обязательных слов"),
+        ("excluded_by_keywords", "по словам в вакансии"),
+        ("excluded_by_company_name", "по названию компании"),
+        ("excluded_by_work_format", "по формату работы"),
+        ("excluded_regions", "по исключённым регионам"),
+        ("outside_included_regions", "вне выбранной географии"),
+        ("excluded_by_employment", "по типу занятости"),
+        ("excluded_without_salary", "без зарплаты"),
+        ("excluded_below_salary", "ниже зарплаты"),
+        ("excluded_by_employer", "по работодателю"),
+    ]
+
+    parts = []
+    for key, label in labels:
+        count = int(filter_stats.get(key, 0) or 0)
+        if count > 0:
+            parts.append(f"{label} {count}")
+
+    if not parts:
+        return ""
+    return "Срезано фильтрами: " + ", ".join(parts[:5])
 
 
 def _vacancy_work_format_ids(vacancy):
@@ -1628,24 +2559,35 @@ def _fetch_vacancy_batch(
     salary_min,
     excluded_employers,
 ):
-    session = _get_http_session()
     collected = []
     seen_ids = set()
     errors = []
     requests_made = 0
     stale_pages = 0
     area_rule_cache = {}
+    filter_stats = _empty_filter_stats()
+    blocked = False
+    blocked_reason = ""
+    blocked_seconds = 0
+    batch_started_at = time.monotonic()
+    exp_label = EXPERIENCE_OPTIONS.get(exp, "любой опыт") if exp else "любой опыт"
 
     for page in range(max_pages):
+        if (time.monotonic() - batch_started_at) >= HH_BATCH_DEADLINE_SECONDS:
+            error_text = _format_hh_request_error(query, exp_label, page, None, "__hh_batch_deadline__")
+            print(f"⚠️ HH батч остановлен по дедлайну: {error_text}")
+            errors.append(error_text)
+            break
         params = {
             "text": query,
             "search_field": search_fields,
             "per_page": 50,
             "page": page,
             "order_by": api_sort,
-            "period": period_days,
             "enable_snippets": "true",
         }
+        if period_days > 0:
+            params["period"] = period_days
 
         if exp:
             params["experience"] = exp
@@ -1653,17 +2595,26 @@ def _fetch_vacancy_batch(
             params["area"] = included_area_ids
 
         data = None
-        exp_label = EXPERIENCE_OPTIONS.get(exp, "любой опыт") if exp else "любой опыт"
         for attempt in range(HH_REQUEST_RETRIES + 1):
+            if (time.monotonic() - batch_started_at) >= HH_BATCH_DEADLINE_SECONDS:
+                error_text = _format_hh_request_error(query, exp_label, page, None, "__hh_batch_deadline__")
+                print(f"⚠️ HH батч остановлен по дедлайну: {error_text}")
+                errors.append(error_text)
+                break
             try:
                 _wait_hh_backoff()
                 requests_made += 1
-                response = session.get(f"{HH_API}/vacancies", params=params, timeout=_http_timeout())
+                response = _hh_request_get("/vacancies", params=params, timeout=_hh_http_timeout())
                 status_code = int(response.status_code or 0)
                 if status_code in (403, 429, 500, 502, 503, 504):
                     response.raise_for_status()
                 response.raise_for_status()
                 data = response.json()
+                break
+            except requests.Timeout:
+                error_text = _format_hh_request_error(query, exp_label, page, None, "__hh_timeout__")
+                print(f"⚠️ HH таймаут: {error_text}")
+                errors.append(error_text)
                 break
             except requests.HTTPError as e:
                 status_code = int((e.response.status_code if e.response is not None else 0) or 0)
@@ -1683,6 +2634,10 @@ def _fetch_vacancy_batch(
                 error_text = _format_hh_request_error(query, exp_label, page, status_code, str(e))
                 print(f"❌ Ошибка запроса hh.ru: {error_text}")
                 errors.append(error_text)
+                if status_code in (403, 429):
+                    blocked = True
+                    blocked_reason = error_text
+                    blocked_seconds = HH_BLOCK_FORBIDDEN_SECONDS if status_code == 403 else HH_BLOCK_RATE_LIMIT_SECONDS
                 break
             except Exception as e:
                 error_text = _format_hh_request_error(query, exp_label, page, None, str(e))
@@ -1704,21 +2659,32 @@ def _fetch_vacancy_batch(
                 continue
             seen_ids.add(vacancy_id)
             fresh_ids_on_page += 1
+            filter_stats["scanned"] += 1
 
             area_id = str(vacancy.get("area", {}).get("id", ""))
             if included_area_set and area_id not in included_area_set:
+                filter_stats["outside_included_regions"] += 1
                 continue
             if excluded_area_set and area_id in excluded_area_set:
+                filter_stats["excluded_regions"] += 1
                 continue
 
             parts = _vacancy_text_parts(vacancy)
             if include_kw and not _keyword_hit(parts, include_kw, include_in):
-                continue
-            if excl_kw and _keyword_hit(parts, excl_kw, excl_in):
+                filter_stats["missing_required_keywords"] += 1
                 continue
 
             employer_name = parts["employer"]
+            if excl_kw and _keyword_hit_extended(parts, excl_kw, excl_in, include_employer=True):
+                employer_block = any(keyword in employer_name for keyword in excl_kw)
+                if employer_block:
+                    filter_stats["excluded_by_company_name"] += 1
+                else:
+                    filter_stats["excluded_by_keywords"] += 1
+                continue
+
             if excluded_employers and any(name in employer_name for name in excluded_employers):
+                filter_stats["excluded_by_employer"] += 1
                 continue
 
             applicable_work_formats = work_formats
@@ -1729,17 +2695,22 @@ def _fetch_vacancy_batch(
             if applicable_work_formats:
                 vacancy_work_formats = _vacancy_work_format_ids(vacancy)
                 if not (vacancy_work_formats & applicable_work_formats):
+                    filter_stats["excluded_by_work_format"] += 1
                     continue
 
             if employment_types and _vacancy_employment_id(vacancy) not in employment_types:
+                filter_stats["excluded_by_employment"] += 1
                 continue
 
             salary_value = _salary_key(vacancy)
             if only_with_salary and salary_value < 0:
+                filter_stats["excluded_without_salary"] += 1
                 continue
             if salary_min and salary_value < salary_min:
+                filter_stats["excluded_below_salary"] += 1
                 continue
 
+            filter_stats["accepted"] += 1
             collected.append(vacancy)
 
         if fresh_ids_on_page == 0:
@@ -1757,6 +2728,10 @@ def _fetch_vacancy_batch(
         "vacancies": collected,
         "errors": errors,
         "requests_made": requests_made,
+        "filter_stats": filter_stats,
+        "blocked": blocked,
+        "blocked_reason": blocked_reason,
+        "blocked_seconds": blocked_seconds,
     }
 
 
@@ -1792,8 +2767,14 @@ def _merge_priority_vacancies(sorted_vacancies, priority_ids, max_results):
     return merged[:max_results]
 
 
-def fetch_vacancies(template, on_batch=None):
+def fetch_vacancies(template, on_batch=None, runtime_options=None):
     template = _normalize_template(template)
+    runtime_options = runtime_options or {}
+    task_cursor = max(0, int(runtime_options.get("task_cursor", 0) or 0))
+    task_limit = max(1, int(runtime_options.get("task_limit", HH_MAX_QUERY_TASKS_PER_RUN) or HH_MAX_QUERY_TASKS_PER_RUN))
+    runtime_key = str(runtime_options.get("runtime_key") or "")
+    if runtime_key:
+        template["_hh_runtime_key"] = runtime_key
     cache_key = _build_search_cache_key(template)
     cached_result = _search_cache_get(cache_key)
     if cached_result is not None:
@@ -1803,7 +2784,12 @@ def fetch_vacancies(template, on_batch=None):
                 on_batch(cached_result.get("vacancies", []))
             except Exception as e:
                 print(f"⚠️ Ошибка live-выдачи из кеша: {e}")
-        return cached_result
+        return {
+            **cached_result,
+            "from_cache": True,
+            "task_cursor": task_cursor,
+            "task_limit": task_limit,
+        }
 
     included_area_ids = [str(x) for x in template.get("included_area_ids", [])]
     excluded_area_ids = [str(x) for x in template.get("excluded_area_ids", [])]
@@ -1822,8 +2808,11 @@ def fetch_vacancies(template, on_batch=None):
     excluded_employers = [name.lower() for name in template.get("excluded_employers", [])]
     sort_by = template.get("sort", "publication_time")
     queries = template.get("queries", DEFAULT_QUERIES)
-    max_pages = int(template.get("max_pages", 5) or 5)
-    period_days = int(template.get("period_days", 1) or 1)
+    max_pages = min(
+        max(1, int(template.get("max_pages", 1) or 1)),
+        HH_SAFE_MAX_PAGES,
+    )
+    period_days = max(0, int(template.get("period_days", 0) or 0))
     max_results = int(template.get("max_results", 50) or 50)
     search_fields = template.get("search_fields", ["name", "company_name", "description"])
 
@@ -1847,28 +2836,50 @@ def fetch_vacancies(template, on_batch=None):
             seen_task_keys.add(task_key)
             query_exp_tasks.append((normalized_query, exp))
 
+    total_task_count = len(query_exp_tasks)
+    selected_task_count = total_task_count
+    safe_cursor = 0
+    if total_task_count > task_limit:
+        safe_cursor = task_cursor % total_task_count
+        rotated_tasks = query_exp_tasks[safe_cursor:] + query_exp_tasks[:safe_cursor]
+        selected_task_count = min(task_limit, len(rotated_tasks))
+        query_exp_tasks = rotated_tasks[:selected_task_count]
+
     results = []
     errors = []
     requests_made = 0
     priority_ids = []
+    filter_stats = _empty_filter_stats()
     started_at = time.time()
+    started_at_mono = time.monotonic()
+    blocked = False
+    blocked_reason = ""
+    blocked_seconds = 0
+    blocked_batches = 0
+    stopped_early = False
+    stop_reason = ""
     if query_exp_tasks:
-        search_pressure = len(query_exp_tasks) * max_pages
-        adaptive_workers = HH_SEARCH_WORKERS
-        if search_pressure >= 60:
-            adaptive_workers = min(adaptive_workers, 2)
-        elif search_pressure >= 24:
-            adaptive_workers = min(adaptive_workers, 3)
-
-        max_workers = min(adaptive_workers, len(query_exp_tasks))
+        max_workers = 1
         print(
-            f"🔧 HH поиск: {len(query_exp_tasks)} комбинаций, "
-            f"{max_pages} стр./запрос, воркеров {max_workers}"
+            f"🔧 HH поиск: {len(query_exp_tasks)} комбинаций из {total_task_count}, "
+            f"{max_pages} стр./запрос, воркеров {max_workers}, "
+            f"лимит запросов {HH_MAX_REQUESTS_PER_RUN}, окно с позиции {safe_cursor + 1}"
         )
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {
-                executor.submit(
-                    _fetch_vacancy_batch,
+        if max_workers <= 1:
+            for query, exp in query_exp_tasks:
+                if (time.monotonic() - started_at_mono) >= HH_RUN_DEADLINE_SECONDS:
+                    stopped_early = True
+                    stop_reason = "HH отвечает слишком медленно. Я остановил этот запуск раньше, чтобы бот не зависал."
+                    print(f"⚠️ {stop_reason}")
+                    errors.append(stop_reason)
+                    break
+                if requests_made >= HH_MAX_REQUESTS_PER_RUN:
+                    stopped_early = True
+                    stop_reason = f"Достигнут безопасный лимит запросов HH за один запуск ({HH_MAX_REQUESTS_PER_RUN})."
+                    print(f"⚠️ {stop_reason}")
+                    errors.append(stop_reason)
+                    break
+                batch = _fetch_vacancy_batch(
                     query,
                     exp,
                     search_fields,
@@ -1888,23 +2899,10 @@ def fetch_vacancies(template, on_batch=None):
                     only_with_salary,
                     salary_min,
                     excluded_employers,
-                ): (query, exp)
-                for query, exp in query_exp_tasks
-            }
-
-            for future in as_completed(future_map):
-                try:
-                    batch = future.result()
-                except Exception as e:
-                    query, exp = future_map[future]
-                    exp_label = EXPERIENCE_OPTIONS.get(exp, "любой опыт") if exp else "любой опыт"
-                    error_text = f"{query} / {exp_label}: {e}"
-                    print(f"❌ Ошибка параллельного запроса hh.ru: {error_text}")
-                    errors.append(error_text)
-                    continue
-
+                )
                 requests_made += int(batch.get("requests_made", 0) or 0)
                 errors.extend(batch.get("errors", []))
+                filter_stats = _merge_filter_stats(filter_stats, batch.get("filter_stats", {}))
                 batch_vacancies = batch.get("vacancies", [])
                 results.extend(batch_vacancies)
                 if on_batch and batch_vacancies:
@@ -1916,6 +2914,97 @@ def fetch_vacancies(template, on_batch=None):
                                 priority_ids.append(vacancy_id)
                     except Exception as e:
                         print(f"⚠️ Ошибка live-выдачи вакансий: {e}")
+                if batch.get("blocked"):
+                    blocked_batches += 1
+                    blocked_reason = str(batch.get("blocked_reason") or "")
+                    blocked_seconds = max(0, int(batch.get("blocked_seconds", 0) or 0))
+                    print(
+                        f"⚠️ HH ограничил один из запросов: {blocked_reason}. "
+                        f"Счётчик ограничений {blocked_batches}/{HH_BLOCK_TRIGGER_COUNT}"
+                    )
+                    if blocked_batches >= HH_BLOCK_TRIGGER_COUNT:
+                        blocked = True
+                        stop_reason = blocked_reason or "HH временно ограничил запросы."
+                        stopped_early = True
+                        break
+                    continue
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(
+                        _fetch_vacancy_batch,
+                        query,
+                        exp,
+                        search_fields,
+                        api_sort,
+                        period_days,
+                        max_pages,
+                        included_area_ids,
+                        included_area_set,
+                        excluded_area_set,
+                        include_kw,
+                        include_in,
+                        excl_kw,
+                        excl_in,
+                        work_formats,
+                        area_work_format_rules,
+                        employment_types,
+                        only_with_salary,
+                        salary_min,
+                        excluded_employers,
+                    ): (query, exp)
+                    for query, exp in query_exp_tasks
+                }
+
+                for future in as_completed(future_map):
+                    try:
+                        batch = future.result()
+                    except Exception as e:
+                        query, exp = future_map[future]
+                        exp_label = EXPERIENCE_OPTIONS.get(exp, "любой опыт") if exp else "любой опыт"
+                        error_text = f"{query} / {exp_label}: {e}"
+                        print(f"❌ Ошибка параллельного запроса hh.ru: {error_text}")
+                        errors.append(error_text)
+                        continue
+
+                    requests_made += int(batch.get("requests_made", 0) or 0)
+                    errors.extend(batch.get("errors", []))
+                    filter_stats = _merge_filter_stats(filter_stats, batch.get("filter_stats", {}))
+                    batch_vacancies = batch.get("vacancies", [])
+                    results.extend(batch_vacancies)
+                    if on_batch and batch_vacancies:
+                        try:
+                            streamed_ids = on_batch(batch_vacancies) or []
+                            for vacancy_id in streamed_ids:
+                                vacancy_id = str(vacancy_id or "")
+                                if vacancy_id and vacancy_id not in priority_ids:
+                                    priority_ids.append(vacancy_id)
+                        except Exception as e:
+                            print(f"⚠️ Ошибка live-выдачи вакансий: {e}")
+                    if batch.get("blocked"):
+                        blocked_batches += 1
+                        blocked_reason = str(batch.get("blocked_reason") or "")
+                        blocked_seconds = max(0, int(batch.get("blocked_seconds", 0) or 0))
+                        print(
+                            f"⚠️ HH ограничил один из запросов: {blocked_reason}. "
+                            f"Счётчик ограничений {blocked_batches}/{HH_BLOCK_TRIGGER_COUNT}"
+                        )
+                        if blocked_batches >= HH_BLOCK_TRIGGER_COUNT:
+                            blocked = True
+                            stop_reason = blocked_reason or "HH временно ограничил запросы."
+                            stopped_early = True
+                            for pending_future in future_map:
+                                pending_future.cancel()
+                            break
+                        continue
+                    if requests_made >= HH_MAX_REQUESTS_PER_RUN:
+                        stopped_early = True
+                        stop_reason = f"Достигнут безопасный лимит запросов HH за один запуск ({HH_MAX_REQUESTS_PER_RUN})."
+                        print(f"⚠️ {stop_reason}")
+                        errors.append(stop_reason)
+                        for pending_future in future_map:
+                            pending_future.cancel()
+                        break
 
     final = []
     seen_final = set()
@@ -1932,13 +3021,27 @@ def fetch_vacancies(template, on_batch=None):
         "errors": _unique_list(errors),
         "requests_made": requests_made,
         "queries_count": len(queries),
+        "filter_stats": filter_stats,
+        "hh_blocked": blocked,
+        "hh_block_reason": blocked_reason,
+        "hh_block_seconds": blocked_seconds,
+        "hh_blocked_batches": blocked_batches,
+        "stopped_early": stopped_early,
+        "stop_reason": stop_reason,
+        "total_task_count": total_task_count,
+        "selected_task_count": selected_task_count,
+        "task_cursor": safe_cursor,
+        "from_cache": False,
     }
     duration = round(time.time() - started_at, 2)
     print(
         f"✅ HH поиск завершён: {len(payload['vacancies'])} вакансий, "
         f"{requests_made} запросов, {len(query_exp_tasks)} комбинаций, {duration} c"
     )
-    if payload["vacancies"] or not payload["errors"]:
+    filter_summary = _format_filter_stats_brief(filter_stats)
+    if filter_summary:
+        print(f"🔧 {filter_summary}")
+    if (payload["vacancies"] or not payload["errors"]) and not blocked and not stopped_early:
         _search_cache_set(cache_key, payload)
     return payload
 
@@ -2148,13 +3251,449 @@ def format_vacancy_brief(index, vacancy):
     return "\n".join(lines)
 
 
+def _fetch_single_vacancy_by_id(vacancy_id):
+    vacancy_id = str(vacancy_id or "").strip()
+    if not vacancy_id:
+        return None, "Пустой vacancy_id"
+    try:
+        _wait_hh_backoff()
+        response = _hh_request_get(f"/vacancies/{vacancy_id}", timeout=_hh_http_timeout())
+        status_code = int(response.status_code or 0)
+        if status_code in (403, 429, 500, 502, 503, 504):
+            response.raise_for_status()
+        response.raise_for_status()
+        vacancy = response.json()
+        return vacancy, None
+    except requests.Timeout:
+        return None, f"{vacancy_id}: HH не ответил вовремя"
+    except Exception as e:
+        return None, f"{vacancy_id}: {e}"
+
+
+def _fetch_vacancies_by_ids(vacancy_ids):
+    ordered_ids = [str(item or "").strip() for item in (vacancy_ids or []) if str(item or "").strip()]
+    _debug_log("fetch_vacancies_by_ids_start", ids=",".join(ordered_ids[:5]), size=len(ordered_ids))
+    if not ordered_ids:
+        return [], ["Пустой список vacancy_id"]
+
+    results_map = {}
+    errors = []
+    max_workers = min(3, len(ordered_ids))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(_fetch_single_vacancy_by_id, vacancy_id): vacancy_id
+            for vacancy_id in ordered_ids
+        }
+        for future in as_completed(future_map):
+            vacancy_id = future_map[future]
+            try:
+                vacancy, error_text = future.result()
+            except Exception as e:
+                vacancy = None
+                error_text = f"{vacancy_id}: {e}"
+            if vacancy:
+                results_map[str(vacancy.get("id") or vacancy_id)] = vacancy
+            elif error_text:
+                errors.append(error_text)
+
+    ordered_vacancies = []
+    for vacancy_id in ordered_ids:
+        vacancy = results_map.get(vacancy_id)
+        if vacancy:
+            ordered_vacancies.append(vacancy)
+    _debug_log(
+        "fetch_vacancies_by_ids_done",
+        requested=len(ordered_ids),
+        loaded=len(ordered_vacancies),
+        errors=len(errors),
+    )
+    return ordered_vacancies, _unique_list(errors)
+
+
+def _group_range_label(page_index, group_size, total_count=None):
+    page_index = max(1, int(page_index or 1))
+    group_size = max(1, int(group_size or 1))
+    start = ((page_index - 1) * group_size) + 1
+    end = start + group_size - 1
+    if total_count is not None:
+        end = min(end, int(total_count))
+    return start, end
+
+
+def _format_ready_group_message(page_index, group_size, current_count, final=False):
+    page_index = max(1, int(page_index or 1))
+    group_size = max(1, int(group_size or 1))
+    current_count = max(0, int(current_count or 0))
+    start = ((page_index - 1) * group_size) + 1
+    end = start + max(0, current_count - 1)
+    if current_count >= group_size or final:
+        return (
+            f"Готова группа <b>{page_index}</b>.\n"
+            f"Внутри вакансии <b>{start}–{end}</b>."
+        )
+    return (
+        f"Группа <b>{page_index}</b> собирается.\n"
+        f"Уже готовы вакансии <b>{start}–{end}</b>."
+    )
+
+
+def _ready_group_keyboard(data, page_index, vacancy_ids, template_id=""):
+    callback_data = _group_callback_data(page_index, vacancy_ids)
+    buttons = []
+    if callback_data:
+        buttons.append([{"text": "Дальше", "callback_data": callback_data}])
+    buttons.extend(_current_search_keyboard(data).get("inline_keyboard", []))
+    return {"inline_keyboard": buttons}
+
+
+def _hh_stateless_group_keyboard(data, template_id, current_page, total_pages):
+    try:
+        total_pages_int = max(1, int(total_pages or 1))
+    except Exception:
+        total_pages_int = 1
+    try:
+        current_page_int = min(total_pages_int, max(1, int(current_page or 1)))
+    except Exception:
+        current_page_int = 1
+
+    buttons = []
+    nav_row = []
+    if current_page_int > 1:
+        nav_row.append({"text": "Назад", "callback_data": _hh_group_page_callback_data(template_id, current_page_int - 1)})
+    if current_page_int < total_pages_int:
+        nav_row.append({"text": "Дальше", "callback_data": _hh_group_page_callback_data(template_id, current_page_int + 1)})
+    elif total_pages_int > 1 and current_page_int != 1:
+        nav_row.append({"text": "С начала", "callback_data": _hh_group_page_callback_data(template_id, 1)})
+    if nav_row:
+        buttons.append(nav_row)
+    if total_pages_int > 1:
+        buttons.extend(
+            _page_picker_rows(
+                list(range(1, total_pages_int + 1)),
+                current_page_int,
+                lambda page_number: _hh_group_page_callback_data(template_id, page_number),
+            )
+        )
+    buttons.append([
+        {"text": "Текущий шаблон", "callback_data": "menu_current"},
+        {"text": "Главное меню", "callback_data": "menu_home"},
+    ])
+    return {"inline_keyboard": buttons}
+
+
+def _render_hh_stateless_group_page(data, tmpl, page_index):
+    result = _execute_search_result(data, tmpl, persist=False)
+    visible_vacancies = result.get("visible_vacancies") or []
+    fetch_errors = result.get("errors") or []
+    page_size = max(1, int(tmpl.get("delivery_page_size", 5) or 5))
+    total_count = len(visible_vacancies)
+    total_pages = max(1, (total_count + page_size - 1) // page_size) if total_count else 1
+    safe_page = min(max(1, int(page_index or 1)), total_pages)
+    start_index = (safe_page - 1) * page_size
+    end_index = min(start_index + page_size, total_count)
+    page_vacancies = visible_vacancies[start_index:end_index]
+    remaining_after = max(0, total_count - end_index)
+
+    lines = [
+        f"<b>Группа {safe_page}</b>",
+        f"Страница: <b>{safe_page}/{total_pages}</b>",
+        f"Новых вакансий в группе: <b>{len(page_vacancies)}</b>",
+        f"Осталось после этой страницы: <b>{remaining_after}</b>",
+    ]
+    if fetch_errors:
+        lines.append(_friendly_fetch_error_summary(fetch_errors))
+    lines.append("")
+    for index, vacancy in enumerate(page_vacancies, start=1):
+        lines.append(format_vacancy_brief(index, vacancy))
+        lines.append("")
+    return {
+        "text": "\n".join(lines).strip(),
+        "reply_markup": _hh_stateless_group_keyboard(data, tmpl["id"], safe_page, total_pages),
+        "page_vacancies": page_vacancies,
+        "page_index": safe_page,
+        "total_pages": total_pages,
+        "total_count": total_count,
+        "errors": fetch_errors,
+    }
+
+
+def _reply_markup_signature(reply_markup):
+    if not reply_markup:
+        return ""
+    try:
+        return json.dumps(reply_markup, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return ""
+
+
+def _next_live_group_entry(run_state, current_page_index):
+    groups = (run_state or {}).get("groups") or {}
+    for group_index in sorted(int(key) for key in groups.keys() if str(key).isdigit()):
+        if group_index <= int(current_page_index or 0):
+            continue
+        group_entry = groups.get(str(group_index)) or {}
+        vacancy_ids = [str(item).strip() for item in (group_entry.get("vacancy_ids") or []) if str(item).strip()]
+        if not vacancy_ids or bool(group_entry.get("opened")):
+            continue
+        return group_index, vacancy_ids
+    return None, []
+
+
+def _previous_live_group_entry(run_state, current_page_index):
+    groups = (run_state or {}).get("groups") or {}
+    previous_indices = []
+    for key in groups.keys():
+        if not str(key).isdigit():
+            continue
+        page_index = int(key)
+        if page_index >= int(current_page_index or 0):
+            continue
+        previous_indices.append(page_index)
+    if not previous_indices:
+        return None, []
+    previous_index = max(previous_indices)
+    group_entry = groups.get(str(previous_index)) or {}
+    vacancy_ids = [str(item).strip() for item in (group_entry.get("vacancy_ids") or []) if str(item).strip()]
+    if not vacancy_ids:
+        return None, []
+    return previous_index, vacancy_ids
+
+
+def _live_group_available_indices(run_state):
+    groups = (run_state or {}).get("groups") or {}
+    indices = []
+    for key, group_entry in groups.items():
+        if not str(key).isdigit():
+            continue
+        vacancy_ids = [str(item).strip() for item in ((group_entry or {}).get("vacancy_ids") or []) if str(item).strip()]
+        if vacancy_ids:
+            indices.append(int(key))
+    return sorted(set(indices))
+
+
+def _remaining_live_group_vacancies(run_state, current_page_index):
+    groups = (run_state or {}).get("groups") or {}
+    remaining = 0
+    for key, group_entry in groups.items():
+        if not str(key).isdigit():
+            continue
+        page_index = int(key)
+        if page_index <= int(current_page_index or 0):
+            continue
+        remaining += len([str(item).strip() for item in ((group_entry or {}).get("vacancy_ids") or []) if str(item).strip()])
+    return remaining
+
+
+def _group_result_keyboard(data, run_state, page_index):
+    buttons = []
+    previous_group_index, previous_group_ids = _previous_live_group_entry(run_state, page_index)
+    next_group_index, next_group_ids = _next_live_group_entry(run_state, page_index)
+    available_indices = _live_group_available_indices(run_state)
+    first_group_index = min(available_indices) if available_indices else None
+    first_group_ids = []
+    if first_group_index is not None:
+        first_group_ids = [
+            str(item).strip()
+            for item in (((run_state.get("groups") or {}).get(str(first_group_index)) or {}).get("vacancy_ids") or [])
+            if str(item).strip()
+        ]
+    nav_row = []
+    previous_callback = _group_callback_data(previous_group_index, previous_group_ids) if previous_group_index else ""
+    next_callback = _group_callback_data(next_group_index, next_group_ids) if next_group_index else ""
+    first_callback = _group_callback_data(first_group_index, first_group_ids) if first_group_index else ""
+    if previous_callback:
+        nav_row.append({"text": "Назад", "callback_data": previous_callback})
+    if next_callback:
+        nav_row.append({"text": "Дальше", "callback_data": next_callback})
+    elif first_callback and first_group_index != page_index:
+        nav_row.append({"text": "С начала", "callback_data": first_callback})
+    if nav_row:
+        buttons.append(nav_row)
+    if len(available_indices) > 1:
+        buttons.extend(
+            _page_picker_rows(
+                available_indices,
+                page_index,
+                lambda group_number: _group_callback_data(
+                    group_number,
+                    [str(item).strip() for item in (((run_state.get("groups") or {}).get(str(group_number)) or {}).get("vacancy_ids") or []) if str(item).strip()],
+                ),
+            )
+        )
+    buttons.append([
+        {"text": "Текущий шаблон", "callback_data": "menu_current"},
+        {"text": "Главное меню", "callback_data": "menu_home"},
+    ])
+    return {"inline_keyboard": buttons}
+
+
+def _format_group_result_text(page_index, vacancies, run_state=None):
+    available_indices = _live_group_available_indices(run_state)
+    total_pages = max(available_indices) if available_indices else int(page_index or 1)
+    remaining_after_page = _remaining_live_group_vacancies(run_state, page_index)
+    completed = bool((run_state or {}).get("completed"))
+    total_pages_label = str(total_pages) if completed else f"{total_pages}+"
+    lines = [
+        f"<b>Группа {page_index}</b>",
+        f"Страница: <b>{page_index}/{total_pages_label}</b>",
+        f"Новых вакансий в группе: <b>{len(vacancies)}</b>",
+        f"Осталось после этой страницы: <b>{remaining_after_page}</b>",
+    ]
+    if not completed:
+        lines.append("Поиск всё ещё продолжается.")
+    lines.append("")
+    for index, vacancy in enumerate(vacancies, start=1):
+        lines.append(format_vacancy_brief(index, vacancy))
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _live_group_last_index(run_state):
+    groups = (run_state or {}).get("groups") or {}
+    indices = [int(key) for key, value in groups.items() if isinstance(value, dict) and value.get("vacancy_ids")]
+    return max(indices) if indices else 1
+
+
+def _refresh_opened_live_group_keyboards(data, tmpl, run_state):
+    if not tmpl or not run_state:
+        return False
+
+    changed = False
+    chat_id = run_state.get("chat_id")
+    groups = (run_state.get("groups") or {})
+    for page_key, group_entry in groups.items():
+        if not isinstance(group_entry, dict) or not group_entry.get("opened"):
+            continue
+        result_message_id = int(group_entry.get("result_message_id", 0) or 0)
+        if result_message_id <= 0:
+            continue
+        try:
+            page_index = int(page_key)
+        except Exception:
+            continue
+        reply_markup = _group_result_keyboard(data, run_state, page_index)
+        keyboard_signature = _reply_markup_signature(reply_markup)
+        if keyboard_signature == str(group_entry.get("result_keyboard_signature") or ""):
+            continue
+        response = tg_call(
+            "editMessageReplyMarkup",
+            chat_id=chat_id,
+            message_id=result_message_id,
+            reply_markup=reply_markup,
+        )
+        if isinstance(response, dict) and (response.get("ok", False) or _tg_not_modified(response)):
+            group_entry["result_keyboard_signature"] = keyboard_signature
+            changed = True
+            _debug_log(
+                "refresh_group_keyboard",
+                template_id=tmpl.get("id"),
+                page_index=page_index,
+                has_next=bool((reply_markup.get("inline_keyboard") or [])[0][0].get("text") == "Дальше"),
+            )
+    return changed
+
+
+def _announce_next_live_group(data, tmpl, run_state):
+    if not tmpl or not run_state:
+        return False
+
+    template_id = str(tmpl.get("id") or "")
+    groups = (run_state.get("groups") or {})
+    next_group = max(2, int(run_state.get("next_group_to_announce", 2) or 2))
+    if next_group > 2:
+        _debug_log(
+            "announce_next_live_group_skipped",
+            template_id=template_id,
+            group_index=next_group,
+            reason="hh_stateless_navigation",
+        )
+        return False
+    group_key = str(next_group)
+    group_entry = groups.get(group_key)
+    if not isinstance(group_entry, dict):
+        return False
+
+    vacancy_ids = [str(item).strip() for item in (group_entry.get("vacancy_ids") or []) if str(item).strip()]
+    if not vacancy_ids or group_entry.get("opened"):
+        return False
+
+    final_group = bool(run_state.get("completed")) and next_group >= _live_group_last_index(run_state)
+    callback_data = _group_callback_data(next_group, vacancy_ids)
+    if not callback_data:
+        return False
+    message_text = _format_ready_group_message(
+        next_group,
+        run_state.get("page_size", tmpl.get("delivery_page_size", 5)),
+        len(vacancy_ids),
+        final=final_group,
+    )
+    reply_markup = _ready_group_keyboard(data, next_group, vacancy_ids, template_id=template_id)
+    render_signature = json.dumps({
+        "text": message_text,
+        "callback_data": callback_data,
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    message_id = int(group_entry.get("message_id", 0) or 0)
+    previous_signature = str(group_entry.get("render_signature") or "")
+
+    _debug_log(
+        "announce_next_live_group",
+        template_id=template_id,
+        group_index=next_group,
+        size=len(vacancy_ids),
+        message_id=message_id,
+        completed=bool(run_state.get("completed")),
+        signature_changed=previous_signature != render_signature,
+    )
+
+    if message_id and previous_signature == render_signature:
+        return True
+
+    if message_id:
+        edit_result = edit_msg(run_state.get("chat_id"), message_id, message_text, reply_markup=reply_markup)
+        if isinstance(edit_result, dict) and (edit_result.get("ok", False) or _tg_not_modified(edit_result)):
+            group_entry["render_signature"] = render_signature
+            run_state["updated_at"] = time.time()
+            _set_live_group_run(data, template_id, run_state)
+            return True
+
+    response = send_msg(run_state.get("chat_id"), message_text, reply_markup=reply_markup)
+    group_entry["message_id"] = _message_id_from_response(response)
+    group_entry["render_signature"] = render_signature
+    run_state["updated_at"] = time.time()
+    _set_live_group_run(data, template_id, run_state)
+    return bool(group_entry.get("message_id"))
+
+
+def _compact_result_vacancy(vacancy):
+    work_format_items = []
+    for item in vacancy.get("work_format") or []:
+        name = str((item or {}).get("name") or "").strip()
+        if name:
+            work_format_items.append({"name": name})
+    return {
+        "id": vacancy.get("id"),
+        "name": vacancy.get("name"),
+        "alternate_url": vacancy.get("alternate_url"),
+        "employer": {"name": (vacancy.get("employer") or {}).get("name")},
+        "area": {"name": (vacancy.get("area") or {}).get("name")},
+        "experience": {"name": (vacancy.get("experience") or {}).get("name")},
+        "salary": vacancy.get("salary") or {},
+        "work_format": work_format_items,
+    }
+
+
+def _compact_result_vacancies(vacancies):
+    return [_compact_result_vacancy(item) for item in (vacancies or [])]
+
+
 def _store_result_session(data, tmpl, vacancies, persist, errors):
-    return _store_result_session_with_resume(data, tmpl, vacancies, persist, errors, resume_page=0)
+    return _store_result_session_with_resume(data, tmpl, vacancies, persist, errors, resume_page=0, resume_enabled=False)
 
 
-def _upsert_result_session_with_resume(data, session_id, tmpl, vacancies, persist, errors, resume_page=0):
+def _upsert_result_session_with_resume(data, session_id, tmpl, vacancies, persist, errors, resume_page=0, resume_enabled=False):
     sessions = data.setdefault("result_sessions", {})
-    normalized_vacancies = list(vacancies or [])
+    normalized_vacancies = _compact_result_vacancies(vacancies)
     normalized_errors = list(errors or [])
     if session_id and session_id in sessions:
         session = sessions[session_id]
@@ -2162,22 +3701,42 @@ def _upsert_result_session_with_resume(data, session_id, tmpl, vacancies, persis
         session["template_name"] = tmpl["name"]
         session["page_size"] = tmpl.get("delivery_page_size", 5)
         session["resume_page"] = max(0, int(resume_page or 0))
+        session["resume_enabled"] = bool(resume_enabled)
         session["vacancies"] = normalized_vacancies
         session["mode"] = "run" if persist else "preview"
         session["errors"] = normalized_errors
+        _persist_result_session(session_id, session)
+        _debug_log(
+            "update_result_session",
+            session_id=session_id,
+            template_id=tmpl["id"],
+            vacancies=len(normalized_vacancies),
+            resume_page=resume_page,
+            payload_bytes=len(json.dumps(normalized_vacancies, ensure_ascii=False).encode("utf-8")),
+        )
         _trim_result_sessions(data)
         return session_id
-    return _store_result_session_with_resume(
+    new_session_id = _store_result_session_with_resume(
         data,
         tmpl,
         normalized_vacancies,
         persist,
         normalized_errors,
         resume_page=resume_page,
+        resume_enabled=resume_enabled,
     )
+    _debug_log(
+        "create_result_session",
+        session_id=new_session_id,
+        template_id=tmpl["id"],
+        vacancies=len(normalized_vacancies),
+        resume_page=resume_page,
+        payload_bytes=len(json.dumps(normalized_vacancies, ensure_ascii=False).encode("utf-8")),
+    )
+    return new_session_id
 
 
-def _store_result_session_with_resume(data, tmpl, vacancies, persist, errors, resume_page=0):
+def _store_result_session_with_resume(data, tmpl, vacancies, persist, errors, resume_page=0, resume_enabled=False):
     session_id = str(uuid.uuid4())[:8]
     data.setdefault("result_sessions", {})[session_id] = {
         "template_id": tmpl["id"],
@@ -2186,10 +3745,12 @@ def _store_result_session_with_resume(data, tmpl, vacancies, persist, errors, re
         "page_size": tmpl.get("delivery_page_size", 5),
         "current_page": 0,
         "resume_page": max(0, int(resume_page or 0)),
-        "vacancies": vacancies,
+        "resume_enabled": bool(resume_enabled),
+        "vacancies": _compact_result_vacancies(vacancies),
         "mode": "run" if persist else "preview",
         "errors": list(errors or []),
     }
+    _persist_result_session(session_id, data["result_sessions"][session_id])
     _trim_result_sessions(data)
     return session_id
 
@@ -2197,7 +3758,24 @@ def _store_result_session_with_resume(data, tmpl, vacancies, persist, errors, re
 def _render_result_page(data, session_id, page):
     session = (data.get("result_sessions", {}) or {}).get(session_id)
     if not session:
+        session = _restore_result_session(data, session_id)
+    if not session:
+        _debug_log(
+            "render_result_page_missing",
+            session_id=session_id,
+            requested_page=page,
+            known_sessions=",".join(sorted((data.get("result_sessions") or {}).keys())[:10]),
+        )
         return None, None
+
+    _debug_log(
+        "render_result_page",
+        session_id=session_id,
+        requested_page=page,
+        vacancies=len(session.get("vacancies", []) or []),
+        resume_page=session.get("resume_page", 0),
+        current_page=session.get("current_page", 0),
+    )
 
     vacancies = session.get("vacancies", [])
     page_size = max(1, int(session.get("page_size", 5) or 5))
@@ -2208,12 +3786,14 @@ def _render_result_page(data, session_id, page):
     start = page * page_size
     end = start + page_size
     items = vacancies[start:end]
+    remaining_after_page = max(0, len(vacancies) - min(end, len(vacancies)))
     mode_label = "Поиск" if session.get("mode") == "run" else "Предпросмотр"
 
     lines = [
         f"<b>{_esc(mode_label)}: {_esc(session.get('template_name', 'Поиск'))}</b>",
         f"Найдено: <b>{len(vacancies)}</b>",
         f"Страница: <b>{page + 1}/{page_count}</b>",
+        f"Осталось после этой страницы: <b>{remaining_after_page}</b>",
     ]
 
     if session.get("errors"):
@@ -2237,6 +3817,14 @@ def _render_result_page(data, session_id, page):
         nav_row.append({"text": "С начала", "callback_data": f"res_{session_id}_0"})
     if nav_row:
         buttons.append(nav_row)
+    if page_count > 1:
+        buttons.extend(
+            _page_picker_rows(
+                range(1, page_count + 1),
+                page + 1,
+                lambda page_number: f"res_{session_id}_{page_number - 1}",
+            )
+        )
     buttons.append([
         {"text": "Текущий шаблон", "callback_data": "menu_current"},
         {"text": "Главное меню", "callback_data": "menu_home"},
@@ -2266,8 +3854,8 @@ def _format_template_summary(template, detailed=False):
     elif not include_names:
         include_text = "Все страны и города"
     else:
-        include_text = ", ".join(_esc(name) for name in include_names)
-    exclude_text = ", ".join(_esc(name) for name in exclude_names) if exclude_names else "Без исключений"
+        include_text = _esc(_compact_preview(include_names, limit=6))
+    exclude_text = _esc(_compact_preview(exclude_names, limit=6, empty_text="Без исключений"))
     include_kw_preview = ", ".join(_esc(word) for word in include_kw[:6]) or "нет"
     exclude_kw_preview = ", ".join(_esc(word) for word in exclude_kw[:6]) or "нет"
     if len(include_kw) > 6:
@@ -2287,7 +3875,7 @@ def _format_template_summary(template, detailed=False):
         f"Исключающие слова: <i>{exclude_kw_preview}</i>",
         f"Где применять исключения: {_esc({'title': 'только название', 'description': 'только описание', 'both': 'и название, и описание'}.get(template.get('exclude_in', 'both'), 'и название, и описание'))}",
         f"Сортировка: {_esc(SORT_OPTIONS.get(template.get('sort', ''), '—'))}",
-        f"Период: {_esc(PERIOD_OPTIONS.get(template.get('period_days', 1), 'За 1 день'))}",
+        f"Период: {_esc(_period_label(template.get('period_days', 0)))}",
         f"Страниц на запрос: {template.get('max_pages', 5)}",
         f"Лимит результатов: {template.get('max_results', 50)}",
         f"В одной странице выдачи: {template.get('delivery_page_size', 5)}",
@@ -2359,10 +3947,18 @@ def _friendly_fetch_error_summary(fetch_errors):
     if not fetch_errors:
         return ""
     joined = " ".join(str(item) for item in fetch_errors)
+    for item in fetch_errors:
+        item_text = str(item or "").strip()
+        if item_text.startswith("HH-поиск временно стоит на паузе"):
+            return item_text
+    if "HH не ответил вовремя" in joined or "HH отвечает слишком медленно" in joined:
+        return "HH не ответил вовремя. Я остановил запуск раньше, чтобы бот не зависал."
     if "ограничил запросы (403)" in joined:
-        return "HH временно ограничил часть запросов. Обычно помогает повторить поиск позже или уменьшить число страниц и запросов."
+        return "HH вернул 403. Похоже, HH временно ограничил запросы с этого источника."
     if "ограничил частоту запросов (429)" in joined:
-        return "HH временно ограничил частоту запросов. Повторите поиск немного позже."
+        return "HH вернул 429. Похоже, HH временно ограничил частоту запросов."
+    if "Достигнут безопасный лимит запросов HH" in joined:
+        return "Для HH сработал безопасный лимит. В этом запуске я сделал только один HH-запрос."
     return f"Ошибка запроса: <code>{_esc('; '.join(fetch_errors[:2]))}</code>"
 
 
@@ -2388,11 +3984,11 @@ def wizard_start(chat_id, data, template_id=None):
     send_msg(
         chat_id,
         f"<b>{title}</b>\n\n"
-        "<b>Шаг 1. Что ищем</b>\n"
-        "Введите основную вакансию и синонимы через запятую.\n"
-        "Или напишите <code>default</code>, если нужен готовый набор аналитических ролей.\n\n"
+        "<b>Шаг 1 из 9 — Что ищем</b>\n"
+        "Введите вакансии через запятую.\n"
+        "Или напишите <code>default</code> — готовый набор аналитических ролей.\n\n"
         "Пример: <code>data analyst, product analyst, business analyst</code>\n\n"
-        "Я буду задавать вопросы по одному блоку: опыт, география, формат работы, исключения и автопроверка. В конце покажу итоговое подтверждение перед сохранением.",
+        "<i>Далее: опыт → география → ключевые слова → формат → зарплата → сортировка → автопроверка → подтверждение</i>",
         reply_markup={"inline_keyboard": _back_home_row()}
     )
 
@@ -2414,7 +4010,7 @@ def _new_draft():
         "work_formats":     [],
         "area_work_format_rules": [],
         "employment_types": [],
-        "period_days":      1,
+        "period_days":      0,
         "only_with_salary": False,
         "salary_min":       0,
         "excluded_employers": [],
@@ -2422,7 +4018,7 @@ def _new_draft():
         "delivery_page_size": 5,
         "sort":             "publication_time",
         "interval":         30,
-        "max_pages":        5,
+        "max_pages":        1,
     })
 
 
@@ -2556,7 +4152,11 @@ def wizard_handle_text(chat_id, text, data):
             return True
         if lo == "default":
             draft["exclude_keywords"] = DEFAULT_EXCLUDE_KEYWORDS[:]
-        elif lo in SKIP_WORDS:
+            _wizard_move_to(state, "exclude_in")
+            save_data(data)
+            _send_exclude_in_kb(chat_id)
+            return True
+        if lo in SKIP_WORDS:
             draft["exclude_keywords"] = []
             _wizard_move_to(state, "work_formats")
             save_data(data)
@@ -2680,27 +4280,27 @@ def _send_search_fields_kb(chat_id, selected):
     for code, label in SEARCH_FIELD_OPTIONS.items():
         mark = "[x] " if code in selected else "[ ] "
         buttons.append([{"text": mark + label, "callback_data": f"sf_{code}"}])
-    buttons.append([{"text": "Далее", "callback_data": "sf_done"}])
+    buttons.append([{"text": "Далее →", "callback_data": "sf_done"}])
     buttons.extend(_back_home_row("wiz_back"))
-    send_msg(chat_id, "<b>Где искать совпадения</b>\nВыберите, где искать вакансию: в названии, компании и/или описании.", reply_markup={"inline_keyboard": buttons})
+    send_msg(chat_id, "<b>Шаг 2 из 9 — Где искать</b>\nВыберите поля, по которым искать вакансию.\nМожно выбрать несколько или оставить все.", reply_markup={"inline_keyboard": buttons})
 
 def _send_experience_kb(chat_id, selected):
     buttons = []
     for code, label in EXPERIENCE_OPTIONS.items():
         mark = "[x] " if code in selected else "[ ] "
         buttons.append([{"text": mark + label, "callback_data": f"exp_{code}"}])
-    buttons.append([{"text": "Далее", "callback_data": "exp_done"}])
+    buttons.append([{"text": "Далее →", "callback_data": "exp_done"}])
     buttons.extend(_back_home_row("wiz_back"))
-    send_msg(chat_id, "<b>Опыт</b>\nВыберите один или несколько вариантов:",
+    send_msg(chat_id, "<b>Шаг 3 из 9 — Опыт работы</b>\nВыберите один или несколько вариантов.\n«Не имеет значения» — любой опыт.",
              reply_markup={"inline_keyboard": buttons})
 
 def _send_area_scope_kb(chat_id):
     kb = {"inline_keyboard": [
-        [{"text": "Все страны", "callback_data": "scope_all"}],
-        [{"text": "Выбрать страны и города", "callback_data": "scope_selected"}],
+        [{"text": "Все страны мира", "callback_data": "scope_all"}],
+        [{"text": "Выбрать конкретные страны и города", "callback_data": "scope_selected"}],
         *_back_home_row("wiz_back"),
     ]}
-    send_msg(chat_id, "<b>Где искать вакансии</b>\nСначала выберите общий режим поиска:", reply_markup=kb)
+    send_msg(chat_id, "<b>Шаг 4 из 9 — География</b>\nГде искать вакансии?\n\nПотом можно добавить исключения (например, кроме России).", reply_markup=kb)
 
 def _send_include_area_prompt(chat_id, current_values=None, mode="create"):
     examples = ", ".join(POPULAR_AREA_NAMES[:12])
@@ -2733,8 +4333,9 @@ def _send_include_kw_prompt(chat_id, current_values=None, mode="create"):
     note = _current_value_note(current_values, "нет") if mode == "edit" else "\n"
     send_msg(
         chat_id,
-        "<b>Обязательные слова</b>\n"
-        "Введите слова через запятую или <code>нет</code>, если такой фильтр не нужен.\n\n"
+        "<b>Шаг 5 из 9 — Обязательные слова</b>\n"
+        "Вакансия должна содержать эти слова (хотя бы одно).\n"
+        "Введите через запятую или <code>нет</code>, если фильтр не нужен.\n\n"
         + note +
         "Пример: <code>sql, python, product</code>",
         reply_markup={"inline_keyboard": _back_home_row("wiz_back")}
@@ -2747,18 +4348,19 @@ def _send_include_in_kb(chat_id):
         [{"text": "И в названии, и в описании", "callback_data": "ii_both"}],
         *_back_home_row("wiz_back"),
     ]}
-    send_msg(chat_id, "<b>Где искать обязательные слова</b>", reply_markup=kb)
+    send_msg(chat_id, "<b>Где искать обязательные слова?</b>\nГде проверять наличие указанных слов.", reply_markup=kb)
 
 def _send_exclude_kw_prompt(chat_id, current_values=None, mode="create"):
     note = _current_value_note(current_values, "нет") if mode == "edit" else "\n"
     send_msg(
         chat_id,
-        "<b>Исключающие слова</b>\n\n"
+        "<b>Шаг 6 из 9 — Исключающие слова</b>\n"
+        "Вакансии с этими словами будут отфильтрованы.\n\n"
         + note +
-        "• <code>default</code> — стандартный список\n"
-        "• <code>нет</code> — не использовать исключающие слова\n"
+        "• <code>default</code> — стандартный антигемблинг-список\n"
+        "• <code>нет</code> — без исключений\n"
         "• Или введите свои слова через запятую\n\n"
-        f"В дефолтном списке: <b>{len(DEFAULT_EXCLUDE_KEYWORDS)}</b> слов",
+        f"Стандартный список: <b>{len(DEFAULT_EXCLUDE_KEYWORDS)}</b> слов (казино, беттинг и т.д.)",
         reply_markup={"inline_keyboard": _back_home_row("wiz_back")}
     )
 
@@ -2769,10 +4371,10 @@ def _send_exclude_in_kb(chat_id):
         [{"text": "И в названии, и в описании", "callback_data": "ei_both"}],
         *_back_home_row("wiz_back"),
     ]}
-    send_msg(chat_id, "<b>Где применять исключающие слова</b>", reply_markup=kb)
+    send_msg(chat_id, "<b>Где применять исключающие слова?</b>\nИскать исключающие слова только в названии, только в описании или в обоих местах.", reply_markup=kb)
 
 def _work_formats_keyboard(selected):
-    buttons = [[{"text": "Любой формат", "callback_data": "wf_any"}]]
+    buttons = [[{"text": "Любой формат (ничего не выбирать)", "callback_data": "wf_any"}]]
     for code, label in get_work_format_options().items():
         mark = "[x] " if code in selected else "[ ] "
         buttons.append([{"text": mark + label.replace("\xa0", " "), "callback_data": f"wf_{code}"}])
@@ -2786,9 +4388,8 @@ def _send_work_formats_kb(chat_id, selected):
         numbered_lines.append(f"{index}. {label.replace(chr(160), ' ')}")
     send_msg(
         chat_id,
-        "<b>Формат работы</b>\n"
-        "Выберите кнопками или отправьте номера через запятую.\n"
-        "Можно несколько вариантов сразу.\n\n"
+        "<b>Шаг 7 из 9 — Формат работы</b>\n"
+        "Выберите кнопками ниже. Можно несколько или «Любой формат».\n\n"
         + "\n".join(numbered_lines),
         reply_markup={"inline_keyboard": _work_formats_keyboard(selected)},
     )
@@ -2827,16 +4428,16 @@ def _employment_keyboard(selected):
     return buttons
 
 def _send_employment_kb(chat_id, selected):
-    send_msg(chat_id, "<b>Тип занятости</b>\nВыберите один или несколько вариантов. Если ничего не выбрано, подойдёт любая занятость.", reply_markup={"inline_keyboard": _employment_keyboard(selected)})
+    send_msg(chat_id, "<b>Шаг 8 из 9 — Тип занятости</b>\nВыберите один или несколько вариантов.\nЕсли ничего не выбрать — подойдёт любая занятость.", reply_markup={"inline_keyboard": _employment_keyboard(selected)})
 
 def _send_salary_mode_kb(chat_id):
     kb = {"inline_keyboard": [
-        [{"text": "Без фильтра по зарплате", "callback_data": "sal_any"}],
+        [{"text": "Любая (без фильтра)", "callback_data": "sal_any"}],
         [{"text": "Только вакансии с зарплатой", "callback_data": "sal_only"}],
-        [{"text": "Минимальная зарплата", "callback_data": "sal_min"}],
+        [{"text": "Указать минимальную сумму", "callback_data": "sal_min"}],
         *_back_home_row("wiz_back"),
     ]}
-    send_msg(chat_id, "<b>Зарплата</b>\nВыберите, нужен ли фильтр по зарплате.", reply_markup=kb)
+    send_msg(chat_id, "<b>Шаг 9 из 9 — Зарплата</b>\nНужен ли фильтр по зарплате?", reply_markup=kb)
 
 def _send_employers_prompt(chat_id, current_values=None, mode="create"):
     note = _current_value_note(current_values, "нет") if mode == "edit" else "\n"
@@ -2863,7 +4464,7 @@ def _send_period_kb(chat_id):
         for days, label in PERIOD_OPTIONS.items()
     ]}
     kb["inline_keyboard"].extend(_back_home_row("wiz_back"))
-    send_msg(chat_id, "<b>Период поиска</b>\nЗа какой период брать вакансии с hh.ru:", reply_markup=kb)
+    send_msg(chat_id, "<b>Период поиска</b>\nМожно искать без ограничения по периоду или выбрать период с hh.ru:", reply_markup=kb)
 
 def _send_pages_kb(chat_id):
     kb = {"inline_keyboard": [
@@ -2896,7 +4497,7 @@ def _send_interval_kb(chat_id):
         for mins, label in INTERVAL_OPTIONS.items()
     ]}
     kb["inline_keyboard"].extend(_back_home_row("wiz_back"))
-    send_msg(chat_id, "<b>Автопроверка</b>\nКак часто автоматически запускать текущий шаблон:", reply_markup=kb)
+    send_msg(chat_id, "<b>Автопроверка — интервал</b>\nКак часто бот будет автоматически запускать этот шаблон и присылать новые вакансии:", reply_markup=kb)
 
 def _send_confirm(chat_id, draft):
     text = (
@@ -2921,10 +4522,12 @@ def _send_confirm(chat_id, draft):
 
 def _menu_reply_markup():
     return {"inline_keyboard": [
-        [{"text": "Создать шаблон", "callback_data": "tmpl_new"},
-         {"text": "Мои шаблоны", "callback_data": "menu_templates"}],
-        [{"text": "Текущий шаблон", "callback_data": "menu_current"},
-         {"text": "Проверить сейчас", "callback_data": "run_now"}],
+        [{"text": "🔍 Поиск HH.ru", "callback_data": "menu_current_hh"},
+         {"text": "🔗 Поиск LinkedIn", "callback_data": "li_menu"}],
+        [{"text": "Создать шаблон HH", "callback_data": "tmpl_new"},
+         {"text": "Шаблоны HH", "callback_data": "menu_templates_hh"}],
+        [{"text": "Создать шаблон LI", "callback_data": "li_tmpl_new"},
+         {"text": "Шаблоны LinkedIn", "callback_data": "li_menu_templates"}],
         [{"text": "Автопроверка", "callback_data": "menu_status"},
          {"text": "Помощь", "callback_data": "menu_help"}],
     ]}
@@ -2953,6 +4556,52 @@ def _search_progress_keyboard():
     return {"inline_keyboard": [
         [{"text": "Текущий шаблон", "callback_data": "menu_current"},
          {"text": "Главное меню", "callback_data": "menu_home"}],
+    ]}
+
+
+def _auto_source_meta(data, source):
+    source = "linkedin" if str(source or "") == "linkedin" else "hh"
+    if source == "linkedin":
+        tmpl = _linkedin_active_template(data)
+        return {
+            "source": "linkedin",
+            "label": "LinkedIn",
+            "enabled": bool(data.get("linkedin_searching", False)),
+            "template": tmpl,
+            "interval": int((tmpl or {}).get("interval", 30) or 30),
+            "last_check": int(data.get("linkedin_last_check", 0) or 0),
+            "menu_callback": "status_linkedin",
+        }
+    tmpl = _active_template(data)
+    return {
+        "source": "hh",
+        "label": "HH.ru",
+        "enabled": bool(data.get("searching", False)),
+        "template": tmpl,
+        "interval": int((tmpl or {}).get("interval", 30) or 30),
+        "last_check": int(data.get("last_check", 0) or 0),
+        "menu_callback": "status_hh",
+    }
+
+
+def _auto_source_menu_keyboard(data):
+    hh_meta = _auto_source_meta(data, "hh")
+    li_meta = _auto_source_meta(data, "linkedin")
+    hh_text = f"HH.ru: {'включена' if hh_meta['enabled'] else 'выключена'}"
+    li_text = f"LinkedIn: {'включена' if li_meta['enabled'] else 'выключена'}"
+    return {"inline_keyboard": [
+        [{"text": hh_text, "callback_data": "status_hh"}],
+        [{"text": li_text, "callback_data": "status_linkedin"}],
+        [{"text": "Главное меню", "callback_data": "menu_home"}],
+    ]}
+
+
+def _auto_source_toggle_keyboard(source):
+    source = "linkedin" if str(source or "") == "linkedin" else "hh"
+    return {"inline_keyboard": [
+        [{"text": "Включить", "callback_data": f"toggle_{source}_on"},
+         {"text": "Выключить", "callback_data": f"toggle_{source}_off"}],
+        *_back_home_row("menu_status"),
     ]}
 
 
@@ -3000,6 +4649,7 @@ def _send_template_details(chat_id, data, tmpl, is_active=False):
 def cmd_menu(chat_id, data):
     data["chat_id"] = chat_id
     save_data(data)
+    current_source = "LinkedIn" if _current_source(data) == "linkedin" else "HH.ru"
     send_msg(
         chat_id,
         "<b>Главное меню</b>\n"
@@ -3008,7 +4658,8 @@ def cmd_menu(chat_id, data):
         "• открыть сохранённые шаблоны\n"
         "• посмотреть текущий шаблон\n"
         "• проверить вакансии сразу\n"
-        "• включить или выключить автопроверку",
+        "• настроить автопроверку HH.ru или LinkedIn\n\n"
+        f"Сейчас общий контекст: <b>{current_source}</b>",
         reply_markup=_menu_reply_markup(),
     )
 
@@ -3022,7 +4673,7 @@ def cmd_start(chat_id, data):
         "Почти всё можно делать кнопками, без ручного ввода команд.\n\n"
         "Шаблон — это сохранённый набор фильтров.\n"
         "Текущий шаблон — тот, который бот использует сейчас.\n"
-        "Автопроверка — автоматический запуск текущего шаблона по расписанию.\n\n"
+        "Автопроверка — автоматический запуск текущего HH- или LinkedIn-шаблона по расписанию.\n\n"
         "<b>Команды:</b>\n"
         "/menu      — главное меню\n"
         "/new       — создать новый шаблон\n"
@@ -3045,13 +4696,13 @@ def cmd_help(chat_id):
         "2. <b>/templates</b> — выберите, откройте или отредактируйте сохранённый шаблон\n"
         "3. <b>/run</b> — немедленно проверю новые вакансии\n"
         "4. <b>/preview</b> — покажу результат без записи в историю\n"
-        "5. <b>/toggle</b> — пауза или запуск автопроверки\n"
+        "5. <b>/toggle</b> — выбор источника для автопроверки\n"
         "6. <b>/current</b> — полная сводка текущего шаблона\n"
         "7. <b>/reset_sent</b> — очистка истории отправок текущего шаблона\n\n"
         "<b>Что как называется:</b>\n"
         "• Шаблон — сохранённые настройки поиска\n"
         "• Текущий шаблон — какой шаблон бот использует сейчас\n"
-        "• Автопроверка — автоматический запуск текущего шаблона по расписанию\n\n"
+        "• Автопроверка — автоматический запуск текущего HH- или LinkedIn-шаблона по расписанию\n\n"
         "<b>Доступные фильтры:</b>\n"
         "• География: страны и города на включение и исключение\n"
         "• Опыт: любые HH-варианты, можно несколько\n"
@@ -3067,6 +4718,7 @@ def cmd_help(chat_id):
 
 def cmd_current(chat_id, data):
     data["chat_id"] = chat_id
+    _set_current_source(data, "hh")
     save_data(data)
     tmpl = _active_template(data)
     if not tmpl:
@@ -3077,6 +4729,7 @@ def cmd_current(chat_id, data):
 
 def cmd_reset_sent(chat_id, data):
     data["chat_id"] = chat_id
+    _set_current_source(data, "hh")
     tmpl = _active_template(data)
     if not tmpl:
         save_data(data)
@@ -3107,63 +4760,81 @@ def cmd_rerun_fresh(chat_id, data):
 
 
 def cmd_toggle(chat_id, data):
-    data["chat_id"] = chat_id
-    if not _active_template(data):
-        save_data(data)
-        send_msg(chat_id, "Нет текущего шаблона. Сначала создайте его или выберите в разделе «Мои шаблоны».", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
-        return
+    cmd_status(chat_id, data)
 
-    data["searching"] = not data.get("searching", False)
-    save_data(data)
-    if data["searching"]:
-        send_msg(chat_id, "<b>Автопроверка включена</b>\nТекущий шаблон будет запускаться по расписанию.", reply_markup=_current_search_keyboard(data))
-    else:
-        send_msg(chat_id, "<b>Автопроверка выключена</b>\nТекущий шаблон можно проверить вручную в любой момент.", reply_markup=_current_search_keyboard(data))
 
 def cmd_status(chat_id, data):
     data["chat_id"] = chat_id
     save_data(data)
-
-    tmpl     = _active_template(data)
-    icon     = "Включена" if data.get("searching") else "Выключена"
-    st_text  = "включена" if data.get("searching") else "выключена"
-    last_ts  = data.get("last_check", 0)
-    last_str = datetime.fromtimestamp(last_ts).strftime("%d.%m %H:%M") if last_ts else "никогда"
-    current_sent = len(_template_sent_ids(data, tmpl["id"])) if tmpl else 0
-    total_sent = len(data.get("sent_ids", []))
-
+    hh_meta = _auto_source_meta(data, "hh")
+    li_meta = _auto_source_meta(data, "linkedin")
     text = (
-        f"{icon} <b>Автопроверка: {st_text}</b>\n\n"
-        f"Текущий шаблон: <b>{_esc(tmpl['name']) if tmpl else 'не выбран'}</b>\n"
-        f"Последняя проверка: {last_str}\n"
-        f"Отправлено по текущему шаблону: {current_sent}\n"
-        f"Отправлено всего: {total_sent}\n"
+        "<b>Автопроверка</b>\n\n"
+        "Выберите источник, для которого хотите включить или выключить автопроверку.\n\n"
+        f"HH.ru: <b>{'включена' if hh_meta['enabled'] else 'выключена'}</b>\n"
+        f"LinkedIn: <b>{'включена' if li_meta['enabled'] else 'выключена'}</b>\n\n"
+        "После выбора покажу статус, текущий шаблон и спрошу, хотите ли вы включить или выключить автопроверку."
     )
+    send_msg(chat_id, text, reply_markup=_auto_source_menu_keyboard(data))
 
-    text += (
-        "\nШаблон — это сохранённые фильтры.\n"
-        "Текущий шаблон — тот, который бот использует сейчас.\n"
-        "Автопроверка — автоматический запуск текущего шаблона по расписанию.\n"
+
+def cmd_status_source(chat_id, data, source):
+    data["chat_id"] = chat_id
+    save_data(data)
+    meta = _auto_source_meta(data, source)
+    tmpl = meta["template"]
+    enabled = meta["enabled"]
+    last_ts = meta["last_check"]
+    last_str = datetime.fromtimestamp(last_ts).strftime("%d.%m %H:%M") if last_ts else "никогда"
+    status_text = "включена" if enabled else "выключена"
+    template_name = _esc((tmpl or {}).get("name") or "не выбран")
+    lines = [
+        f"<b>Автопроверка {meta['label']}</b>",
+        f"Статус: <b>{status_text}</b>",
+        f"Текущий шаблон: <b>{template_name}</b>",
+        f"Последняя проверка: {last_str}",
+        f"Интервал: <b>{meta['interval']} мин</b>",
+        "",
+    ]
+    if not tmpl:
+        lines.append("Сначала выберите или создайте текущий шаблон для этого источника.")
+    elif enabled:
+        lines.append(f"Хотите выключить автопроверку {meta['label']} или оставить её включённой?")
+    else:
+        lines.append(f"Хотите включить автопроверку {meta['label']} каждые {meta['interval']} минут?")
+    send_msg(chat_id, "\n".join(lines), reply_markup=_auto_source_toggle_keyboard(meta["source"]))
+
+
+def cmd_toggle_source(chat_id, data, source, enabled):
+    data["chat_id"] = chat_id
+    meta = _auto_source_meta(data, source)
+    tmpl = meta["template"]
+    if not tmpl:
+        save_data(data)
+        send_msg(
+            chat_id,
+            f"Нет текущего шаблона для {meta['label']}. Сначала создайте его или выберите сохранённый.",
+            reply_markup=_auto_source_menu_keyboard(data),
+        )
+        return
+
+    if meta["source"] == "linkedin":
+        data["linkedin_searching"] = bool(enabled)
+    else:
+        data["searching"] = bool(enabled)
+    save_data(data)
+
+    status_text = "включена" if enabled else "выключена"
+    question_text = (
+        f"<b>Автопроверка {meta['label']} {status_text}</b>\n"
+        f"Текущий шаблон: <b>{_esc(tmpl.get('name') or '')}</b>\n"
+        f"Интервал: <b>{meta['interval']} мин</b>"
     )
-
-    if tmpl and data.get("searching"):
-        interval  = tmpl.get("interval", 30) * 60
-        remaining = max(0, int(last_ts + interval - time.time()))
-        if remaining > 0:
-            text += f"Следующая проверка через: {remaining // 60} мин {remaining % 60} сек\n"
-
-    kb = {"inline_keyboard": [
-        [{"text": "Выключить" if data.get("searching") else "Включить",
-          "callback_data": "toggle"},
-         {"text": "Проверить сейчас", "callback_data": "run_now"}],
-        [{"text": "Текущий шаблон", "callback_data": "menu_current"},
-         {"text": "Мои шаблоны", "callback_data": "menu_templates"}],
-        [{"text": "Главное меню", "callback_data": "menu_home"}],
-    ]}
-    send_msg(chat_id, text, reply_markup=kb)
+    send_msg(chat_id, question_text, reply_markup=_auto_source_toggle_keyboard(meta["source"]))
 
 def cmd_templates(chat_id, data, page=0):
     data["chat_id"] = chat_id
+    _set_current_source(data, "hh")
     save_data(data)
     tmpls = data.get("templates", [])
     if not tmpls:
@@ -3223,29 +4894,23 @@ def cmd_templates(chat_id, data, page=0):
 
 def cmd_run(chat_id, data):
     data["chat_id"] = chat_id
+    _set_current_source(data, "hh")
+    hh_block_message = _hh_guard_before_search(data)
+    if hh_block_message:
+        save_data(data)
+        send_msg(chat_id, hh_block_message, reply_markup=_current_search_keyboard(data))
+        return
     save_data(data)
     tmpl = _active_template(data)
     if not tmpl:
         send_msg(chat_id, "Нет текущего шаблона. Создайте его через /new или выберите в разделе «Мои шаблоны».", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
         return
 
-    session_id, session, next_page = _find_open_result_session(data, tmpl["id"])
-    if session_id and session is not None and next_page is not None:
-        text, markup = _render_result_page(data, session_id, next_page)
-        save_data(data)
-        send_msg(
-            chat_id,
-            "Есть ещё непросмотренные вакансии из предыдущей проверки.\n"
-            "Продолжаю с того места, где список остановился.",
-        )
-        send_msg(chat_id, text, reply_markup=markup)
-        return
-
     if _is_run_in_progress(data):
         send_msg(
             chat_id,
             "Проверка уже идёт.\n"
-            "Если в сообщении ниже есть кнопка «Дальше», можно открыть следующие вакансии уже сейчас.",
+            "Новые вакансии будут приходить автоматически по мере нахождения.",
             reply_markup=_current_search_keyboard(data),
         )
         return
@@ -3258,13 +4923,19 @@ def cmd_run(chat_id, data):
 
 def cmd_preview(chat_id, data):
     data["chat_id"] = chat_id
+    _set_current_source(data, "hh")
+    hh_block_message = _hh_guard_before_search(data)
+    if hh_block_message:
+        save_data(data)
+        send_msg(chat_id, hh_block_message, reply_markup=_current_search_keyboard(data))
+        return
     save_data(data)
     tmpl = _active_template(data)
     if not tmpl:
         send_msg(chat_id, "Нет текущего шаблона. Создайте его через /new или выберите в разделе «Мои шаблоны».", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
         return
     if _is_run_in_progress(data):
-        send_msg(chat_id, "Сейчас уже выполняется другая проверка. Дождитесь её завершения или откройте продолжение списка кнопкой «Дальше».")
+        send_msg(chat_id, "Сейчас уже выполняется другая проверка. Дождитесь её завершения.")
         return
     send_msg(chat_id, _format_launch_message(tmpl, preview=True))
     if _dispatch_async_run(persist=False):
@@ -3282,14 +4953,53 @@ def _active_template(data):
         return None
     return next((t for t in data.get("templates", []) if t["id"] == aid), None)
 
+
+def _current_source(data):
+    return "linkedin" if str((data or {}).get("current_source") or "") == "linkedin" else "hh"
+
+
+def _set_current_source(data, source):
+    data["current_source"] = "linkedin" if str(source or "") == "linkedin" else "hh"
+
 def _execute_search_result(data, tmpl, persist=True):
-    result = fetch_vacancies(tmpl)
+    _ensure_hh_oauth_token_fresh(data)
+    hh_block_message = _hh_guard_before_search(data)
+    if hh_block_message:
+        save_data(data)
+        return {
+            "fetched_vacancies": [],
+            "visible_vacancies": [],
+            "errors": [hh_block_message],
+            "filter_stats": _empty_filter_stats(),
+            "hh_temporarily_blocked": True,
+        }
+
+    runtime_options = _hh_runtime_options(data, tmpl, advance_cursor=bool(persist))
+    result = fetch_vacancies(tmpl, runtime_options=runtime_options)
     fetched_vacancies = result.get("vacancies", [])
-    fetch_errors = result.get("errors", [])
+    fetch_errors = list(result.get("errors", []))
+    filter_stats = result.get("filter_stats", {})
+    hh_window_note = _hh_window_note(result)
+    hh_temporarily_blocked = False
     sent_ids = _template_sent_ids(data, tmpl["id"])
     sent_set = set(sent_ids)
 
+    if result.get("hh_blocked"):
+        latest_data = load_data()
+        _hh_set_temporary_block(
+            latest_data,
+            result.get("hh_block_reason") or "HH вернул 403 на поисковый запрос.",
+            seconds=int(result.get("hh_block_seconds", HH_BLOCK_FORBIDDEN_SECONDS) or HH_BLOCK_FORBIDDEN_SECONDS),
+        )
+        _hh_finalize_runtime(latest_data, tmpl, result, advance_cursor=bool(persist))
+        save_data(latest_data)
+        hh_temporarily_blocked = True
+        latest_block_message = _hh_block_message(latest_data)
+        if latest_block_message:
+            fetch_errors = [latest_block_message] + [item for item in fetch_errors if item != latest_block_message]
+
     if persist:
+        latest_data = load_data()
         visible_vacancies = []
         for vacancy in fetched_vacancies:
             vacancy_id = str(vacancy.get("id", ""))
@@ -3298,32 +5008,92 @@ def _execute_search_result(data, tmpl, persist=True):
             visible_vacancies.append(vacancy)
             sent_set.add(vacancy_id)
             sent_ids.append(vacancy_id)
-        data["last_check"] = time.time()
-        _set_template_sent_ids(data, tmpl["id"], sent_ids)
-        save_data(data)
+        latest_data["last_check"] = time.time()
+        _set_template_sent_ids(latest_data, tmpl["id"], sent_ids)
+        _hh_finalize_runtime(latest_data, tmpl, result, advance_cursor=True)
+        save_data(latest_data)
     else:
+        latest_data = load_data()
+        _hh_finalize_runtime(latest_data, tmpl, result, advance_cursor=False)
+        save_data(latest_data)
         visible_vacancies = list(fetched_vacancies)
 
     return {
         "fetched_vacancies": fetched_vacancies,
         "visible_vacancies": visible_vacancies,
         "errors": fetch_errors,
+        "filter_stats": filter_stats,
+        "hh_temporarily_blocked": hh_temporarily_blocked,
     }
 
 
 def _run_search_live(chat_id, data, tmpl):
+    _ensure_hh_oauth_token_fresh(data)
     initial_sent_ids = list(_template_sent_ids(data, tmpl["id"]))
     initial_sent_set = set(initial_sent_ids)
     instant_limit = max(1, int(tmpl.get("delivery_page_size", 5) or 5))
     instant_sent_ids = []
-    instant_sent_set = set()
     progress_message_id = None
-    live_session_id = None
     live_visible_vacancies = []
     live_visible_ids = set()
+    live_run_state = _new_live_group_run(chat_id, tmpl["id"], instant_limit)
+    live_run_id = live_run_state["run_id"]
+    latest_data = load_data()
+    _set_live_group_run(latest_data, tmpl["id"], live_run_state)
+    save_data(latest_data)
+
+    def _build_live_snapshot():
+        sorted_live = _sort_vacancies(
+            live_visible_vacancies,
+            tmpl.get("sort", "publication_time"),
+            tmpl.get("queries", []),
+        )
+        return _merge_priority_vacancies(sorted_live, instant_sent_ids, len(sorted_live))
+
+    def _sync_ready_groups(visible_snapshot, final=False):
+        latest_state = load_data()
+        run_state = _live_group_run(latest_state, tmpl["id"])
+        if not isinstance(run_state, dict) or str(run_state.get("run_id") or "") != live_run_id:
+            _debug_log(
+                "sync_ready_group_skipped",
+                template_id=tmpl["id"],
+                run_id=live_run_id,
+            )
+            return
+
+        total_visible = len(visible_snapshot)
+        groups = run_state.setdefault("groups", {})
+        total_groups = (total_visible + instant_limit - 1) // instant_limit if total_visible > instant_limit else 1
+
+        for group_index in range(2, total_groups + 1):
+            start = (group_index - 1) * instant_limit
+            end = min(start + instant_limit, total_visible)
+            current_group = visible_snapshot[start:end]
+            current_group_ids = [str((item or {}).get("id") or "").strip() for item in current_group if str((item or {}).get("id") or "").strip()]
+            if not current_group_ids:
+                continue
+            group_key = str(group_index)
+            group_entry = groups.get(group_key) or {
+                "vacancy_ids": [],
+                "message_id": 0,
+                "render_signature": "",
+                "result_message_id": 0,
+                "result_keyboard_signature": "",
+                "opened": False,
+                "opened_at": 0,
+            }
+            group_entry["vacancy_ids"] = current_group_ids
+            groups[group_key] = group_entry
+
+        run_state["completed"] = bool(final)
+        run_state["updated_at"] = time.time()
+        _set_live_group_run(latest_state, tmpl["id"], run_state)
+        _refresh_opened_live_group_keyboards(latest_state, tmpl, run_state)
+        _announce_next_live_group(latest_state, tmpl, run_state)
+        save_data(latest_state)
 
     def _on_batch(batch_vacancies):
-        nonlocal progress_message_id, live_session_id
+        nonlocal progress_message_id
         newly_streamed_ids = []
 
         for vacancy in batch_vacancies:
@@ -3335,63 +5105,63 @@ def _run_search_live(chat_id, data, tmpl):
             live_visible_ids.add(vacancy_id)
             live_visible_vacancies.append(vacancy)
 
-            if len(instant_sent_ids) >= instant_limit:
-                continue
-
-            send_msg(chat_id, format_vacancy(vacancy))
-            instant_sent_set.add(vacancy_id)
-            instant_sent_ids.append(vacancy_id)
-            newly_streamed_ids.append(vacancy_id)
-            if len(instant_sent_ids) >= instant_limit and progress_message_id is None:
-                progress_response = send_msg(
-                    chat_id,
-                    f"Показал первые <b>{len(instant_sent_ids)}</b> вакансий.\n"
-                    "Собираю продолжение списка...",
-                    reply_markup=_search_progress_keyboard(),
-                )
-                progress_message_id = _message_id_from_response(progress_response)
+            if len(instant_sent_ids) < instant_limit:
+                send_msg(chat_id, format_vacancy(vacancy))
+                instant_sent_ids.append(vacancy_id)
+                newly_streamed_ids.append(vacancy_id)
+                if len(instant_sent_ids) >= instant_limit and progress_message_id is None:
+                    progress_response = send_msg(
+                        chat_id,
+                        f"Показал первые <b>{len(instant_sent_ids)}</b> вакансий.\n"
+                        "Следующая группа пока собирается...",
+                        reply_markup=_search_progress_keyboard(),
+                    )
+                    progress_message_id = _message_id_from_response(progress_response)
 
         if newly_streamed_ids:
-            _append_template_sent_ids(data, tmpl["id"], newly_streamed_ids)
-            save_data(data)
+            latest_state = load_data()
+            _append_template_sent_ids(latest_state, tmpl["id"], newly_streamed_ids)
+            save_data(latest_state)
 
         hidden_count = max(0, len(live_visible_vacancies) - len(instant_sent_ids))
         if hidden_count > 0:
-            sorted_live = _sort_vacancies(live_visible_vacancies, tmpl.get("sort", "publication_time"), tmpl.get("queries", []))
-            visible_snapshot = _merge_priority_vacancies(sorted_live, instant_sent_ids, len(sorted_live))
-            resume_page = len(instant_sent_ids) // instant_limit
-            live_session_id = _upsert_result_session_with_resume(
-                data,
-                live_session_id,
-                tmpl,
-                visible_snapshot,
-                True,
-                [],
-                resume_page=resume_page,
-            )
-            save_data(data)
+            visible_snapshot = _build_live_snapshot()
+            _sync_ready_groups(visible_snapshot, final=False)
             if progress_message_id is not None:
                 progress_text = (
                     f"Показал первые <b>{len(instant_sent_ids)}</b> вакансий.\n"
-                    "Следующие вакансии уже можно открыть кнопкой «Дальше».\n"
+                    "Следующая группа открывается кнопкой <b>Дальше</b>.\n"
+                    "После открытия второй группы можно листать остальные страницы.\n"
                     "Поиск всё ещё продолжается..."
                 )
-                progress_markup = _search_summary_keyboard(
-                    data,
-                    live_session_id,
-                    start_page=resume_page,
-                    hidden_count=hidden_count,
-                )
+                progress_markup = _search_progress_keyboard()
                 edit_msg(chat_id, progress_message_id, progress_text, reply_markup=progress_markup)
 
         return newly_streamed_ids
 
-    result = fetch_vacancies(tmpl, on_batch=_on_batch)
+    runtime_options = _hh_runtime_options(data, tmpl, advance_cursor=True)
+    result = fetch_vacancies(tmpl, on_batch=_on_batch, runtime_options=runtime_options)
     fetched_vacancies = result.get("vacancies", [])
-    fetch_errors = result.get("errors", [])
+    fetch_errors = list(result.get("errors", []))
+    filter_stats = result.get("filter_stats", {})
+    hh_window_note = _hh_window_note(result)
+    hh_temporarily_blocked = False
+
+    if result.get("hh_blocked"):
+        latest_block_data = load_data()
+        _hh_set_temporary_block(
+            latest_block_data,
+            result.get("hh_block_reason") or "HH вернул 403 на поисковый запрос.",
+            seconds=int(result.get("hh_block_seconds", HH_BLOCK_FORBIDDEN_SECONDS) or HH_BLOCK_FORBIDDEN_SECONDS),
+        )
+        _hh_finalize_runtime(latest_block_data, tmpl, result, advance_cursor=True)
+        save_data(latest_block_data)
+        hh_temporarily_blocked = True
+        latest_block_message = _hh_block_message(latest_block_data)
+        if latest_block_message:
+            fetch_errors = [latest_block_message] + [item for item in fetch_errors if item != latest_block_message]
 
     visible_vacancies = []
-    sent_ids = list(initial_sent_ids)
     sent_set = set(initial_sent_set)
     for vacancy in fetched_vacancies:
         vacancy_id = str(vacancy.get("id", ""))
@@ -3399,17 +5169,24 @@ def _run_search_live(chat_id, data, tmpl):
             continue
         visible_vacancies.append(vacancy)
         sent_set.add(vacancy_id)
-        sent_ids.append(vacancy_id)
 
     if not visible_vacancies:
         reason_lines = []
-        if fetched_vacancies:
+        if hh_temporarily_blocked and fetch_errors:
+            reason_lines.append(fetch_errors[0])
+        elif fetch_errors:
+            reason_lines.append(_friendly_fetch_error_summary(fetch_errors))
+        elif fetched_vacancies:
             reason_lines.append("По фильтрам вакансии есть, но они уже были отправлены раньше.")
         else:
             reason_lines.append("По текущим фильтрам ничего не найдено.")
-        if fetch_errors:
-            reason_lines.append(_friendly_fetch_error_summary(fetch_errors))
-        reason_lines.append("Проверьте запросы, опыт, географию, формат работы и слова для исключения.")
+        if hh_window_note and not hh_temporarily_blocked:
+            reason_lines.append(hh_window_note)
+        filter_summary = _format_filter_stats_brief(filter_stats)
+        if filter_summary and not hh_temporarily_blocked:
+            reason_lines.append(filter_summary)
+        if not hh_temporarily_blocked:
+            reason_lines.append("Проверьте запросы, опыт, географию, формат работы и слова для исключения.")
         reply_markup = _rerun_fresh_keyboard(data) if fetched_vacancies else _current_search_keyboard(data)
         send_msg(chat_id, "\n".join(reason_lines), reply_markup=reply_markup)
         return {
@@ -3418,47 +5195,37 @@ def _run_search_live(chat_id, data, tmpl):
             "new_count": 0,
             "persist": True,
             "errors": fetch_errors,
+            "hh_temporarily_blocked": hh_temporarily_blocked,
         }
 
-    data["last_check"] = time.time()
-    _set_template_sent_ids(data, tmpl["id"], sent_ids)
-
-    hidden_count = max(0, len(visible_vacancies) - len(instant_sent_ids))
-    session_id = live_session_id
-    if hidden_count > 0:
-        resume_page = len(instant_sent_ids) // max(1, int(tmpl.get("delivery_page_size", 5) or 5))
-        session_id = _upsert_result_session_with_resume(
-            data,
-            session_id,
-            tmpl,
-            visible_vacancies,
-            True,
-            fetch_errors,
-            resume_page=resume_page,
-        )
-
-    save_data(data)
+    visible_snapshot = _build_live_snapshot()
+    _sync_ready_groups(visible_snapshot, final=True)
+    hidden_count = max(0, len(visible_snapshot) - len(instant_sent_ids))
+    latest_state = load_data()
+    latest_state["last_check"] = time.time()
+    _hh_finalize_runtime(latest_state, tmpl, result, advance_cursor=True)
+    save_data(latest_state)
 
     header_lines = [
         "<b>Поиск завершён</b>",
         f"Поиск: <b>{_esc(tmpl['name'])}</b>",
         f"Показано сразу: <b>{len(instant_sent_ids)}</b>",
-        f"Всего новых вакансий: <b>{len(visible_vacancies)}</b>",
+        f"Всего новых вакансий: <b>{len(visible_snapshot)}</b>",
         f"Всего найдено по фильтрам: <b>{len(fetched_vacancies)}</b>",
     ]
     if hidden_count > 0:
-        header_lines.append(f"Осталось в списке: <b>{hidden_count}</b>")
-        header_lines.append("Нажмите «Дальше», чтобы открыть следующую страницу.")
+        header_lines.append(f"Ещё не открыто: <b>{hidden_count}</b>")
+        header_lines.append("Откройте вторую группу кнопкой <b>Дальше</b>, затем можно листать остальные страницы.")
     if fetch_errors:
         header_lines.append(_friendly_fetch_error_summary(fetch_errors))
+    if hh_window_note and not hh_temporarily_blocked:
+        header_lines.append(hh_window_note)
+    filter_summary = _format_filter_stats_brief(filter_stats)
+    if filter_summary and len(visible_snapshot) <= 10:
+        header_lines.append(_esc(filter_summary))
 
     summary_text = "\n".join(header_lines)
-    summary_markup = _search_summary_keyboard(
-        data,
-        session_id,
-        start_page=resume_page if hidden_count > 0 else 0,
-        hidden_count=hidden_count,
-    )
+    summary_markup = _current_search_keyboard(latest_state)
     if progress_message_id is not None:
         edit_result = edit_msg(chat_id, progress_message_id, summary_text, reply_markup=summary_markup)
         if not isinstance(edit_result, dict) or not edit_result.get("ok", False):
@@ -3468,10 +5235,12 @@ def _run_search_live(chat_id, data, tmpl):
 
     return {
         "total_found": len(fetched_vacancies),
-        "sent_now": len(visible_vacancies),
-        "new_count": len(visible_vacancies),
+        "sent_now": len(instant_sent_ids),
+        "new_count": len(visible_snapshot),
         "persist": True,
         "errors": fetch_errors,
+        "filter_stats": filter_stats,
+        "hh_temporarily_blocked": hh_temporarily_blocked,
     }
 
 
@@ -3483,16 +5252,26 @@ def _run_search(chat_id, data, tmpl, persist=True):
     fetched_vacancies = result["fetched_vacancies"]
     visible_vacancies = result["visible_vacancies"]
     fetch_errors = result["errors"]
+    filter_stats = result.get("filter_stats", {})
+    hh_temporarily_blocked = bool(result.get("hh_temporarily_blocked"))
 
     if not visible_vacancies:
         reason_lines = []
-        if fetched_vacancies and persist:
+        if hh_temporarily_blocked and fetch_errors:
+            reason_lines.append(fetch_errors[0])
+        elif fetch_errors:
+            reason_lines.append(_friendly_fetch_error_summary(fetch_errors))
+        elif fetched_vacancies and persist:
             reason_lines.append("По фильтрам вакансии есть, но они уже были отправлены раньше.")
         else:
             reason_lines.append("По текущим фильтрам ничего не найдено.")
-        if fetch_errors:
-            reason_lines.append(_friendly_fetch_error_summary(fetch_errors))
-        reason_lines.append("Проверьте запросы, опыт, географию, формат работы и слова для исключения.")
+        if hh_window_note and not hh_temporarily_blocked:
+            reason_lines.append(hh_window_note)
+        filter_summary = _format_filter_stats_brief(filter_stats)
+        if filter_summary and not hh_temporarily_blocked:
+            reason_lines.append(filter_summary)
+        if not hh_temporarily_blocked:
+            reason_lines.append("Проверьте запросы, опыт, географию, формат работы и слова для исключения.")
         reply_markup = _rerun_fresh_keyboard(data) if fetched_vacancies and persist else _current_search_keyboard(data)
         send_msg(chat_id, "\n".join(reason_lines), reply_markup=reply_markup)
         return {
@@ -3501,6 +5280,7 @@ def _run_search(chat_id, data, tmpl, persist=True):
             "new_count": 0,
             "persist": bool(persist),
             "errors": fetch_errors,
+            "hh_temporarily_blocked": hh_temporarily_blocked,
         }
 
     session_id = _store_result_session(data, tmpl, visible_vacancies, persist, fetch_errors)
@@ -3515,6 +5295,11 @@ def _run_search(chat_id, data, tmpl, persist=True):
     ]
     if fetch_errors:
         header_lines.append(_friendly_fetch_error_summary(fetch_errors))
+    if hh_window_note and not hh_temporarily_blocked:
+        header_lines.append(hh_window_note)
+    filter_summary = _format_filter_stats_brief(filter_stats)
+    if filter_summary and len(visible_vacancies) <= 10:
+        header_lines.append(_esc(filter_summary))
     send_msg(chat_id, "\n".join(header_lines), reply_markup=_current_search_keyboard(data))
     send_msg(chat_id, text, reply_markup=markup)
 
@@ -3524,23 +5309,35 @@ def _run_search(chat_id, data, tmpl, persist=True):
         "new_count": len(visible_vacancies),
         "persist": bool(persist),
         "errors": fetch_errors,
+        "hh_temporarily_blocked": hh_temporarily_blocked,
     }
 
 
 def _build_runtime_status(data=None):
     data = load_data() if data is None else _normalize_data(data)
     tmpl = _active_template(data)
+    linkedin_tmpl = _linkedin_active_template(data)
     run_in_progress = _is_run_in_progress(data)
     return {
         "service": "hh-vacancy-bot",
         "platform": "vercel" if IS_VERCEL else "local",
+        "current_source": _current_source(data),
         "searching": bool(data.get("searching", False)),
+        "linkedin_searching": bool(data.get("linkedin_searching", False)),
+        "hh_block_until": int(float(data.get("hh_block_until", 0) or 0)),
+        "hh_blocked": _hh_is_temporarily_blocked(data),
+        "hh_block_reason": str(data.get("hh_block_reason") or ""),
+        "hh_oauth": _hh_oauth_public_status(data),
         "run_in_progress": run_in_progress,
         "chat_configured": bool(data.get("chat_id")),
         "active_template_id": tmpl.get("id") if tmpl else None,
         "active_template_name": tmpl.get("name") if tmpl else None,
+        "linkedin_active_template_id": linkedin_tmpl.get("id") if linkedin_tmpl else None,
+        "linkedin_active_template_name": linkedin_tmpl.get("name") if linkedin_tmpl else None,
         "templates_count": len(data.get("templates", [])),
+        "linkedin_templates_count": len(data.get("linkedin_templates", [])),
         "last_check": int(data.get("last_check", 0) or 0),
+        "linkedin_last_check": int(data.get("linkedin_last_check", 0) or 0),
         "uses_runtime_cache": _runtime_cache_available(),
         "webhook_target": get_telegram_webhook_target() if get_public_base_url() else None,
     }
@@ -3557,6 +5354,15 @@ def run_manual_search_tick(persist=True):
         return {"ok": False, "status": "skipped", "reason": "no_active_template"}
     if _is_run_in_progress(data):
         return {"ok": False, "status": "skipped", "reason": "run_in_progress"}
+    hh_block_message = _hh_guard_before_search(data)
+    if hh_block_message:
+        save_data(data)
+        return {
+            "ok": False,
+            "status": "skipped",
+            "reason": "hh_temporarily_blocked",
+            "message": hh_block_message,
+        }
 
     _set_run_in_progress(data, True, mode="run" if persist else "preview")
     save_data(data)
@@ -3695,6 +5501,11 @@ def handle_callback(cb, data):
 
     answer_cb(cb_id)
 
+    # ── LinkedIn callbacks ─────────────────────────────────
+    if cdata.startswith("li_"):
+        if handle_linkedin_callback(cdata, chat_id, msg_id, data, state, draft):
+            return
+
     # ── Статус / тоггл ────────────────────────────────────
     if cdata == "menu_home":
         data = load_data()
@@ -3706,28 +5517,81 @@ def handle_callback(cb, data):
         cmd_status(chat_id, data)
         return
 
-    if cdata == "toggle":
-        cmd_toggle(chat_id, data)
-        return
-
-    if cdata == "run_now":
+    if cdata == "menu_current_hh":
         data = load_data()
-        cmd_run(chat_id, data)
+        cmd_current(chat_id, data)
         return
 
-    if cdata == "preview_now":
-        data = load_data()
-        cmd_preview(chat_id, data)
-        return
-
-    if cdata == "menu_templates":
+    if cdata == "menu_templates_hh":
         data = load_data()
         cmd_templates(chat_id, data)
         return
 
+    if cdata == "status_hh":
+        data = load_data()
+        cmd_status_source(chat_id, data, "hh")
+        return
+
+    if cdata == "status_linkedin":
+        data = load_data()
+        cmd_status_source(chat_id, data, "linkedin")
+        return
+
+    if cdata == "toggle":
+        data = load_data()
+        cmd_status(chat_id, data)
+        return
+
+    if cdata == "toggle_hh_on":
+        data = load_data()
+        cmd_toggle_source(chat_id, data, "hh", True)
+        return
+
+    if cdata == "toggle_hh_off":
+        data = load_data()
+        cmd_toggle_source(chat_id, data, "hh", False)
+        return
+
+    if cdata == "toggle_linkedin_on":
+        data = load_data()
+        cmd_toggle_source(chat_id, data, "linkedin", True)
+        return
+
+    if cdata == "toggle_linkedin_off":
+        data = load_data()
+        cmd_toggle_source(chat_id, data, "linkedin", False)
+        return
+
+    if cdata == "run_now":
+        data = load_data()
+        if _current_source(data) == "linkedin":
+            cmd_linkedin_run(chat_id, data, persist=True)
+        else:
+            cmd_run(chat_id, data)
+        return
+
+    if cdata == "preview_now":
+        data = load_data()
+        if _current_source(data) == "linkedin":
+            cmd_linkedin_run(chat_id, data, persist=False)
+        else:
+            cmd_preview(chat_id, data)
+        return
+
+    if cdata == "menu_templates":
+        data = load_data()
+        if _current_source(data) == "linkedin":
+            cmd_linkedin_templates(chat_id, data)
+        else:
+            cmd_templates(chat_id, data)
+        return
+
     if cdata == "menu_current":
         data = load_data()
-        cmd_current(chat_id, data)
+        if _current_source(data) == "linkedin":
+            cmd_linkedin_current(chat_id, data)
+        else:
+            cmd_current(chat_id, data)
         return
 
     if cdata == "menu_help":
@@ -3736,7 +5600,10 @@ def handle_callback(cb, data):
 
     if cdata == "reset_sent":
         data = load_data()
-        cmd_reset_sent(chat_id, data)
+        if _current_source(data) == "linkedin":
+            cmd_linkedin_reset_sent(chat_id, data)
+        else:
+            cmd_reset_sent(chat_id, data)
         return
 
     if cdata == "rerun_fresh":
@@ -3756,13 +5623,215 @@ def handle_callback(cb, data):
         _show_wizard_step(chat_id, state)
         return
 
+    if cdata.startswith("hgrp:"):
+        edit_msg(
+            chat_id,
+            msg_id,
+            "Эта кнопка обновлена.\n"
+            "Используйте новый запуск поиска: у второй группы снова будет мгновенное открытие без зависания.",
+            reply_markup=_current_search_keyboard(load_data()),
+        )
+        return
+
+    if cdata.startswith("grp:"):
+        page_index, vacancy_ids = _parse_group_callback_data(cdata)
+        _debug_log(
+            "callback_group_open",
+            page_index=page_index,
+            ids=",".join(vacancy_ids[:5]),
+            size=len(vacancy_ids),
+        )
+        if not page_index or not vacancy_ids:
+            send_msg(
+                chat_id,
+                "Не удалось разобрать группу вакансий.\n"
+                f"Ошибка: callback_data <code>{_esc(cdata)}</code>",
+                reply_markup={"inline_keyboard": _back_home_row("menu_current")},
+            )
+            return
+
+        data = load_data()
+        tmpl = _active_template(data)
+        template_id = str((tmpl or {}).get("id") or "")
+        run_state = _live_group_run(data, template_id)
+        group_entry = None
+        if isinstance(run_state, dict):
+            group_entry = (run_state.get("groups") or {}).get(str(page_index))
+        current_group_ids = [
+            str(item).strip()
+            for item in ((group_entry or {}).get("vacancy_ids") or vacancy_ids)
+            if str(item).strip()
+        ]
+        sent_set = set(_template_sent_ids(data, (tmpl or {}).get("id")))
+        unseen_ids = [vacancy_id for vacancy_id in current_group_ids if vacancy_id not in sent_set]
+        fetch_ids = list(current_group_ids if bool((group_entry or {}).get("opened")) else (unseen_ids or current_group_ids))
+
+        if not fetch_ids:
+            edit_msg(
+                chat_id,
+                msg_id,
+                f"Группа <b>{page_index}</b> уже была открыта раньше.\n"
+                "Жду, если в неё добавятся новые вакансии.",
+                reply_markup=_current_search_keyboard(data),
+            )
+            return
+
+        vacancies, fetch_errors = _fetch_vacancies_by_ids(fetch_ids)
+        _debug_log(
+            "callback_group_result",
+            page_index=page_index,
+            loaded=len(vacancies),
+            errors=len(fetch_errors),
+            unseen=len(unseen_ids),
+        )
+        if not vacancies:
+            error_lines = [
+                "Не удалось открыть следующую группу вакансий.",
+                f"Ошибка: не удалось загрузить vacancy_id <code>{_esc(','.join(fetch_ids))}</code>.",
+            ]
+            if fetch_errors:
+                error_lines.append(f"Детали: <code>{_esc('; '.join(fetch_errors[:3]))}</code>")
+            send_msg(chat_id, "\n".join(error_lines), reply_markup={"inline_keyboard": _back_home_row("menu_current")})
+            return
+
+        latest_data = load_data()
+        latest_tmpl = next(
+            (item for item in (latest_data.get("templates") or []) if str(item.get("id") or "") == template_id),
+            tmpl,
+        )
+        latest_run_state = _live_group_run(latest_data, template_id)
+        latest_group_entry = None
+        if isinstance(latest_run_state, dict):
+            latest_group_entry = (latest_run_state.get("groups") or {}).get(str(page_index))
+        _debug_log(
+            "callback_group_latest_state",
+            template_id=template_id,
+            page_index=page_index,
+            available_pages=",".join(str(item) for item in _live_group_available_indices(latest_run_state)),
+        )
+
+        if latest_tmpl:
+            _append_template_sent_ids(latest_data, latest_tmpl["id"], fetch_ids)
+            if isinstance(latest_run_state, dict):
+                if not isinstance(latest_group_entry, dict):
+                    latest_group_entry = {
+                        "vacancy_ids": list(current_group_ids),
+                        "message_id": 0,
+                        "render_signature": "",
+                        "result_message_id": 0,
+                        "result_keyboard_signature": "",
+                        "opened": False,
+                        "opened_at": 0,
+                    }
+                    latest_run_state.setdefault("groups", {})[str(page_index)] = latest_group_entry
+                latest_group_entry["vacancy_ids"] = list(current_group_ids)
+                latest_group_entry["opened"] = True
+                latest_group_entry["opened_at"] = time.time()
+                latest_run_state["next_group_to_announce"] = max(
+                    int(latest_run_state.get("next_group_to_announce", 2) or 2),
+                    page_index + 1,
+                )
+                latest_run_state["updated_at"] = time.time()
+                _set_live_group_run(latest_data, template_id, latest_run_state)
+                _refresh_opened_live_group_keyboards(latest_data, latest_tmpl, latest_run_state)
+            save_data(latest_data)
+
+        render_data = latest_data if isinstance(latest_data, dict) else data
+        render_run_state = latest_run_state if isinstance(latest_run_state, dict) else run_state
+        edit_msg(
+            chat_id,
+            msg_id,
+            f"Группа <b>{page_index}</b> открыта.\n"
+            f"Показано новых вакансий: <b>{len(vacancies)}</b>."
+            + ("\nПоиск всё ещё продолжается." if isinstance(render_run_state, dict) and not bool(render_run_state.get("completed")) else ""),
+            reply_markup=_current_search_keyboard(render_data),
+        )
+        group_reply_markup = _group_result_keyboard(render_data, render_run_state, page_index)
+        group_response = send_msg(
+            chat_id,
+            _format_group_result_text(page_index, vacancies, render_run_state),
+            reply_markup=group_reply_markup,
+        )
+        post_data = load_data()
+        post_tmpl = next(
+            (item for item in (post_data.get("templates") or []) if str(item.get("id") or "") == template_id),
+            latest_tmpl,
+        )
+        post_run_state = _live_group_run(post_data, template_id)
+        post_group_entry = None
+        if isinstance(post_run_state, dict):
+            post_group_entry = (post_run_state.get("groups") or {}).get(str(page_index))
+        if post_tmpl and isinstance(post_run_state, dict):
+            if not isinstance(post_group_entry, dict):
+                post_group_entry = {
+                    "vacancy_ids": list(current_group_ids),
+                    "message_id": 0,
+                    "render_signature": "",
+                    "result_message_id": 0,
+                    "result_keyboard_signature": "",
+                    "opened": True,
+                    "opened_at": time.time(),
+                }
+                post_run_state.setdefault("groups", {})[str(page_index)] = post_group_entry
+            post_group_entry["vacancy_ids"] = list(current_group_ids)
+            post_group_entry["opened"] = True
+            post_group_entry["opened_at"] = float(post_group_entry.get("opened_at") or time.time())
+            post_group_entry["result_message_id"] = int(_message_id_from_response(group_response) or 0)
+            post_group_entry["result_keyboard_signature"] = _reply_markup_signature(group_reply_markup)
+            post_run_state["updated_at"] = time.time()
+            _set_live_group_run(post_data, template_id, post_run_state)
+            _announce_next_live_group(post_data, post_tmpl, post_run_state)
+            _refresh_opened_live_group_keyboards(post_data, post_tmpl, post_run_state)
+            _debug_log(
+                "callback_group_saved_state",
+                template_id=template_id,
+                page_index=page_index,
+                available_pages=",".join(str(item) for item in _live_group_available_indices(post_run_state)),
+                next_group=post_run_state.get("next_group_to_announce", 0),
+            )
+            save_data(post_data)
+        return
+
     if cdata.startswith("res_"):
         _, session_id, page_text = cdata.split("_", 2)
+        _debug_log(
+            "callback_res_open",
+            session_id=session_id,
+            requested_page=page_text,
+            known_sessions=",".join(sorted((data.get("result_sessions") or {}).keys())[:10]),
+            saved_at=round(_state_saved_at(data), 3),
+        )
         session = (data.get("result_sessions", {}) or {}).get(session_id)
         if not session:
-            send_msg(chat_id, "Эта выдача уже недоступна. Запустите поиск ещё раз.", reply_markup={"inline_keyboard": _back_home_row("menu_current")})
+            session = _restore_result_session(data, session_id)
+        if not session:
+            _debug_log(
+                "callback_res_missing",
+                session_id=session_id,
+                requested_page=page_text,
+                known_sessions=",".join(sorted((data.get("result_sessions") or {}).keys())[:10]),
+            )
+            debug_text = (
+                "Эта выдача уже недоступна.\n"
+                f"Ошибка: session <code>{_esc(session_id)}</code> не найдена в state/cache.\n"
+                f"Известные session: <code>{_esc(','.join(sorted((data.get('result_sessions') or {}).keys())[:5]) or 'нет')}</code>\n"
+                "Запустите поиск ещё раз."
+            )
+            send_msg(chat_id, debug_text, reply_markup={"inline_keyboard": _back_home_row("menu_current")})
             return
         text, markup = _render_result_page(data, session_id, int(page_text))
+        if not text or not markup:
+            _debug_log(
+                "callback_res_render_failed",
+                session_id=session_id,
+                requested_page=page_text,
+            )
+            debug_text = (
+                "Не удалось открыть страницу выдачи.\n"
+                f"Ошибка: render_result_page вернул пустой результат для session <code>{_esc(session_id)}</code>."
+            )
+            send_msg(chat_id, debug_text, reply_markup={"inline_keyboard": _back_home_row("menu_current")})
+            return
         save_data(data)
         edit_msg(chat_id, msg_id, text, reply_markup=markup)
         return
@@ -3791,6 +5860,7 @@ def handle_callback(cb, data):
     if cdata.startswith("tmpl_select_"):
         tmpl_id = cdata[len("tmpl_select_"):]
         data["active_template_id"] = tmpl_id
+        _set_current_source(data, "hh")
         data.setdefault("sent_ids_by_template", {}).setdefault(str(tmpl_id), [])
         save_data(data)
         tmpl = next((t for t in data["templates"] if t["id"] == tmpl_id), None)
@@ -4061,8 +6131,6 @@ def handle_callback(cb, data):
 
         if cdata == "confirm_activate":
             data["active_template_id"] = tmpl["id"]
-        elif data.get("active_template_id") == tmpl["id"]:
-            data["active_template_id"] = tmpl["id"]
 
         if str(chat_id) in data["user_states"]:
             del data["user_states"][str(chat_id)]
@@ -4102,6 +6170,7 @@ def handle_callback(cb, data):
 # ═══════════════════════════════════════════════════════════
 
 def _create_default_template():
+    default_excluded = _default_hh_excluded_areas()
     return _normalize_template({
         "id":                 "default01",
         "name":               "Аналитик — все страны кроме России",
@@ -4110,8 +6179,8 @@ def _create_default_template():
         "experience":         [ANY_EXPERIENCE, "noExperience", "between1And3"],
         "included_area_ids":  [],
         "included_area_names": [],
-        "excluded_area_ids":  [str(RUSSIA_AREA_ID)],
-        "excluded_area_names": ["Россия"],
+        "excluded_area_ids":  default_excluded.get("ids", []),
+        "excluded_area_names": default_excluded.get("names", []),
         "include_keywords":   DEFAULT_ANALYST_INCLUDE_KEYWORDS[:],
         "include_in":         "description",
         "exclude_keywords":   DEFAULT_EXCLUDE_KEYWORDS[:],
@@ -4119,15 +6188,1208 @@ def _create_default_template():
         "work_formats":       [],
         "area_work_format_rules": _default_area_work_format_rules(),
         "employment_types":   [],
-        "period_days":        3,
+        "period_days":        0,
         "only_with_salary":   False,
         "salary_min":         0,
         "excluded_employers": [],
         "max_results":        50,
+        "delivery_page_size": 5,
         "sort":               "publication_time",
         "interval":           30,
-        "max_pages":          5,
+        "max_pages":          1,
     })
+
+
+def _create_default_linkedin_template():
+    """Создаёт дефолтный LinkedIn-шаблон: аналитика + python, EN/RU, без лишних country-исключений сверх дефолта."""
+    return _normalize_linkedin_template({
+        "id":               "li_default01",
+        "name":             "Аналитик / Python (EN/RU)",
+        "keywords":         DEFAULT_LINKEDIN_QUERIES[:],
+        "location":         "Worldwide",
+        "remote_filter":    "",
+        "experience_levels": [],
+        "posted_within":    "r2592000",
+        "sort_by":          "DD",
+        "max_results":      50,
+        "delivery_page_size": 5,
+        "interval":         30,
+        # Обязательные слова по title/company отключены: они слишком сильно сужают выдачу guest LinkedIn.
+        "include_keywords": [],
+        # исключаем вакансии с требованием иных языков (не RU/EN)
+        "exclude_keywords": DEFAULT_LINKEDIN_EXCLUDE_LANGUAGES[:],
+        "excluded_locations": DEFAULT_LINKEDIN_EXCLUDED_LOCATIONS[:],
+        "li_cookie":        LINKEDIN_COOKIE,
+    })
+
+
+def _linkedin_russian_required_queries(base_keywords):
+    base = [str(item).strip() for item in (base_keywords or []) if str(item).strip()]
+    if not base:
+        base = DEFAULT_LINKEDIN_QUERIES[:]
+    return [f"{item} russian" if "russian" not in item.lower() else item for item in base]
+
+
+def _create_default_linkedin_russian_template(base_template=None):
+    base = _normalize_linkedin_template(dict(base_template or _create_default_linkedin_template()))
+    return _normalize_linkedin_template({
+        "id":               "li_ru_required01",
+        "name":             "Аналитик / Python (русский обязателен)",
+        "keywords":         _linkedin_russian_required_queries(base.get("keywords") or []),
+        "location":         base.get("location") or "Worldwide",
+        "remote_filter":    str(base.get("remote_filter") or ""),
+        "experience_levels": list(base.get("experience_levels") or []),
+        "posted_within":    str(base.get("posted_within") or "r2592000"),
+        "sort_by":          str(base.get("sort_by") or "DD"),
+        "max_results":      int(base.get("max_results") or 50),
+        "delivery_page_size": int(base.get("delivery_page_size") or 5),
+        "interval":         int(base.get("interval") or 30),
+        "include_keywords": [],
+        "exclude_keywords": list(base.get("exclude_keywords") or DEFAULT_LINKEDIN_EXCLUDE_LANGUAGES[:]),
+        "excluded_locations": list(base.get("excluded_locations") or DEFAULT_LINKEDIN_EXCLUDED_LOCATIONS[:]),
+        "li_cookie":        str(base.get("li_cookie") or LINKEDIN_COOKIE).strip(),
+    })
+
+
+def _ensure_linkedin_templates_ready(data):
+    """Создаёт дефолтный LinkedIn-шаблон при первом запуске. Возвращает True если что-то изменилось."""
+    templates = data.get("linkedin_templates") or []
+    if templates:
+        changed = False
+        default_template = None
+        if not data.get("linkedin_active_template_id"):
+            data["linkedin_active_template_id"] = templates[0]["id"]
+            changed = True
+        for template in templates:
+            if str(template.get("id") or "") != "li_default01":
+                continue
+            default_template = template
+            merged_excluded_locations = _normalize_linkedin_excluded_locations(
+                list(template.get("excluded_locations") or []) + DEFAULT_LINKEDIN_EXCLUDED_LOCATIONS
+            )
+            if list(template.get("excluded_locations") or []) != merged_excluded_locations:
+                template["excluded_locations"] = merged_excluded_locations
+                changed = True
+            current_keywords = [str(k).strip() for k in (template.get("keywords") or []) if str(k).strip()]
+            if current_keywords and all("python" in k.lower() for k in current_keywords):
+                template["keywords"] = DEFAULT_LINKEDIN_QUERIES[:]
+                changed = True
+            if [str(k).strip().lower() for k in (template.get("include_keywords") or []) if str(k).strip()] == ["python"]:
+                template["include_keywords"] = []
+                changed = True
+            if str(template.get("posted_within") or "") == "r604800":
+                template["posted_within"] = "r2592000"
+                changed = True
+            if str(template.get("name") or "").strip() == "Python аналитик (EN/RU)":
+                template["name"] = "Аналитик / Python (EN/RU)"
+                changed = True
+        ru_template = next((t for t in templates if str(t.get("id") or "") == "li_ru_required01"), None)
+        if ru_template is None:
+            templates.append(_create_default_linkedin_russian_template(default_template))
+            _set_linkedin_template_sent_ids(data, "li_ru_required01", [])
+            changed = True
+        else:
+            merged_excluded_locations = _normalize_linkedin_excluded_locations(
+                list(ru_template.get("excluded_locations") or []) + DEFAULT_LINKEDIN_EXCLUDED_LOCATIONS
+            )
+            if list(ru_template.get("excluded_locations") or []) != merged_excluded_locations:
+                ru_template["excluded_locations"] = merged_excluded_locations
+                changed = True
+            expected_keywords = _linkedin_russian_required_queries(default_template.get("keywords") if default_template else DEFAULT_LINKEDIN_QUERIES)
+            if list(ru_template.get("keywords") or []) != expected_keywords:
+                ru_template["keywords"] = expected_keywords
+                changed = True
+            if list(ru_template.get("include_keywords") or []):
+                ru_template["include_keywords"] = []
+                changed = True
+        return changed
+
+    tmpl = _create_default_linkedin_template()
+    ru_tmpl = _create_default_linkedin_russian_template(tmpl)
+    data["linkedin_templates"]          = [tmpl, ru_tmpl]
+    data["linkedin_active_template_id"] = tmpl["id"]
+    _set_linkedin_template_sent_ids(data, tmpl["id"], [])
+    _set_linkedin_template_sent_ids(data, ru_tmpl["id"], [])
+    print("➕ Создан дефолтный LinkedIn-шаблон:", tmpl["name"])
+    print("➕ Создан дополнительный LinkedIn-шаблон:", ru_tmpl["name"])
+    return True
+
+
+# ═══════════════════════════════════════════════════════════
+#  LINKEDIN — ПАРСЕР ВАКАНСИЙ
+# ═══════════════════════════════════════════════════════════
+
+def _normalize_linkedin_template(tmpl):
+    t = dict(tmpl or {})
+    t["id"]              = str(t.get("id") or str(uuid.uuid4())[:8])
+    t["name"]            = (t.get("name") or "LinkedIn поиск")[:50]
+    t["keywords"]        = [k.strip() for k in (t.get("keywords") or ["data analyst"]) if k.strip()] or ["data analyst"]
+    t["location"]        = str(t.get("location") or "Worldwide").strip()
+    t["remote_filter"]   = str(t.get("remote_filter") or "")
+    t["experience_levels"] = list(t.get("experience_levels") or [])
+    t["posted_within"]   = str(t.get("posted_within") or "r2592000")
+    t["sort_by"]         = str(t.get("sort_by") or "DD")
+    t["max_results"]     = max(1, int(t.get("max_results") or 50))
+    t["delivery_page_size"] = max(1, int(t.get("delivery_page_size") or 5))
+    t["interval"]        = int(t.get("interval") or 30)
+    t["exclude_keywords"] = [k.strip().lower() for k in (t.get("exclude_keywords") or []) if k.strip()]
+    t["include_keywords"] = [k.strip().lower() for k in (t.get("include_keywords") or []) if k.strip()]
+    t["excluded_locations"] = _normalize_linkedin_excluded_locations(t.get("excluded_locations") or [])
+    t["li_cookie"]       = str(t.get("li_cookie") or LINKEDIN_COOKIE).strip()
+    if t["id"] == "li_default01":
+        t["excluded_locations"] = _normalize_linkedin_excluded_locations(
+            t.get("excluded_locations", []) + DEFAULT_LINKEDIN_EXCLUDED_LOCATIONS
+        )
+    return t
+
+
+def _linkedin_active_template(data):
+    aid = data.get("linkedin_active_template_id")
+    if not aid:
+        return None
+    return next((t for t in (data.get("linkedin_templates") or []) if t["id"] == aid), None)
+
+
+def _linkedin_template_sent_ids(data, template_id):
+    return list((data.get("linkedin_sent_ids_by_template") or {}).get(str(template_id or ""), []))
+
+
+def _set_linkedin_template_sent_ids(data, template_id, vacancy_ids):
+    sent_map = data.setdefault("linkedin_sent_ids_by_template", {})
+    sent_map[str(template_id or "")] = list(vacancy_ids or [])[-10000:]
+
+
+def _append_linkedin_template_sent_ids(data, template_id, vacancy_ids):
+    existing = _linkedin_template_sent_ids(data, template_id)
+    merged   = _unique_list(existing + [str(i) for i in (vacancy_ids or []) if str(i or "").strip()])
+    _set_linkedin_template_sent_ids(data, template_id, merged)
+    return merged
+
+
+# ─── LinkedIn result sessions (пагинация) ────────────────
+
+def _store_li_result_session(data, tmpl, vacancies, persist):
+    """Сохраняет список вакансий LinkedIn в result-сессию. Возвращает session_id."""
+    session_id = str(uuid.uuid4())[:8]
+    sessions = data.setdefault("linkedin_result_sessions", {})
+    # Компактное хранение: только нужные поля
+    compact = [
+        {"id": v.get("id"), "title": v.get("title"), "company": v.get("company"),
+         "location": v.get("location"), "posted_at": v.get("posted_at"), "url": v.get("url")}
+        for v in (vacancies or [])
+    ]
+    sessions[session_id] = {
+        "template_id":   tmpl["id"],
+        "template_name": tmpl["name"],
+        "created_at":    time.time(),
+        "page_size":     int(tmpl.get("delivery_page_size") or 5),
+        "vacancies":     compact,
+        "persist":       bool(persist),
+    }
+    # Оставляем не более 5 LinkedIn-сессий
+    ordered = sorted(sessions.items(), key=lambda x: x[1].get("created_at", 0), reverse=True)
+    keep_ids = {sid for sid, _ in ordered[:5]}
+    for sid in list(sessions.keys()):
+        if sid not in keep_ids:
+            sessions.pop(sid, None)
+    return session_id
+
+
+def _li_session_nav_keyboard(session_id, page, page_count, data):
+    """Клавиатура навигации для LinkedIn-пагинации."""
+    nav = []
+    if page > 0:
+        nav.append({"text": "← Назад", "callback_data": f"li_res_{session_id}_{page - 1}"})
+    if page < page_count - 1:
+        nav.append({"text": "Дальше →", "callback_data": f"li_res_{session_id}_{page + 1}"})
+    elif page_count > 1 and page > 0:
+        nav.append({"text": "С начала", "callback_data": f"li_res_{session_id}_0"})
+    buttons = []
+    if nav:
+        buttons.append(nav)
+    if page_count > 1:
+        buttons.extend(
+            _page_picker_rows(
+                range(1, page_count + 1),
+                page + 1,
+                lambda page_number: f"li_res_{session_id}_{page_number - 1}",
+            )
+        )
+    buttons.append([
+        {"text": "LinkedIn меню",  "callback_data": "li_menu"},
+        {"text": "Главное меню",   "callback_data": "menu_home"},
+    ])
+    return {"inline_keyboard": buttons}
+
+
+def _li_deliver_page(chat_id, data, session_id, page):
+    """Отправляет страницу LinkedIn-вакансий по номеру page. Возвращает (ok, summary_text, markup)."""
+    sessions = data.get("linkedin_result_sessions") or {}
+    session  = sessions.get(session_id)
+    if not session:
+        return False, "Эта выдача уже недоступна. Запустите поиск ещё раз.", \
+               {"inline_keyboard": [[{"text": "LinkedIn меню", "callback_data": "li_menu"}]]}
+
+    vacancies  = session.get("vacancies") or []
+    page_size  = max(1, int(session.get("page_size") or 5))
+    page_count = max(1, -(-len(vacancies) // page_size))  # ceil division
+    page       = max(0, min(page, page_count - 1))
+    persist    = session.get("persist", True)
+
+    start = page * page_size
+    batch = vacancies[start : start + page_size]
+    remaining_after_page = max(0, len(vacancies) - min(start + len(batch), len(vacancies)))
+
+    for v in batch:
+        send_msg(chat_id, format_linkedin_vacancy(v))
+
+    if persist:
+        tmpl_id = session.get("template_id")
+        _append_linkedin_template_sent_ids(data, tmpl_id, [v["id"] for v in batch if v.get("id")])
+        save_data(data)
+
+    summary = (
+        f"<b>Страница {page + 1} из {page_count}</b>\n"
+        f"Шаблон: <b>{_esc(session.get('template_name',''))}</b>\n"
+        f"Показано: <b>{start + len(batch)}</b> из <b>{len(vacancies)}</b>\n"
+        f"Осталось после этой страницы: <b>{remaining_after_page}</b>"
+    )
+    markup = _li_session_nav_keyboard(session_id, page, page_count, data)
+    return True, summary, markup
+
+
+def _linkedin_template_summary(tmpl, detailed=False):
+    lines = []
+    kws   = ", ".join((tmpl.get("keywords") or [])[:5])
+    excluded_locations = list(tmpl.get("excluded_locations") or [])
+    lines.append(f"<b>{_esc(tmpl.get('name', ''))}</b>")
+    lines.append(f"Ключевые слова: <code>{_esc(kws[:80])}</code>")
+    lines.append(f"Локация: <code>{_esc(tmpl.get('location', 'Worldwide'))}</code>")
+    remote_label = LINKEDIN_REMOTE_OPTIONS.get(str(tmpl.get("remote_filter") or ""), "Любой формат")
+    lines.append(f"Формат: <b>{_esc(remote_label)}</b>")
+    exp_codes = tmpl.get("experience_levels") or []
+    if exp_codes:
+        exp_labels = [LINKEDIN_EXPERIENCE_OPTIONS.get(c, c) for c in exp_codes]
+        lines.append(f"Опыт: <b>{_esc(', '.join(exp_labels))}</b>")
+    else:
+        lines.append("Опыт: <b>Любой</b>")
+    period_label = LINKEDIN_PERIOD_OPTIONS.get(str(tmpl.get("posted_within") or ""), "За 30 дней")
+    lines.append(f"Период: <b>{_esc(period_label)}</b>")
+    lines.append(f"Лимит: <b>{tmpl.get('max_results', 50)}</b>")
+    lines.append(f"Автопроверка: <b>{tmpl.get('interval', 30)} мин</b>")
+    if detailed:
+        incl = tmpl.get("include_keywords") or []
+        excl = tmpl.get("exclude_keywords") or []
+        if incl:
+            lines.append(f"Обязательные слова: <code>{_esc(', '.join(incl[:5]))}</code>")
+        if excl:
+            lines.append(f"Исключения: <code>{_esc(', '.join(excl[:5]))}{' и др.' if len(excl) > 5 else ''}</code>")
+        if excluded_locations:
+            preview = ", ".join(excluded_locations[:5])
+            if len(excluded_locations) > 5:
+                preview += f" ... (+{len(excluded_locations) - 5})"
+            lines.append(f"Исключённые страны: <code>{_esc(preview)}</code>")
+        has_cookie = bool(tmpl.get("li_cookie") or LINKEDIN_COOKIE)
+        lines.append(f"Cookie: {'<b>установлен</b>' if has_cookie else '<b>не установлен</b> (публичный поиск)'}")
+    return "\n".join(lines)
+
+
+# ─── LinkedIn scraping ────────────────────────────────────
+
+def _linkedin_build_headers(li_cookie=""):
+    cookie = li_cookie or LINKEDIN_COOKIE
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://www.linkedin.com/jobs/search/",
+    }
+    if cookie:
+        headers["Cookie"] = f"li_at={cookie}; JSESSIONID=ajax:0; lang=v=2&lang=en-us"
+    return headers
+
+
+def _format_linkedin_request_error(keyword, status_code, detail=""):
+    keyword = str(keyword or "").strip() or "запрос"
+    if status_code == 429:
+        return f"{keyword}: LinkedIn временно ограничил запросы (429)"
+    if status_code == 403:
+        return f"{keyword}: LinkedIn отклонил запрос (403)"
+    if status_code in (500, 502, 503, 504):
+        return f"{keyword}: временная ошибка LinkedIn ({status_code})"
+    if status_code:
+        return f"{keyword}: ошибка LinkedIn ({status_code})"
+    return f"{keyword}: {detail[:120]}" if detail else f"{keyword}: неизвестная ошибка LinkedIn"
+
+
+def _linkedin_retry_delay(status_code, attempt):
+    delay = LINKEDIN_RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
+    if status_code == 429:
+        delay = max(delay, LINKEDIN_429_COOLDOWN_SECONDS)
+    elif status_code == 403:
+        delay = max(delay, LINKEDIN_429_COOLDOWN_SECONDS * 0.75)
+    return delay
+
+
+def _linkedin_error_has_rate_limit(errors):
+    return any("(429)" in str(err) or "(403)" in str(err) for err in (errors or []))
+
+
+def _linkedin_empty_result_message(tmpl, result):
+    errors = list(result.get("errors") or [])
+    total_raw = int(result.get("total_raw") or 0)
+    filter_stats = result.get("filter_stats") or {}
+    by_excluded_location = int(filter_stats.get("by_excluded_location") or 0)
+    by_include_kw = int(filter_stats.get("by_include_kw") or 0)
+    by_exclude_kw = int(filter_stats.get("by_exclude_kw") or 0)
+    lines = []
+
+    if _linkedin_error_has_rate_limit(errors):
+        lines.append("LinkedIn временно ограничил часть запросов.")
+        lines.append("Это не значит, что вакансий нет.")
+        lines.append("Можно нажать «Повторить ещё раз» или попробовать позже.")
+    else:
+        lines.append("По текущим фильтрам ничего не найдено на LinkedIn.")
+
+    if total_raw:
+        lines.append(f"Сырых карточек найдено: {total_raw}.")
+    if by_excluded_location:
+        lines.append(f"Отсечено по странам: {by_excluded_location}.")
+    if by_include_kw:
+        lines.append(f"Отсечено обязательными словами: {by_include_kw}.")
+    if by_exclude_kw:
+        lines.append(f"Отсечено по исключающим словам: {by_exclude_kw}.")
+
+    if by_include_kw:
+        lines.append("Сильнее всего режут обязательные слова. Их можно ослабить в шаблоне.")
+    elif not total_raw and not errors:
+        lines.append("Попробуйте расширить ключевые слова или увеличить период.")
+
+    if not (tmpl.get("li_cookie") or LINKEDIN_COOKIE) and _linkedin_error_has_rate_limit(errors):
+        lines.append("Без li_at cookie лимиты LinkedIn обычно строже.")
+
+    if errors:
+        lines.append("")
+        lines.append("Причина: " + "; ".join(errors[:2]))
+
+    return "\n".join(lines)
+
+
+def _linkedin_parse_jobs_html(html_text):
+    """Парсит HTML-ответ LinkedIn guest API в список вакансий."""
+    job_ids_pat  = re.compile(r'data-entity-urn="urn:li:jobPosting:(\d+)"')
+    title_pat    = re.compile(r'class="[^"]*base-search-card__title[^"]*"[^>]*>\s*(.*?)\s*</h3>', re.DOTALL)
+    company_pat  = re.compile(r'class="[^"]*base-search-card__subtitle[^"]*"[^>]*>.*?<a[^>]*>\s*(.*?)\s*</a>', re.DOTALL)
+    location_pat = re.compile(r'class="[^"]*job-search-card__location[^"]*"[^>]*>\s*(.*?)\s*</span>', re.DOTALL)
+    time_pat     = re.compile(r'<time[^>]*datetime="([^"]*)"[^>]*>')
+    link_pat     = re.compile(r'<a[^>]*class="[^"]*base-card__full-link[^"]*"[^>]*href="([^"]*)"')
+
+    def _strip_tags(s):
+        return re.sub(r"<[^>]+>", "", s).strip()
+
+    job_ids   = job_ids_pat.findall(html_text)
+    titles    = [html.unescape(_strip_tags(t)) for t in title_pat.findall(html_text)]
+    companies = [html.unescape(_strip_tags(c)) for c in company_pat.findall(html_text)]
+    locations = [html.unescape(_strip_tags(l)) for l in location_pat.findall(html_text)]
+    dates     = time_pat.findall(html_text)
+    links_raw = link_pat.findall(html_text)
+
+    jobs = []
+    for i, job_id in enumerate(job_ids):
+        link = links_raw[i] if i < len(links_raw) else f"https://www.linkedin.com/jobs/view/{job_id}"
+        if link and "?" in link:
+            link = link.split("?")[0]
+        jobs.append({
+            "id":        job_id,
+            "title":     titles[i]    if i < len(titles)    else "Без названия",
+            "company":   companies[i] if i < len(companies) else "",
+            "location":  locations[i] if i < len(locations) else "",
+            "posted_at": dates[i]     if i < len(dates)     else "",
+            "url":       link or f"https://www.linkedin.com/jobs/view/{job_id}",
+            "source":    "linkedin",
+        })
+    return jobs
+
+
+def fetch_linkedin_vacancies(tmpl):
+    """Поиск вакансий LinkedIn по шаблону. Возвращает {vacancies, errors, filter_stats, total_raw}."""
+    keywords_list = tmpl.get("keywords") or ["data analyst"]
+    location      = tmpl.get("location") or "Worldwide"
+    remote_filter = str(tmpl.get("remote_filter") or "")
+    exp_levels    = tmpl.get("experience_levels") or []
+    posted_within = str(tmpl.get("posted_within") or "r2592000")
+    sort_by       = str(tmpl.get("sort_by") or "DD")
+    max_results   = int(tmpl.get("max_results") or 50)
+    li_cookie     = str(tmpl.get("li_cookie") or LINKEDIN_COOKIE).strip()
+    exclude_kws   = [k.lower() for k in (tmpl.get("exclude_keywords") or [])]
+    include_kws   = [k.lower() for k in (tmpl.get("include_keywords") or [])]
+    excluded_locations = list(tmpl.get("excluded_locations") or [])
+
+    session = _get_http_session()
+    headers = _linkedin_build_headers(li_cookie)
+
+    all_jobs = {}
+    errors   = []
+
+    for keyword in keywords_list:
+        start = 0
+        while len(all_jobs) < max_results * 2:
+            params = {"keywords": keyword, "location": location, "start": start, "count": LINKEDIN_PAGE_SIZE, "sortBy": sort_by}
+            if remote_filter:
+                params["f_WT"] = remote_filter
+            if exp_levels:
+                params["f_E"] = ",".join(exp_levels)
+            if posted_within:
+                params["f_TPR"] = posted_within
+            jobs = None
+            try:
+                for attempt in range(LINKEDIN_REQUEST_RETRIES + 1):
+                    try:
+                        _wait_hh_backoff()
+                        resp = session.get(LINKEDIN_API_BASE, params=params, headers=headers, timeout=_http_timeout())
+                        status_code = int(resp.status_code or 0)
+                        if status_code in (403, 429, 500, 502, 503, 504):
+                            resp.raise_for_status()
+                        if status_code != 200:
+                            resp.raise_for_status()
+                        jobs = _linkedin_parse_jobs_html(resp.text)
+                        break
+                    except requests.HTTPError as e:
+                        status_code = int((e.response.status_code if e.response is not None else 0) or 0)
+                        is_retryable = status_code in (403, 429, 500, 502, 503, 504)
+                        if is_retryable and attempt < LINKEDIN_REQUEST_RETRIES:
+                            delay = _linkedin_retry_delay(status_code, attempt)
+                            _push_hh_backoff(delay)
+                            print(
+                                f"⚠️ LinkedIn ограничил запросы: {keyword}, "
+                                f"start {start}, статус {status_code}, повтор через {round(delay, 1)} c"
+                            )
+                            time.sleep(delay)
+                            continue
+                        error_text = _format_linkedin_request_error(keyword, status_code, str(e))
+                        print(f"❌ Ошибка запроса LinkedIn: {error_text}")
+                        errors.append(error_text)
+                        jobs = None
+                        break
+                    except Exception as e:
+                        error_text = _format_linkedin_request_error(keyword, None, str(e))
+                        print(f"❌ Ошибка запроса LinkedIn: {error_text}")
+                        errors.append(error_text)
+                        jobs = None
+                        break
+                if jobs is None:
+                    break
+                if not jobs:
+                    break
+                for job in jobs:
+                    if job["id"] and job["id"] not in all_jobs:
+                        all_jobs[job["id"]] = job
+                start += len(jobs)
+                if len(jobs) < LINKEDIN_PAGE_SIZE:
+                    break
+                time.sleep(0.35)
+            except Exception as e:
+                error_text = _format_linkedin_request_error(keyword, None, str(e))
+                print(f"❌ Ошибка обработки LinkedIn: {error_text}")
+                errors.append(error_text)
+                break
+
+    filter_stats = {"by_exclude_kw": 0, "by_include_kw": 0, "by_excluded_location": 0}
+    filtered = []
+    for job in all_jobs.values():
+        text_lo = (job.get("title", "") + " " + job.get("company", "")).lower()
+        if excluded_locations and _linkedin_location_is_excluded(job.get("location", ""), excluded_locations):
+            filter_stats["by_excluded_location"] += 1
+            continue
+        if exclude_kws and any(kw in text_lo for kw in exclude_kws):
+            filter_stats["by_exclude_kw"] += 1
+            continue
+        if include_kws and not any(kw in text_lo for kw in include_kws):
+            filter_stats["by_include_kw"] += 1
+            continue
+        filtered.append(job)
+
+    return {
+        "vacancies":    filtered[:max_results],
+        "errors":       errors,
+        "filter_stats": filter_stats,
+        "total_raw":    len(all_jobs),
+    }
+
+
+def format_linkedin_vacancy(vacancy):
+    title   = _esc(vacancy.get("title") or "Без названия")
+    company = _esc(vacancy.get("company") or "")
+    loc     = _esc(vacancy.get("location") or "")
+    url     = vacancy.get("url") or ""
+    posted  = vacancy.get("posted_at") or ""
+    lines   = [f'<b><a href="{url}">{title}</a></b>']
+    if company:
+        lines.append(f"Компания: {company}")
+    if loc:
+        lines.append(f"Локация: {loc}")
+    if posted:
+        lines.append(f"Опубликовано: {posted}")
+    lines.append(f'LinkedIn: <a href="{url}">Открыть</a>')
+    return "\n".join(lines)
+
+
+# ─── LinkedIn wizard ──────────────────────────────────────
+
+def li_wizard_start(chat_id, data, template_id=None):
+    if template_id:
+        tmpl = next((t for t in (data.get("linkedin_templates") or []) if t["id"] == template_id), None)
+        if not tmpl:
+            send_msg(chat_id, "LinkedIn-шаблон не найден.", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
+            return
+        draft = _normalize_linkedin_template(dict(tmpl))
+        mode  = "edit"
+    else:
+        draft = _normalize_linkedin_template({})
+        mode  = "create"
+
+    data["user_states"][str(chat_id)] = {"step": "li_keywords", "draft": draft, "history": [], "mode": mode, "source": "linkedin"}
+    save_data(data)
+    title = "Редактирование LinkedIn-шаблона" if mode == "edit" else "Создание LinkedIn-шаблона"
+    send_msg(
+        chat_id,
+        f"<b>{title}</b>\n\n"
+        "<b>Шаг 1 из 5 — Ключевые слова</b>\n"
+        "Введите должности или навыки через запятую.\n\n"
+        "Пример: <code>data analyst, product analyst, python</code>\n\n"
+        "<i>Далее: локация → формат → опыт → подтверждение</i>",
+        reply_markup={"inline_keyboard": _back_home_row()},
+    )
+
+
+def li_wizard_handle_text(chat_id, text, data):
+    """Обрабатывает текстовый ввод в LinkedIn-wizard. Возвращает True если обработано."""
+    state = data["user_states"].get(str(chat_id))
+    if not state or state.get("source") != "linkedin":
+        return False
+    step  = state["step"]
+    draft = state["draft"]
+    txt   = text.strip()
+    lo    = txt.lower()
+
+    if step == "li_keywords":
+        if lo in KEEP_WORDS and draft.get("keywords"):
+            _wizard_move_to(state, "li_location")
+            save_data(data)
+            _li_send_location_prompt(chat_id, draft.get("location", "Worldwide"), state.get("mode", "create"))
+            return True
+        keywords = [k.strip() for k in txt.split(",") if k.strip()]
+        if not keywords:
+            send_msg(chat_id, "Введите хотя бы одно ключевое слово или должность.")
+            return True
+        draft["keywords"] = keywords
+        _wizard_move_to(state, "li_location")
+        save_data(data)
+        _li_send_location_prompt(chat_id, draft.get("location", "Worldwide"), state.get("mode", "create"))
+        return True
+
+    if step == "li_location":
+        if lo in KEEP_WORDS and draft.get("location"):
+            _wizard_move_to(state, "li_remote")
+            save_data(data)
+            _li_send_remote_kb(chat_id, str(draft.get("remote_filter") or ""))
+            return True
+        if txt:
+            draft["location"] = txt
+        _wizard_move_to(state, "li_remote")
+        save_data(data)
+        _li_send_remote_kb(chat_id, str(draft.get("remote_filter") or ""))
+        return True
+
+    if step == "li_cookie":
+        if lo in KEEP_WORDS:
+            _wizard_move_to(state, "li_exclude_kw")
+            save_data(data)
+            _li_send_exclude_kw_prompt(chat_id, draft.get("exclude_keywords", []), state.get("mode", "create"))
+            return True
+        if lo in SKIP_WORDS:
+            draft["li_cookie"] = ""
+        else:
+            draft["li_cookie"] = txt.strip()
+        _wizard_move_to(state, "li_exclude_kw")
+        save_data(data)
+        _li_send_exclude_kw_prompt(chat_id, draft.get("exclude_keywords", []), state.get("mode", "create"))
+        return True
+
+    if step == "li_exclude_kw":
+        if lo in KEEP_WORDS:
+            _wizard_move_to(state, "li_name")
+            save_data(data)
+            _li_send_name_prompt(chat_id, draft.get("name", "LinkedIn поиск"))
+            return True
+        if lo == "default":
+            draft["exclude_keywords"] = DEFAULT_EXCLUDE_KEYWORDS[:]
+            _wizard_move_to(state, "li_name")
+            save_data(data)
+            _li_send_name_prompt(chat_id, draft.get("name", "LinkedIn поиск"))
+            return True
+        if lo in SKIP_WORDS:
+            draft["exclude_keywords"] = []
+        else:
+            draft["exclude_keywords"] = [k.strip().lower() for k in txt.split(",") if k.strip()]
+        _wizard_move_to(state, "li_name")
+        save_data(data)
+        _li_send_name_prompt(chat_id, draft.get("name", "LinkedIn поиск"))
+        return True
+
+    if step == "li_name":
+        if lo not in ("ok", "ок"):
+            draft["name"] = txt[:50]
+        _wizard_move_to(state, "li_confirm")
+        save_data(data)
+        _li_send_confirm(chat_id, draft)
+        return True
+
+    return False
+
+
+def _li_send_location_prompt(chat_id, current="Worldwide", mode="create"):
+    note = (f"Текущее: <code>{_esc(current)}</code>\nНапишите <code>ok</code>, чтобы оставить.\n\n" if mode == "edit" else "")
+    send_msg(
+        chat_id,
+        "<b>Шаг 2 из 5 — Локация</b>\n"
+        "Введите страну, город или <code>Worldwide</code>.\n\n"
+        + note +
+        "Примеры: <code>Worldwide</code>, <code>Georgia</code>, <code>Germany</code>, <code>Almaty</code>",
+        reply_markup={"inline_keyboard": _back_home_row("wiz_back")},
+    )
+
+
+def _li_send_remote_kb(chat_id, selected=""):
+    buttons = []
+    for k, v in LINKEDIN_REMOTE_OPTIONS.items():
+        mark = "[x] " if selected == k else "[ ] "
+        buttons.append([{"text": mark + v, "callback_data": f"li_remote_{k if k else 'any'}"}])
+    buttons.extend(_back_home_row("wiz_back"))
+    send_msg(chat_id, "<b>Шаг 3 из 5 — Формат работы</b>\nВыберите формат:", reply_markup={"inline_keyboard": buttons})
+
+
+def _li_send_experience_kb(chat_id, selected=None):
+    selected = selected or []
+    buttons  = []
+    for code, label in LINKEDIN_EXPERIENCE_OPTIONS.items():
+        mark = "[x] " if code in selected else "[ ] "
+        buttons.append([{"text": mark + label, "callback_data": f"li_exp_{code}"}])
+    buttons.append([{"text": "Любой опыт", "callback_data": "li_exp_any"}])
+    buttons.append([{"text": "Далее →",    "callback_data": "li_exp_done"}])
+    buttons.extend(_back_home_row("wiz_back"))
+    send_msg(chat_id, "<b>Шаг 4 из 5 — Уровень опыта</b>\nВыберите один или несколько.\n«Любой опыт» — без ограничений.", reply_markup={"inline_keyboard": buttons})
+
+
+def _li_send_cookie_prompt(chat_id, has_cookie=False, mode="create"):
+    note = ("Cookie уже установлен.\nНапишите <code>ok</code>, чтобы оставить, или вставьте новый.\n\n" if has_cookie else "")
+    send_msg(
+        chat_id,
+        "<b>Шаг 5 из 5 (доп.) — LinkedIn Cookie</b>\n"
+        "Не обязательно. Cookie увеличивает лимит и точность вакансий.\n\n"
+        + note +
+        "Как получить:\n"
+        "1. Войдите в LinkedIn в браузере\n"
+        "2. DevTools → Application → Cookies\n"
+        "3. Скопируйте значение куки <code>li_at</code>\n\n"
+        "Или напишите <code>нет</code> — использую публичный поиск.",
+        reply_markup={"inline_keyboard": _back_home_row("wiz_back")},
+    )
+
+
+def _li_send_exclude_kw_prompt(chat_id, current=None, mode="create"):
+    note = _current_value_note(current, "нет") if mode == "edit" else ""
+    send_msg(
+        chat_id,
+        "<b>Исключающие слова (необязательно)</b>\n"
+        "Вакансии с этими словами будут отфильтрованы.\n\n"
+        + note +
+        "• <code>default</code> — стандартный антигемблинг-список\n"
+        "• <code>нет</code> — без исключений\n"
+        "• Или свои слова через запятую",
+        reply_markup={"inline_keyboard": _back_home_row("wiz_back")},
+    )
+
+
+def _li_send_name_prompt(chat_id, current="LinkedIn поиск"):
+    send_msg(
+        chat_id,
+        "<b>Шаг 5 из 5 — Название шаблона</b>\n"
+        f"Текущее: <code>{_esc(current)}</code>\n\n"
+        "Введите название или <code>ok</code>, чтобы оставить текущее.",
+        reply_markup={"inline_keyboard": _back_home_row("wiz_back")},
+    )
+
+
+def _li_send_confirm(chat_id, draft):
+    text = "<b>Проверьте LinkedIn-шаблон перед сохранением</b>\n\n" + _linkedin_template_summary(draft, detailed=True)
+    kb = {"inline_keyboard": [
+        [{"text": "Сохранить",                    "callback_data": "li_confirm_save"},
+         {"text": "Сохранить и сделать текущим",  "callback_data": "li_confirm_activate"}],
+        [{"text": "Отмена", "callback_data": "li_confirm_cancel"}],
+        *_back_home_row("wiz_back"),
+    ]}
+    send_msg(chat_id, text, reply_markup=kb)
+
+
+# ─── LinkedIn keyboard helpers ────────────────────────────
+
+def _li_current_kb(data):
+    return {"inline_keyboard": [
+        [{"text": "Проверить сейчас", "callback_data": "li_run_now"},
+         {"text": "Предпросмотр",     "callback_data": "li_preview_now"}],
+        [{"text": "Редактировать", "callback_data": f"li_tmpl_edit_{data.get('linkedin_active_template_id') or ''}"},
+         {"text": "Очистить историю", "callback_data": "li_reset_sent"}],
+        [{"text": "LinkedIn меню",  "callback_data": "li_menu"},
+         {"text": "Главное меню",   "callback_data": "menu_home"}],
+    ]}
+
+
+def _li_error_kb(data):
+    rows = [[{"text": "Повторить ещё раз", "callback_data": "li_retry_now"}]]
+    rows.extend(_li_current_kb(data)["inline_keyboard"])
+    return {"inline_keyboard": rows}
+
+
+# ─── LinkedIn команды ─────────────────────────────────────
+
+def cmd_linkedin_menu(chat_id, data):
+    data["chat_id"] = chat_id
+    _set_current_source(data, "linkedin")
+    save_data(data)
+    tmpl      = _linkedin_active_template(data)
+    templates = data.get("linkedin_templates") or []
+    text = "<b>LinkedIn поиск</b>\n"
+    if tmpl:
+        text += f"Текущий шаблон: <b>{_esc(tmpl['name'])}</b>\n"
+        text += f"Запрос: <code>{_esc(', '.join((tmpl.get('keywords') or [])[:3]))}</code>\n"
+        text += f"Локация: <code>{_esc(tmpl.get('location','Worldwide'))}</code>\n"
+        text += f"Автопроверка: <b>{'включена' if data.get('linkedin_searching') else 'выключена'}</b>\n"
+    else:
+        text += "Шаблон не выбран. Создайте первый!\n"
+    text += f"\nВсего шаблонов: <b>{len(templates)}</b>"
+    kb = {"inline_keyboard": [
+        [{"text": "Проверить сейчас", "callback_data": "li_run_now"},
+         {"text": "Предпросмотр",     "callback_data": "li_preview_now"}],
+        [{"text": "Создать шаблон",   "callback_data": "li_tmpl_new"},
+         {"text": "Мои шаблоны",      "callback_data": "li_menu_templates"}],
+        [{"text": "Текущий шаблон",   "callback_data": "li_menu_current"},
+         {"text": "Очистить историю", "callback_data": "li_reset_sent"}],
+        [{"text": "Главное меню",     "callback_data": "menu_home"}],
+    ]}
+    send_msg(chat_id, text, reply_markup=kb)
+
+
+def _run_linkedin_search(chat_id, data, tmpl, persist=True, announce=True):
+    if announce:
+        mode_label = "Предпросмотр" if not persist else "Поиск"
+        send_msg(
+            chat_id,
+            f"<b>{mode_label} на LinkedIn</b>\n"
+            f"Шаблон: <b>{_esc(tmpl['name'])}</b>\n"
+            f"Запрос: <code>{_esc(', '.join((tmpl.get('keywords') or [])[:3]))}</code>\n"
+            f"Локация: <code>{_esc(tmpl.get('location','Worldwide'))}</code>\n\n"
+            "Ищу вакансии, подождите..."
+        )
+
+    result   = fetch_linkedin_vacancies(tmpl)
+    fetched  = result.get("vacancies") or []
+    errors   = result.get("errors") or []
+    total_raw = result.get("total_raw", len(fetched))
+    filter_stats = result.get("filter_stats") or {}
+
+    sent_ids = _linkedin_template_sent_ids(data, tmpl["id"])
+    sent_set = set(sent_ids)
+    visible  = [v for v in fetched if v["id"] not in sent_set] if persist else list(fetched)
+
+    if not visible:
+        if fetched:
+            msg    = "Вакансии найдены, но все уже были показаны раньше."
+            if errors:
+                msg += "\n\n" + "Есть и временные ошибки LinkedIn. Можно повторить ещё раз, чтобы добрать пропущенное."
+            markup_rows = [[{"text": "Пройтись заново", "callback_data": "li_rerun_fresh"}]]
+            if errors:
+                markup_rows.append([{"text": "Повторить ещё раз", "callback_data": "li_retry_now"}])
+            markup_rows.append([{"text": "LinkedIn меню", "callback_data": "li_menu"}])
+            markup = {"inline_keyboard": markup_rows}
+        else:
+            msg = _linkedin_empty_result_message(tmpl, result)
+            markup = _li_error_kb(data) if errors else {"inline_keyboard": [[{"text": "LinkedIn меню", "callback_data": "li_menu"}],
+                                                                             *_back_home_row("menu_home")]}
+        send_msg(chat_id, msg, reply_markup=markup)
+        return {
+            "total_found": len(fetched),
+            "shown_count": 0,
+            "new_count": 0,
+            "errors": list(errors),
+        }
+
+    page_size  = int(tmpl.get("delivery_page_size") or 5)
+    first_page = visible[:page_size]
+
+    for v in first_page:
+        send_msg(chat_id, format_linkedin_vacancy(v))
+
+    # Сохраняем ВСЕ visible в сессию для пагинации (начиная со страницы 1 — первая уже отправлена)
+    session_id = _store_li_result_session(data, tmpl, visible, persist)
+
+    if persist:
+        _append_linkedin_template_sent_ids(data, tmpl["id"], [v["id"] for v in first_page])
+        data["linkedin_last_check"] = time.time()
+        save_data(data)
+
+    page_count = max(1, -(-len(visible) // page_size))  # ceil division
+    has_more   = len(visible) > page_size
+
+    summary_lines = [
+        f"<b>{'Предпросмотр' if not persist else 'Поиск'} завершён</b>",
+        f"Шаблон: <b>{_esc(tmpl['name'])}</b>",
+        f"Страница: <b>1 из {page_count}</b>",
+        f"Показано: <b>{len(first_page)}</b> из <b>{len(visible)}</b> новых",
+        f"Всего найдено: <b>{total_raw}</b>",
+        f"Осталось после этой страницы: <b>{max(0, len(visible) - len(first_page))}</b>",
+    ]
+    if filter_stats.get("by_excluded_location"):
+        summary_lines.append(f"Отсечено по странам: <b>{int(filter_stats.get('by_excluded_location') or 0)}</b>")
+    if filter_stats.get("by_include_kw"):
+        summary_lines.append(f"Отсечено обязательными словами: <b>{int(filter_stats.get('by_include_kw') or 0)}</b>")
+    if has_more:
+        summary_lines.append(f"Ещё <b>{len(visible) - page_size}</b> вакансий — нажмите <b>Дальше</b>")
+    if errors:
+        if _linkedin_error_has_rate_limit(errors):
+            summary_lines.append("LinkedIn временно ограничил часть запросов. Можно нажать <b>«Повторить ещё раз»</b>.")
+        summary_lines.append("Причина: " + _esc("; ".join(errors[:2])))
+
+    # Строим клавиатуру: кнопка Дальше если есть ещё страницы
+    nav_buttons = []
+    if has_more:
+        nav_buttons.extend(_li_session_nav_keyboard(session_id, 0, page_count, data)["inline_keyboard"][:-1])
+    if errors:
+        nav_buttons.append([{"text": "Повторить ещё раз", "callback_data": "li_retry_now"}])
+    nav_buttons.extend(_li_current_kb(data)["inline_keyboard"])
+    send_msg(chat_id, "\n".join(summary_lines), reply_markup={"inline_keyboard": nav_buttons})
+    return {
+        "total_found": total_raw,
+        "shown_count": len(first_page),
+        "new_count": len(visible),
+        "errors": list(errors),
+    }
+
+
+def cmd_linkedin_run(chat_id, data, persist=True):
+    data["chat_id"] = chat_id
+    _set_current_source(data, "linkedin")
+    save_data(data)
+    tmpl = _linkedin_active_template(data)
+    if not tmpl:
+        send_msg(chat_id, "Нет текущего LinkedIn-шаблона. Создайте его!",
+                 reply_markup={"inline_keyboard": [[{"text": "Создать шаблон LinkedIn", "callback_data": "li_tmpl_new"}],
+                                                   *_back_home_row("menu_home")]})
+        return
+    _run_linkedin_search(chat_id, data, tmpl, persist=persist, announce=True)
+
+
+def cmd_linkedin_current(chat_id, data):
+    data["chat_id"] = chat_id
+    _set_current_source(data, "linkedin")
+    save_data(data)
+    tmpl = _linkedin_active_template(data)
+    if not tmpl:
+        send_msg(chat_id, "Текущий LinkedIn-шаблон не выбран.",
+                 reply_markup={"inline_keyboard": [[{"text": "Создать шаблон", "callback_data": "li_tmpl_new"}],
+                                                   *_back_home_row("menu_home")]})
+        return
+    text = "<b>Текущий LinkedIn-шаблон</b>\n\n" + _linkedin_template_summary(tmpl, detailed=True)
+    send_msg(chat_id, text, reply_markup=_li_current_kb(data))
+
+
+def cmd_linkedin_reset_sent(chat_id, data):
+    data["chat_id"] = chat_id
+    _set_current_source(data, "linkedin")
+    tmpl = _linkedin_active_template(data)
+    if not tmpl:
+        send_msg(chat_id, "Нет текущего LinkedIn-шаблона.")
+        return
+    _set_linkedin_template_sent_ids(data, tmpl["id"], [])
+    save_data(data)
+    send_msg(chat_id, f"История LinkedIn-шаблона <b>{_esc(tmpl['name'])}</b> очищена.", reply_markup=_li_current_kb(data))
+
+
+def cmd_linkedin_rerun_fresh(chat_id, data):
+    data["chat_id"] = chat_id
+    _set_current_source(data, "linkedin")
+    tmpl = _linkedin_active_template(data)
+    if not tmpl:
+        send_msg(chat_id, "Нет текущего LinkedIn-шаблона.", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
+        return
+    _set_linkedin_template_sent_ids(data, tmpl["id"], [])
+    save_data(data)
+    send_msg(chat_id, "История LinkedIn очищена. Запускаю поиск заново...")
+    cmd_linkedin_run(chat_id, data, persist=True)
+
+
+def cmd_linkedin_templates(chat_id, data, page=0):
+    data["chat_id"] = chat_id
+    _set_current_source(data, "linkedin")
+    save_data(data)
+    templates = data.get("linkedin_templates") or []
+    if not templates:
+        send_msg(chat_id, "Нет сохранённых LinkedIn-шаблонов. Создайте первый!",
+                 reply_markup={"inline_keyboard": [[{"text": "Создать шаблон", "callback_data": "li_tmpl_new"}],
+                                                   *_back_home_row("menu_home")]})
+        return
+    per_page    = 4
+    total_pages = max(1, (len(templates) + per_page - 1) // per_page)
+    page        = max(0, min(page, total_pages - 1))
+    start       = page * per_page
+    items       = templates[start:start + per_page]
+    active_id   = data.get("linkedin_active_template_id")
+    text = f"<b>Мои LinkedIn-шаблоны</b>\nСтраница {page + 1}/{total_pages}\n\n"
+    buttons = []
+    for idx, t in enumerate(items, start=start + 1):
+        is_active = t["id"] == active_id
+        text += (
+            f"<b>{idx}. {_esc(t['name'])}</b>\n"
+            f"Запрос: {_esc(', '.join((t.get('keywords') or [])[:2]))}\n"
+            f"Локация: {_esc(t.get('location','Worldwide'))}\n"
+            f"Статус: {'Текущий' if is_active else 'Сохранённый'}\n\n"
+        )
+        buttons.append([
+            {"text": f"{idx}. Открыть",          "callback_data": f"li_tmpl_open_{t['id']}"},
+            {"text": f"{idx}. Сделать текущим",  "callback_data": f"li_tmpl_select_{t['id']}"},
+            {"text": f"{idx}. Удалить",          "callback_data": f"li_tmpl_delete_{t['id']}"},
+        ])
+    nav_row = []
+    if page > 0:
+        nav_row.append({"text": "Назад", "callback_data": f"li_tmpl_page_{page - 1}"})
+    if page < total_pages - 1:
+        nav_row.append({"text": "Далее", "callback_data": f"li_tmpl_page_{page + 1}"})
+    if nav_row:
+        buttons.append(nav_row)
+    buttons.append([{"text": "Создать шаблон", "callback_data": "li_tmpl_new"}])
+    buttons.extend(_back_home_row("menu_home"))
+    send_msg(chat_id, text, reply_markup={"inline_keyboard": buttons})
+
+
+# ─── LinkedIn handle_callback callbacks ──────────────────
+
+def handle_linkedin_callback(cdata, chat_id, msg_id, data, state, draft):
+    """Обрабатывает все LinkedIn-callbacks. Возвращает True если обработано."""
+
+    if cdata == "li_menu":
+        data = load_data()
+        cmd_linkedin_menu(chat_id, data)
+        return True
+
+    if cdata == "li_run_now":
+        data = load_data()
+        cmd_linkedin_run(chat_id, data, persist=True)
+        return True
+
+    if cdata == "li_retry_now":
+        data = load_data()
+        send_msg(chat_id, "Повторяю LinkedIn-поиск ещё раз...")
+        cmd_linkedin_run(chat_id, data, persist=True)
+        return True
+
+    if cdata == "li_preview_now":
+        data = load_data()
+        cmd_linkedin_run(chat_id, data, persist=False)
+        return True
+
+    if cdata == "li_menu_current":
+        data = load_data()
+        cmd_linkedin_current(chat_id, data)
+        return True
+
+    if cdata == "li_menu_templates":
+        data = load_data()
+        cmd_linkedin_templates(chat_id, data)
+        return True
+
+    if cdata == "li_reset_sent":
+        data = load_data()
+        cmd_linkedin_reset_sent(chat_id, data)
+        return True
+
+    if cdata == "li_rerun_fresh":
+        data = load_data()
+        cmd_linkedin_rerun_fresh(chat_id, data)
+        return True
+
+    if cdata == "li_tmpl_new":
+        data = load_data()
+        li_wizard_start(chat_id, data)
+        return True
+
+    if cdata.startswith("li_tmpl_page_"):
+        data = load_data()
+        cmd_linkedin_templates(chat_id, data, int(cdata[len("li_tmpl_page_"):]))
+        return True
+
+    if cdata.startswith("li_tmpl_open_"):
+        tmpl_id = cdata[len("li_tmpl_open_"):]
+        data    = load_data()
+        tmpl    = next((t for t in (data.get("linkedin_templates") or []) if t["id"] == tmpl_id), None)
+        if not tmpl:
+            send_msg(chat_id, "Шаблон не найден.", reply_markup={"inline_keyboard": _back_home_row("li_menu_templates")})
+            return True
+        is_active = tmpl_id == data.get("linkedin_active_template_id")
+        text = ("<b>Текущий LinkedIn-шаблон</b>\n\n" if is_active else "<b>LinkedIn-шаблон</b>\n\n") + _linkedin_template_summary(tmpl, detailed=True)
+        kb   = {"inline_keyboard": [
+            [{"text": "Сделать текущим", "callback_data": f"li_tmpl_select_{tmpl_id}"},
+             {"text": "Редактировать",   "callback_data": f"li_tmpl_edit_{tmpl_id}"}],
+            [{"text": "Удалить",         "callback_data": f"li_tmpl_delete_{tmpl_id}"}],
+            *_back_home_row("li_menu_templates"),
+        ]} if not is_active else _li_current_kb(data)
+        send_msg(chat_id, text, reply_markup=kb)
+        return True
+
+    if cdata.startswith("li_tmpl_select_"):
+        tmpl_id = cdata[len("li_tmpl_select_"):]
+        data["linkedin_active_template_id"] = tmpl_id
+        _set_current_source(data, "linkedin")
+        data.setdefault("linkedin_sent_ids_by_template", {}).setdefault(str(tmpl_id), [])
+        save_data(data)
+        tmpl = next((t for t in (data.get("linkedin_templates") or []) if t["id"] == tmpl_id), None)
+        name = _esc(tmpl["name"]) if tmpl else tmpl_id
+        send_msg(chat_id, f"Текущий LinkedIn-шаблон: <b>{name}</b>", reply_markup=_li_current_kb(data))
+        return True
+
+    if cdata.startswith("li_tmpl_edit_"):
+        tmpl_id = cdata[len("li_tmpl_edit_"):]
+        data    = load_data()
+        li_wizard_start(chat_id, data, template_id=tmpl_id)
+        return True
+
+    if cdata.startswith("li_tmpl_delete_"):
+        tmpl_id  = cdata[len("li_tmpl_delete_"):]
+        data["linkedin_templates"] = [t for t in (data.get("linkedin_templates") or []) if t["id"] != tmpl_id]
+        (data.get("linkedin_sent_ids_by_template") or {}).pop(str(tmpl_id), None)
+        if data.get("linkedin_active_template_id") == tmpl_id:
+            data["linkedin_active_template_id"] = None
+            data["linkedin_searching"] = False
+        _ensure_linkedin_templates_ready(data)
+        save_data(data)
+        send_msg(chat_id, "LinkedIn-шаблон удалён.")
+        data = load_data()
+        cmd_linkedin_templates(chat_id, data)
+        return True
+
+    # ── LinkedIn wizard: remote format ────────────────────
+    if cdata.startswith("li_remote_"):
+        val = cdata[len("li_remote_"):]
+        draft["remote_filter"] = "" if val == "any" else val
+        state["draft"] = draft
+        _wizard_move_to(state, "li_experience")
+        save_data(data)
+        _li_send_experience_kb(chat_id, draft.get("experience_levels", []))
+        return True
+
+    # ── LinkedIn wizard: experience ───────────────────────
+    if cdata == "li_exp_any":
+        draft["experience_levels"] = []
+        state["draft"] = draft
+        save_data(data)
+        edit_reply_markup(chat_id, msg_id, {"inline_keyboard": _li_experience_kb_buttons(draft.get("experience_levels", []))})
+        return True
+
+    if cdata.startswith("li_exp_") and cdata != "li_exp_done":
+        code = cdata[len("li_exp_"):]
+        sel  = draft.get("experience_levels", [])
+        if code in sel:
+            sel.remove(code)
+        else:
+            sel.append(code)
+        draft["experience_levels"] = _unique_list(sel)
+        state["draft"] = draft
+        save_data(data)
+        edit_reply_markup(chat_id, msg_id, {"inline_keyboard": _li_experience_kb_buttons(draft.get("experience_levels", []))})
+        return True
+
+    if cdata == "li_exp_done":
+        _wizard_move_to(state, "li_period")
+        save_data(data)
+        _li_send_period_kb(chat_id, str(draft.get("posted_within") or "r2592000"))
+        return True
+
+    # ── LinkedIn wizard: period ───────────────────────────
+    if cdata.startswith("li_period_"):
+        val = cdata[len("li_period_"):]
+        draft["posted_within"] = "" if val == "all" else val
+        state["draft"] = draft
+        _wizard_move_to(state, "li_cookie")
+        save_data(data)
+        _li_send_cookie_prompt(chat_id, bool(draft.get("li_cookie") or LINKEDIN_COOKIE), state.get("mode", "create"))
+        return True
+
+    # ── LinkedIn wizard: confirm ──────────────────────────
+    if cdata in ("li_confirm_save", "li_confirm_activate"):
+        tmpl     = _normalize_linkedin_template(state.get("draft", {}))
+        existing = [t for t in (data.get("linkedin_templates") or []) if t["id"] != tmpl["id"]]
+        existing.append(tmpl)
+        data["linkedin_templates"] = existing
+        data.setdefault("linkedin_sent_ids_by_template", {}).setdefault(str(tmpl["id"]), [])
+        if cdata == "li_confirm_activate":
+            data["linkedin_active_template_id"] = tmpl["id"]
+        if str(chat_id) in data["user_states"]:
+            del data["user_states"][str(chat_id)]
+        save_data(data)
+        if cdata == "li_confirm_activate":
+            send_msg(chat_id, f"<b>LinkedIn-шаблон «{_esc(tmpl['name'])}» сохранён и сделан текущим.</b>", reply_markup=_li_current_kb(data))
+        else:
+            send_msg(chat_id, f"<b>LinkedIn-шаблон «{_esc(tmpl['name'])}» сохранён.</b>\nОткрыть в разделе «Мои шаблоны».",
+                     reply_markup={"inline_keyboard": [[{"text": "Мои LinkedIn-шаблоны", "callback_data": "li_menu_templates"},
+                                                        {"text": "Главное меню",         "callback_data": "menu_home"}]]})
+        return True
+
+    if cdata == "li_confirm_cancel":
+        if str(chat_id) in data["user_states"]:
+            del data["user_states"][str(chat_id)]
+        save_data(data)
+        send_msg(chat_id, "Создание LinkedIn-шаблона отменено.", reply_markup={"inline_keyboard": _back_home_row("menu_home")})
+        return True
+
+    # ── Пагинация результатов LinkedIn ────────────────────
+    if cdata.startswith("li_res_"):
+        # формат: li_res_{session_id}_{page}
+        parts = cdata[len("li_res_"):].rsplit("_", 1)
+        if len(parts) == 2:
+            session_id, page_str = parts
+            try:
+                page = int(page_str)
+            except ValueError:
+                page = 0
+            data = load_data()
+            ok, summary, markup = _li_deliver_page(chat_id, data, session_id, page)
+            send_msg(chat_id, summary, reply_markup=markup)
+        return True
+
+    return False
+
+
+def _li_experience_kb_buttons(selected):
+    buttons = []
+    for code, label in LINKEDIN_EXPERIENCE_OPTIONS.items():
+        mark = "[x] " if code in selected else "[ ] "
+        buttons.append([{"text": mark + label, "callback_data": f"li_exp_{code}"}])
+    buttons.append([{"text": "Любой опыт", "callback_data": "li_exp_any"}])
+    buttons.append([{"text": "Далее →",    "callback_data": "li_exp_done"}])
+    buttons.extend(_back_home_row("wiz_back"))
+    return buttons
+
+
+def _li_send_period_kb(chat_id, selected="r2592000"):
+    buttons = []
+    for k, v in LINKEDIN_PERIOD_OPTIONS.items():
+        mark = "[x] " if selected == k else "[ ] "
+        cb   = f"li_period_{k if k else 'all'}"
+        buttons.append([{"text": mark + v, "callback_data": cb}])
+    buttons.extend(_back_home_row("wiz_back"))
+    send_msg(chat_id, "<b>Шаг 5 из 5 — Период публикации</b>\nЗа какое время брать вакансии:", reply_markup={"inline_keyboard": buttons})
 
 
 # ═══════════════════════════════════════════════════════════
@@ -4175,10 +7437,13 @@ def process_update(upd):
 
     state = data["user_states"].get(str(chat_id))
     if state and not text.startswith("/"):
-        if state["step"] == "name" and text.lower() in ("ok", "ок"):
-            text = state["draft"].get("name", "Новый поиск")
         try:
-            wizard_handle_text(chat_id, text, data)
+            if state.get("source") == "linkedin":
+                li_wizard_handle_text(chat_id, text, data)
+            else:
+                if state["step"] == "name" and text.lower() in ("ok", "ок"):
+                    text = state["draft"].get("name", "Новый поиск")
+                wizard_handle_text(chat_id, text, data)
         except Exception as e:
             print(f"❌ Ошибка wizard: {e}")
         return
@@ -4192,17 +7457,35 @@ def process_update(upd):
         elif cmd == "/help":
             cmd_help(chat_id)
         elif cmd == "/new":
-            wizard_start(chat_id, data)
+            if _current_source(data) == "linkedin":
+                li_wizard_start(chat_id, data)
+            else:
+                wizard_start(chat_id, data)
         elif cmd == "/templates":
-            cmd_templates(chat_id, data)
+            if _current_source(data) == "linkedin":
+                cmd_linkedin_templates(chat_id, data)
+            else:
+                cmd_templates(chat_id, data)
         elif cmd == "/current":
-            cmd_current(chat_id, data)
+            if _current_source(data) == "linkedin":
+                cmd_linkedin_current(chat_id, data)
+            else:
+                cmd_current(chat_id, data)
         elif cmd == "/run":
-            cmd_run(chat_id, data)
+            if _current_source(data) == "linkedin":
+                cmd_linkedin_run(chat_id, data, persist=True)
+            else:
+                cmd_run(chat_id, data)
         elif cmd == "/preview":
-            cmd_preview(chat_id, data)
+            if _current_source(data) == "linkedin":
+                cmd_linkedin_run(chat_id, data, persist=False)
+            else:
+                cmd_preview(chat_id, data)
         elif cmd == "/reset_sent":
-            cmd_reset_sent(chat_id, data)
+            if _current_source(data) == "linkedin":
+                cmd_linkedin_reset_sent(chat_id, data)
+            else:
+                cmd_reset_sent(chat_id, data)
         elif cmd == "/toggle":
             cmd_toggle(chat_id, data)
         elif cmd == "/status":
@@ -4223,6 +7506,15 @@ def run_scheduled_search_tick(force=False):
     tmpl = _active_template(data)
     if not tmpl:
         return {"ok": False, "status": "skipped", "reason": "no_active_template"}
+    hh_block_message = _hh_guard_before_search(data)
+    if hh_block_message:
+        save_data(data)
+        return {
+            "ok": False,
+            "status": "skipped",
+            "reason": "hh_temporarily_blocked",
+            "message": hh_block_message,
+        }
 
     interval = tmpl.get("interval", 30) * 60
     last_chk = data.get("last_check", 0)
@@ -4252,6 +7544,78 @@ def run_scheduled_search_tick(force=False):
         data["last_check"] = time.time()
         save_data(data)
         return {"ok": False, "status": "error", "reason": str(e)}
+
+
+def run_scheduled_linkedin_tick(force=False):
+    data = load_data()
+    chat_id = data.get("chat_id")
+
+    if not (data.get("linkedin_searching") and data.get("linkedin_active_template_id") and chat_id):
+        return {"ok": False, "status": "skipped", "reason": "inactive_or_chat_missing"}
+
+    tmpl = _linkedin_active_template(data)
+    if not tmpl:
+        return {"ok": False, "status": "skipped", "reason": "no_active_template"}
+
+    interval = int(tmpl.get("interval", 30) or 30) * 60
+    last_chk = float(data.get("linkedin_last_check", 0) or 0)
+    if not force and time.time() - last_chk < interval:
+        remaining = max(0, int(last_chk + interval - time.time()))
+        return {
+            "ok": True,
+            "status": "skipped",
+            "reason": "interval_not_reached",
+            "remaining_seconds": remaining,
+            "template_id": tmpl["id"],
+            "template_name": tmpl["name"],
+        }
+
+    print(f"🔧 Плановый LinkedIn-поиск: {tmpl['name']}")
+    try:
+        result = _run_linkedin_search(chat_id, data, tmpl, persist=True, announce=False)
+        latest_data = load_data()
+        latest_data["linkedin_last_check"] = time.time()
+        save_data(latest_data)
+        return {
+            "ok": True,
+            "status": "done",
+            "template_id": tmpl["id"],
+            "template_name": tmpl["name"],
+            **(result or {}),
+        }
+    except Exception as e:
+        print(f"❌ Ошибка планового LinkedIn-поиска: {e}")
+        latest_data = load_data()
+        latest_data["linkedin_last_check"] = time.time()
+        save_data(latest_data)
+        return {"ok": False, "status": "error", "reason": str(e)}
+
+
+def run_all_scheduled_ticks(force=False):
+    hh_result = run_scheduled_search_tick(force=force)
+    linkedin_result = run_scheduled_linkedin_tick(force=force)
+    ok = all(
+        item.get("ok", False) or item.get("status") == "skipped"
+        for item in (hh_result, linkedin_result)
+    )
+    if any(item.get("status") == "error" for item in (hh_result, linkedin_result)):
+        status = "error"
+        reasons = [item.get("reason") for item in (hh_result, linkedin_result) if item.get("status") == "error" and item.get("reason")]
+        reason = "; ".join(reasons) if reasons else "scheduled_tick_error"
+    elif any(item.get("status") == "done" for item in (hh_result, linkedin_result)):
+        status = "done"
+        reason = ""
+    else:
+        status = "skipped"
+        reasons = [item.get("reason") for item in (hh_result, linkedin_result) if item.get("status") == "skipped" and item.get("reason")]
+        reason = reasons[0] if reasons else "inactive_or_chat_missing"
+    return {
+        "ok": ok,
+        "status": status,
+        "reason": reason,
+        "hh": hh_result,
+        "linkedin": linkedin_result,
+    }
 
 
 def _cron_request_authorized(auth_header="", query_secret=""):
@@ -4284,8 +7648,13 @@ def _web_search_response(data, tmpl, persist):
     fetched_vacancies = result["fetched_vacancies"]
     visible_vacancies = result["visible_vacancies"]
     fetch_errors = result["errors"]
+    friendly_error = _friendly_fetch_error_summary(fetch_errors)
 
-    if not visible_vacancies:
+    if result.get("hh_temporarily_blocked") and fetch_errors:
+        reason = fetch_errors[0]
+    elif friendly_error and not visible_vacancies:
+        reason = friendly_error
+    elif not visible_vacancies:
         if fetched_vacancies and persist:
             reason = "По фильтрам вакансии есть, но они уже были отправлены раньше."
         else:
@@ -4301,6 +7670,7 @@ def _web_search_response(data, tmpl, persist):
         "shown_count": len(visible_vacancies),
         "page_size": int(tmpl.get("delivery_page_size", 5) or 5),
         "reason": reason,
+        "friendly_error": friendly_error,
         "errors": list(fetch_errors or []),
         "vacancies": [_vacancy_to_web_item(vacancy) for vacancy in visible_vacancies],
     }
@@ -5351,7 +8721,7 @@ def _web_ui_html():
       els.onlyWithSalary.checked = !!current.only_with_salary;
       els.salaryMin.value = current.salary_min || 0;
       renderSelect(els.sort, options.sort, current.sort || 'publication_time');
-      renderSelect(els.periodDays, options.period_days, current.period_days || 1);
+      renderSelect(els.periodDays, options.period_days, current.period_days ?? 0);
       els.maxPages.value = current.max_pages || 5;
       els.maxResults.value = current.max_results || 50;
       els.deliveryPageSize.value = current.delivery_page_size || 5;
@@ -5706,6 +9076,58 @@ def _web_ui_html():
 '''.replace("__TOKEN_REQUIRED__", token_required)
 
 
+def _hh_oauth_result_html(title, message):
+    return f'''<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(title)}</title>
+  <style>
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #f5f7fb;
+      color: #172033;
+      font-family: Arial, sans-serif;
+    }}
+    main {{
+      width: min(560px, calc(100vw - 32px));
+      background: #ffffff;
+      border: 1px solid #e0e6ef;
+      border-radius: 16px;
+      padding: 28px;
+      box-shadow: 0 18px 44px rgba(27, 43, 80, 0.08);
+    }}
+    h1 {{ margin: 0 0 12px; font-size: 24px; }}
+    p {{ margin: 0 0 20px; color: #5f6f86; line-height: 1.5; }}
+    a {{ color: #1f4ecf; font-weight: 700; text-decoration: none; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{html.escape(title)}</h1>
+    <p>{html.escape(message)}</p>
+    <a href="/ui">Открыть панель</a>
+  </main>
+</body>
+</html>'''
+
+
+def _hh_oauth_public_status(data=None):
+    oauth = _normalize_hh_oauth_state((data or {}).get("hh_oauth") if isinstance(data, dict) else None)
+    expires_at = int(float(oauth.get("expires_at") or 0))
+    return {
+        "configured": _hh_oauth_ready(),
+        "authorized": bool(_hh_access_token_from_state(data)),
+        "has_refresh_token": bool(oauth.get("refresh_token") or HH_REFRESH_TOKEN),
+        "expires_at": expires_at,
+        "last_error": oauth.get("last_error") or "",
+    }
+
+
 if FastAPI is not None:
     app = FastAPI(title="HH Vacancy Bot")
 
@@ -5723,8 +9145,89 @@ if FastAPI is not None:
     @app.get("/index")
     @app.get("/index.html")
     @app.get("/api/ui")
-    def api_root():
+    def api_root(request: Request):
+        if request.query_params.get("code") or request.query_params.get("error"):
+            return _handle_hh_oauth_callback(request)
         return HTMLResponse(_web_ui_html())
+
+    @app.get("/hh/oauth/start")
+    @app.get("/api/hh/oauth/start")
+    def api_hh_oauth_start(request: Request):
+        if not _web_request_authorized(request):
+            return _web_unauthorized_response()
+        if not _hh_oauth_ready():
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "HH_CLIENT_ID и HH_CLIENT_SECRET не заданы в переменных окружения",
+                    "status": _build_runtime_status(),
+                },
+                status_code=500,
+            )
+        redirect_uri = _get_hh_redirect_uri(request)
+        if not redirect_uri:
+            return JSONResponse({"ok": False, "error": "Не удалось определить HH_REDIRECT_URI"}, status_code=500)
+        data = load_data()
+        oauth_state = uuid.uuid4().hex
+        data["hh_oauth"] = _normalize_hh_oauth_state(data.get("hh_oauth"))
+        data["hh_oauth"]["oauth_state"] = oauth_state
+        data["hh_oauth"]["oauth_state_expires_at"] = time.time() + 600
+        data["hh_oauth"]["last_error"] = ""
+        save_data(data)
+        params = {
+            "response_type": "code",
+            "client_id": HH_CLIENT_ID,
+            "redirect_uri": redirect_uri,
+            "state": oauth_state,
+        }
+        return RedirectResponse(f"{HH_OAUTH_AUTHORIZE_URL}?{urlencode(params)}", status_code=302)
+
+    @app.get("/hh/oauth/callback")
+    @app.get("/api/hh/oauth/callback")
+    def api_hh_oauth_callback(request: Request):
+        return _handle_hh_oauth_callback(request)
+
+    def _handle_hh_oauth_callback(request: Request):
+        error = str(request.query_params.get("error") or "").strip()
+        if error:
+            return HTMLResponse(
+                _hh_oauth_result_html("HH OAuth не подключён", f"HH вернул ошибку авторизации: {error}"),
+                status_code=400,
+            )
+        code = str(request.query_params.get("code") or "").strip()
+        returned_state = str(request.query_params.get("state") or "").strip()
+        if not code:
+            return HTMLResponse(
+                _hh_oauth_result_html("HH OAuth не подключён", "В callback нет параметра code."),
+                status_code=400,
+            )
+        if not _hh_oauth_ready():
+            return HTMLResponse(
+                _hh_oauth_result_html("HH OAuth не настроен", "На сервере не заданы HH_CLIENT_ID и HH_CLIENT_SECRET."),
+                status_code=500,
+            )
+        data = load_data()
+        oauth = _normalize_hh_oauth_state(data.get("hh_oauth"))
+        expected_state = str(oauth.get("oauth_state") or "").strip()
+        state_expires_at = float(oauth.get("oauth_state_expires_at") or 0)
+        if not expected_state or returned_state != expected_state or state_expires_at < time.time():
+            _save_hh_oauth_error(data, "Некорректный или просроченный OAuth state")
+            return HTMLResponse(
+                _hh_oauth_result_html("HH OAuth не подключён", "Защитный state не совпал или устарел. Запустите подключение заново."),
+                status_code=400,
+            )
+        try:
+            token_data = _exchange_hh_oauth_code(data, code, _get_hh_redirect_uri(request))
+            expires_at = int(float(token_data.get("expires_at") or 0))
+            expires_text = datetime.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M:%S") if expires_at else "не указан"
+            return HTMLResponse(_hh_oauth_result_html("HH OAuth подключён", f"Токен сохранён. Истекает: {expires_text}."))
+        except Exception as e:
+            _save_hh_oauth_error(data, e)
+            print(f"❌ Ошибка HH OAuth callback: {e}")
+            return HTMLResponse(
+                _hh_oauth_result_html("HH OAuth не подключён", f"Не удалось обменять code на token: {e}"),
+                status_code=500,
+            )
 
     @app.get("/health")
     @app.get("/api/health")
@@ -5940,7 +9443,7 @@ if FastAPI is not None:
         auth_header = request.headers.get("authorization", "")
         if not _cron_request_authorized(auth_header, secret):
             return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
-        return run_scheduled_search_tick(force=bool(force))
+        return run_all_scheduled_ticks(force=bool(force))
 
     @app.get("/run-now")
     @app.get("/api/run-now")
@@ -6003,7 +9506,7 @@ def run_polling():
             offset = upd["update_id"] + 1
             process_update(upd)
 
-        run_scheduled_search_tick()
+        run_all_scheduled_ticks()
         time.sleep(1)
 
 
@@ -6022,7 +9525,7 @@ def run_webhook():
 
     while True:
         server.handle_request()
-        run_scheduled_search_tick()
+        run_all_scheduled_ticks()
 
 
 def main():
