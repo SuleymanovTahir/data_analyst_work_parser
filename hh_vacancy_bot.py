@@ -88,8 +88,8 @@ HH_REFRESH_TOKEN = (os.getenv("HH_REFRESH_TOKEN") or "").strip()
 STATE_TTL_SECONDS = int(os.getenv("HH_STATE_TTL_SECONDS", str(60 * 60 * 24 * 30)) or (60 * 60 * 24 * 30))
 AREAS_TTL_SECONDS = int(os.getenv("HH_AREAS_TTL_SECONDS", str(60 * 60 * 24 * 30)) or (60 * 60 * 24 * 30))
 SEARCH_RESULT_TTL_SECONDS = int(os.getenv("HH_SEARCH_RESULT_TTL_SECONDS", "900") or 900)
-HH_SEARCH_WORKERS = max(1, int(os.getenv("HH_SEARCH_WORKERS", "1") or 1))
-HTTP_POOL_SIZE = max(4, int(os.getenv("HH_HTTP_POOL_SIZE", "16") or 16))
+HH_SEARCH_WORKERS = max(1, int(os.getenv("HH_SEARCH_WORKERS", "8") or 8))
+HTTP_POOL_SIZE = max(4, int(os.getenv("HH_HTTP_POOL_SIZE", "32") or 32))
 HTTP_CONNECT_TIMEOUT = max(2, int(os.getenv("HH_HTTP_CONNECT_TIMEOUT", "5") or 5))
 HTTP_READ_TIMEOUT = max(4, int(os.getenv("HH_HTTP_READ_TIMEOUT", "15") or 15))
 HH_API_CONNECT_TIMEOUT = max(2, int(os.getenv("HH_API_CONNECT_TIMEOUT", "3") or 3))
@@ -100,11 +100,11 @@ HH_403_COOLDOWN_SECONDS = max(30.0, float(os.getenv("HH_403_COOLDOWN_SECONDS", "
 HH_BLOCK_FORBIDDEN_SECONDS = max(60, int(os.getenv("HH_BLOCK_FORBIDDEN_SECONDS", "600") or 600))
 HH_BLOCK_RATE_LIMIT_SECONDS = max(60, int(os.getenv("HH_BLOCK_RATE_LIMIT_SECONDS", "300") or 300))
 HH_BLOCK_TRIGGER_COUNT = max(1, int(os.getenv("HH_BLOCK_TRIGGER_COUNT", "3") or 3))
-HH_MAX_REQUESTS_PER_RUN = max(1, int(os.getenv("HH_MAX_REQUESTS_PER_RUN", "1") or 1))
-HH_MAX_QUERY_TASKS_PER_RUN = max(1, int(os.getenv("HH_MAX_QUERY_TASKS_PER_RUN", "1") or 1))
-HH_SAFE_MAX_PAGES = max(1, int(os.getenv("HH_SAFE_MAX_PAGES", "1") or 1))
+HH_MAX_REQUESTS_PER_RUN = max(1, int(os.getenv("HH_MAX_REQUESTS_PER_RUN", "720") or 720))
+HH_MAX_QUERY_TASKS_PER_RUN = max(1, int(os.getenv("HH_MAX_QUERY_TASKS_PER_RUN", "240") or 240))
+HH_SAFE_MAX_PAGES = max(1, int(os.getenv("HH_SAFE_MAX_PAGES", "3") or 3))
 HH_BATCH_DEADLINE_SECONDS = max(5, int(os.getenv("HH_BATCH_DEADLINE_SECONDS", "8") or 8))
-HH_RUN_DEADLINE_SECONDS = max(6, int(os.getenv("HH_RUN_DEADLINE_SECONDS", "10") or 10))
+HH_RUN_DEADLINE_SECONDS = max(6, int(os.getenv("HH_RUN_DEADLINE_SECONDS", "45") or 45))
 LINKEDIN_REQUEST_RETRIES = max(1, int(os.getenv("HH_LINKEDIN_REQUEST_RETRIES", "3") or 3))
 LINKEDIN_RETRY_BASE_DELAY_SECONDS = max(1.0, float(os.getenv("HH_LINKEDIN_RETRY_BASE_DELAY_SECONDS", "2.0") or 2.0))
 LINKEDIN_429_COOLDOWN_SECONDS = max(4.0, float(os.getenv("HH_LINKEDIN_429_COOLDOWN_SECONDS", "12") or 12))
@@ -198,6 +198,7 @@ INTERVAL_OPTIONS = {
 
 MAX_PAGES_OPTIONS = {
     1:  "1 страница",
+    3:  "3 страницы",
 }
 
 PERIOD_OPTIONS = {
@@ -2866,7 +2867,7 @@ def fetch_vacancies(template, on_batch=None, runtime_options=None):
     stopped_early = False
     stop_reason = ""
     if query_exp_tasks:
-        max_workers = 1
+        max_workers = min(HH_SEARCH_WORKERS, len(query_exp_tasks))
         print(
             f"🔧 HH поиск: {len(query_exp_tasks)} комбинаций из {total_task_count}, "
             f"{max_pages} стр./запрос, воркеров {max_workers}, "

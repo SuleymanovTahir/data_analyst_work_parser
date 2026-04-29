@@ -4,7 +4,7 @@
 - OAuth-секреты HH нельзя хранить в репозитории. Использовать только ENV: `HH_CLIENT_ID`, `HH_CLIENT_SECRET`, `HH_REDIRECT_URI`; при необходимости готовый токен можно подать через `HH_ACCESS_TOKEN`/`HH_REFRESH_TOKEN`.
 - Redirect URI приложения HH сейчас указывает на корень сайта, поэтому `/` умеет принять `code/state` и обменять OAuth code на token. Ручной запуск авторизации: `/hh/oauth/start`.
 - Для поиска вакансий достаточно application token через `grant_type=client_credentials`; код получает его автоматически из `HH_CLIENT_ID`/`HH_CLIENT_SECRET`, если `HH_ACCESS_TOKEN` ещё не задан.
-- Авторизованный HH token не отменяет безопасные лимиты поиска. `HH_MAX_REQUESTS_PER_RUN`, короткие timeout и block guard оставлены, чтобы не вернуть старые `403/429` и зависания.
+- Авторизованный HH token позволяет быстро проверять весь шаблон: дефолтные `HH_MAX_QUERY_TASKS_PER_RUN` и `HH_MAX_REQUESTS_PER_RUN` подняты. Block guard на реальные `403/429` оставлен, потому что официальный token не отменяет rate limit HH.
 - `Client Secret`, который был отправлен в чат, считается скомпрометированным: после проверки лучше перевыпустить secret в кабинете HH и обновить ENV на Vercel.
 
 ИЗМЕНЕНИЯ
@@ -12,6 +12,8 @@
 - HH API-запросы к `/areas`, `/dictionaries`, `/vacancies` и `/vacancies/{id}` теперь используют `Authorization: Bearer ...`, если token доступен через ENV или OAuth state.
 - В runtime status добавлено поле `hh_oauth` с флагами `configured`, `authorized`, `has_refresh_token`, `expires_at`, `last_error`.
 - В `vercel.json` добавлены rewrite-маршруты `/hh/oauth/start` и `/hh/oauth/callback`.
+- HH-поиск переключён с диагностического режима на быстрый режим для официального token: до 240 комбинаций шаблон/опыт за запуск, до 720 запросов, до 8 параллельных воркеров и до 3 страниц на запрос.
+- Отображение опыта в шаблонах теперь явно пишет альтернативы через `или`, например `Без опыта или 1–3 года`.
 
 2026-04-20 (HH диагностический fail-fast)
 
