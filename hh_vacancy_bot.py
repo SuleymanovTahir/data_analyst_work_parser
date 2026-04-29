@@ -182,6 +182,13 @@ def _effective_experience_codes(values):
     return selected or [ANY_EXPERIENCE]
 
 
+def _effective_excluded_experience_codes(values):
+    return [
+        code for code in _unique_list(values or [])
+        if code in EXPERIENCE_OPTIONS and code != ANY_EXPERIENCE
+    ]
+
+
 def _join_or_labels(values, empty_text="—"):
     items = [str(value or "").strip() for value in (values or []) if str(value or "").strip()]
     if not items:
@@ -1154,6 +1161,7 @@ def _normalize_template(template):
     tmpl["queries"] = tmpl["queries"] or DEFAULT_QUERIES[:]
 
     tmpl["experience"] = _effective_experience_codes(tmpl.get("experience", [ANY_EXPERIENCE]))
+    tmpl["excluded_experience"] = _effective_excluded_experience_codes(tmpl.get("excluded_experience", []))
 
     tmpl["search_fields"] = _unique_list(tmpl.get("search_fields", ["name", "company_name", "description"]))
     if not tmpl["search_fields"]:
@@ -1166,6 +1174,8 @@ def _normalize_template(template):
 
     tmpl["exclude_keywords"] = [k.strip().lower() for k in tmpl.get("exclude_keywords", DEFAULT_EXCLUDE_KEYWORDS) if k and k.strip()]
     tmpl["include_keywords"] = [k.strip().lower() for k in tmpl.get("include_keywords", []) if k and k.strip()]
+    tmpl["title_include_keywords"] = [k.strip().lower() for k in tmpl.get("title_include_keywords", []) if k and k.strip()]
+    tmpl["title_exclude_keywords"] = [k.strip().lower() for k in tmpl.get("title_exclude_keywords", []) if k and k.strip()]
     tmpl["include_in"] = tmpl.get("include_in", "both")
     tmpl["exclude_in"] = tmpl.get("exclude_in", "both")
     tmpl["work_formats"] = _unique_list(tmpl.get("work_formats", []))
@@ -1799,12 +1809,15 @@ def _template_to_web_payload(template, include_summary=True):
         "queries": list(tmpl.get("queries", [])),
         "search_fields": list(tmpl.get("search_fields", [])),
         "experience": list(tmpl.get("experience", [])),
+        "excluded_experience": list(tmpl.get("excluded_experience", [])),
         "included_area_names": list(tmpl.get("included_area_names", [])),
         "excluded_area_names": list(tmpl.get("excluded_area_names", [])),
         "include_keywords": list(tmpl.get("include_keywords", [])),
         "include_in": tmpl.get("include_in", "both"),
         "exclude_keywords": list(tmpl.get("exclude_keywords", [])),
         "exclude_in": tmpl.get("exclude_in", "both"),
+        "title_include_keywords": list(tmpl.get("title_include_keywords", [])),
+        "title_exclude_keywords": list(tmpl.get("title_exclude_keywords", [])),
         "work_formats": list(tmpl.get("work_formats", [])),
         "area_work_format_rules": list(tmpl.get("area_work_format_rules", [])),
         "area_work_format_rules_text": _area_work_format_rules_text(tmpl.get("area_work_format_rules", [])),
@@ -1879,6 +1892,10 @@ def _build_template_from_payload(payload):
     experience = [item for item in _unique_list(payload.get("experience", [])) if item in experience_allowed]
     if not experience:
         experience = [ANY_EXPERIENCE]
+    excluded_experience = [
+        item for item in _unique_list(payload.get("excluded_experience", []))
+        if item in experience_allowed and item != ANY_EXPERIENCE
+    ]
 
     included_area_names = _split_text_values(payload.get("included_area_names"))
     included_area_ids, included_area_names, not_found_include = _resolve_area_names(included_area_names)
@@ -1917,6 +1934,7 @@ def _build_template_from_payload(payload):
         "queries": queries,
         "search_fields": search_fields,
         "experience": experience,
+        "excluded_experience": excluded_experience,
         "included_area_ids": included_area_ids,
         "included_area_names": included_area_names,
         "excluded_area_ids": excluded_area_ids,
@@ -1925,6 +1943,8 @@ def _build_template_from_payload(payload):
         "include_in": include_in,
         "exclude_keywords": [item.lower() for item in _split_text_values(payload.get("exclude_keywords"))],
         "exclude_in": exclude_in,
+        "title_include_keywords": [item.lower() for item in _split_text_values(payload.get("title_include_keywords"))],
+        "title_exclude_keywords": [item.lower() for item in _split_text_values(payload.get("title_exclude_keywords"))],
         "work_formats": work_formats,
         "area_work_format_rules": area_work_format_rules,
         "employment_types": employment_types,
@@ -2376,6 +2396,33 @@ def find_area_id(name):
         return int(unique_ids[0]["id"])
     return None
 
+
+def _search_area_options(query, limit=20):
+    normalized = re.sub(r"\s+", " ", str(query or "").casefold().replace("ё", "е")).strip()
+    if not normalized:
+        return []
+    by_id, _ = _index_areas()
+    results = []
+    for area_id, area in by_id.items():
+        area_name = str((area or {}).get("name") or "").strip()
+        if not area_name:
+            continue
+        searchable_name = re.sub(r"\s+", " ", area_name.casefold().replace("ё", "е"))
+        if normalized not in searchable_name:
+            continue
+        child_count = len((area or {}).get("areas") or [])
+        score = 0 if searchable_name == normalized else (1 if searchable_name.startswith(normalized) else 2)
+        results.append({
+            "id": str(area_id),
+            "name": area_name,
+            "label": area_name,
+            "type": "country" if child_count else "city",
+            "children_count": child_count,
+            "_score": score,
+        })
+    results.sort(key=lambda item: (item["_score"], item["type"] != "country", item["name"]))
+    return [{k: v for k, v in item.items() if k != "_score"} for item in results[: max(1, int(limit or 20))]]
+
 def _collect_ids(area, ids):
     ids.add(str(area["id"]))
     for sub in area.get("areas", []):
@@ -2444,6 +2491,9 @@ def _empty_filter_stats():
         "scanned": 0,
         "outside_included_regions": 0,
         "excluded_regions": 0,
+        "excluded_by_experience": 0,
+        "missing_title_keywords": 0,
+        "excluded_by_title_keywords": 0,
         "missing_required_keywords": 0,
         "excluded_by_keywords": 0,
         "excluded_by_company_name": 0,
@@ -2468,12 +2518,15 @@ def _format_filter_stats_brief(filter_stats):
         return ""
 
     labels = [
+        ("missing_title_keywords", "без слов в названии"),
+        ("excluded_by_title_keywords", "по словам в названии"),
         ("missing_required_keywords", "без обязательных слов"),
         ("excluded_by_keywords", "по словам в вакансии"),
         ("excluded_by_company_name", "по названию компании"),
         ("excluded_by_work_format", "по формату работы"),
         ("excluded_regions", "по исключённым регионам"),
         ("outside_included_regions", "вне выбранной географии"),
+        ("excluded_by_experience", "по исключённому опыту"),
         ("excluded_by_employment", "по типу занятости"),
         ("excluded_without_salary", "без зарплаты"),
         ("excluded_below_salary", "ниже зарплаты"),
@@ -2562,6 +2615,9 @@ def _fetch_vacancy_batch(
     include_in,
     excl_kw,
     excl_in,
+    title_include_kw,
+    title_exclude_kw,
+    excluded_experience,
     work_formats,
     area_work_format_rules,
     employment_types,
@@ -2683,7 +2739,19 @@ def _fetch_vacancy_batch(
                 filter_stats["excluded_regions"] += 1
                 continue
 
+            experience_id = str((vacancy.get("experience") or {}).get("id") or "")
+            if excluded_experience and experience_id in excluded_experience:
+                filter_stats["excluded_by_experience"] += 1
+                continue
+
             parts = _vacancy_text_parts(vacancy)
+            if title_include_kw and not _keyword_hit(parts, title_include_kw, "title"):
+                filter_stats["missing_title_keywords"] += 1
+                continue
+            if title_exclude_kw and _keyword_hit(parts, title_exclude_kw, "title"):
+                filter_stats["excluded_by_title_keywords"] += 1
+                continue
+
             if include_kw and not _keyword_hit(parts, include_kw, include_in):
                 filter_stats["missing_required_keywords"] += 1
                 continue
@@ -2818,6 +2886,9 @@ def fetch_vacancies(template, on_batch=None, runtime_options=None):
     include_in = template.get("include_in", "both")
     excl_kw = [k.lower() for k in template.get("exclude_keywords", [])]
     excl_in = template.get("exclude_in", "both")
+    title_include_kw = [k.lower() for k in template.get("title_include_keywords", [])]
+    title_exclude_kw = [k.lower() for k in template.get("title_exclude_keywords", [])]
+    excluded_experience = set(_effective_excluded_experience_codes(template.get("excluded_experience", [])))
     work_formats = set(template.get("work_formats", []))
     area_work_format_rules = _compile_area_work_format_rules(template.get("area_work_format_rules", []))
     employment_types = set(template.get("employment_types", []))
@@ -2834,9 +2905,12 @@ def fetch_vacancies(template, on_batch=None, runtime_options=None):
 
     exp_list = _effective_experience_codes(template.get("experience", [ANY_EXPERIENCE]))
     if ANY_EXPERIENCE in exp_list or not exp_list:
-        exp_filters = [None]
+        all_experience = [code for code in EXPERIENCE_OPTIONS.keys() if code != ANY_EXPERIENCE]
+        exp_filters = [code for code in all_experience if code not in excluded_experience] if excluded_experience else [None]
     else:
-        exp_filters = exp_list
+        exp_filters = [code for code in exp_list if code not in excluded_experience]
+    if not exp_filters:
+        exp_filters = [None]
 
     api_sort = sort_by if sort_by in API_SORT_OPTIONS else "publication_time"
     query_exp_tasks = []
@@ -2909,6 +2983,9 @@ def fetch_vacancies(template, on_batch=None, runtime_options=None):
                     include_in,
                     excl_kw,
                     excl_in,
+                    title_include_kw,
+                    title_exclude_kw,
+                    excluded_experience,
                     work_formats,
                     area_work_format_rules,
                     employment_types,
@@ -2963,6 +3040,9 @@ def fetch_vacancies(template, on_batch=None, runtime_options=None):
                         include_in,
                         excl_kw,
                         excl_in,
+                        title_include_kw,
+                        title_exclude_kw,
+                        excluded_experience,
                         work_formats,
                         area_work_format_rules,
                         employment_types,
@@ -3857,11 +3937,14 @@ def _render_result_page(data, session_id, page):
 def _format_template_summary(template, detailed=False):
     template = _normalize_template(template)
     exp_names = [EXPERIENCE_OPTIONS.get(code, code) for code in template.get("experience", [])]
+    excluded_exp_names = [EXPERIENCE_OPTIONS.get(code, code) for code in template.get("excluded_experience", [])]
     search_fields = [SEARCH_FIELD_OPTIONS.get(code, code) for code in template.get("search_fields", [])]
     include_names = template.get("included_area_names", [])
     exclude_names = template.get("excluded_area_names", [])
     include_kw = template.get("include_keywords", [])
     exclude_kw = template.get("exclude_keywords", [])
+    title_include_kw = template.get("title_include_keywords", [])
+    title_exclude_kw = template.get("title_exclude_keywords", [])
     work_formats = [get_work_format_options().get(code, code) for code in template.get("work_formats", [])]
     area_work_format_rules = template.get("area_work_format_rules", [])
     employment_types = [get_employment_options().get(code, code) for code in template.get("employment_types", [])]
@@ -3886,8 +3969,11 @@ def _format_template_summary(template, detailed=False):
         f"Запросов: <b>{len(template.get('queries', []))}</b>",
         f"Поля поиска: {_esc(', '.join(search_fields) or '—')}",
         f"Опыт: {_esc(_join_or_labels(exp_names))}",
+        f"Исключить опыт: {_esc(_join_or_labels(excluded_exp_names, empty_text='нет'))}",
         f"Искать в: {include_text}",
         f"Исключить регионы: {exclude_text}",
+        f"Название содержит: <i>{_esc(', '.join(title_include_kw[:6]) or 'нет')}</i>",
+        f"Название не содержит: <i>{_esc(', '.join(title_exclude_kw[:6]) or 'нет')}</i>",
         f"Включающие слова: <i>{include_kw_preview}</i>",
         f"Где искать включающие слова: {_esc({'title': 'только название', 'description': 'только описание', 'both': 'и название, и описание'}.get(template.get('include_in', 'both'), 'и название, и описание'))}",
         f"Исключающие слова: <i>{exclude_kw_preview}</i>",
@@ -7958,6 +8044,108 @@ def _web_ui_html():
       max-width: 100%;
       overflow-wrap: anywhere;
     }
+    .mode-card {
+      display: grid;
+      gap: 10px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--panel-soft);
+      padding: 14px;
+      min-width: 0;
+    }
+    .mode-card h3 {
+      margin: 0;
+      color: var(--text);
+      font-size: 15px;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    .chip-editor {
+      display: grid;
+      gap: 10px;
+      min-width: 0;
+    }
+    .chip-input-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+    }
+    .chip-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      min-height: 34px;
+      min-width: 0;
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      max-width: 100%;
+      padding: 7px 10px;
+      border: 1px solid var(--line-strong);
+      border-radius: 999px;
+      background: #fff;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 600;
+      overflow-wrap: anywhere;
+    }
+    .chip button {
+      width: 20px;
+      height: 20px;
+      padding: 0;
+      border-radius: 50%;
+      background: var(--danger-soft);
+      color: var(--danger);
+      line-height: 1;
+    }
+    .suggestions {
+      display: none;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fff;
+      max-height: 220px;
+      overflow: auto;
+      box-shadow: var(--shadow);
+    }
+    .suggestions.visible {
+      display: grid;
+    }
+    .suggestion-item {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      cursor: pointer;
+    }
+    .suggestion-item:last-child {
+      border-bottom: 0;
+    }
+    .suggestion-item:hover {
+      background: var(--accent-soft);
+    }
+    .suggestion-kind {
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .hidden-field {
+      display: none;
+    }
+    .result-controls {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .result-controls select {
+      width: auto;
+      min-width: 110px;
+    }
     .field-row {
       display: flex;
       flex-wrap: wrap;
@@ -8228,17 +8416,9 @@ def _web_ui_html():
     <section class="app-header">
       <div class="app-header-main">
         <span class="eyebrow">HH.ru</span>
-        <h1>Поиск вакансий</h1>
-        <p>
-          Панель построена по логике HH: слева мои шаблоны и фильтры, справа текущий шаблон,
-          автопроверка, результаты поиска и пагинация. Все ключевые действия доступны без Telegram.
-        </p>
+        <h1>Шаблоны поиска</h1>
       </div>
       <div class="app-header-side">
-        <div class="header-note">
-          <strong>Что видно сразу:</strong> текущий шаблон, автопроверка, результаты, ошибки и переход по страницам.
-          Если данные не загрузятся, страница покажет явную ошибку вместо бесконечного <code>Загрузка...</code>.
-        </div>
         <div id="tokenBox" class="token-box">
           <input id="authToken" type="text" placeholder="Токен доступа для панели">
           <button id="saveTokenBtn" class="primary" type="button">Сохранить токен</button>
@@ -8255,7 +8435,6 @@ def _web_ui_html():
         <div class="sidebar-head">
           <div>
             <h2>Мои шаблоны</h2>
-            <p>Шаблон — это сохранённый набор фильтров. Текущий шаблон — тот, который используется сейчас.</p>
           </div>
           <button id="newSearchBtn" class="primary" type="button">Создать шаблон</button>
         </div>
@@ -8266,7 +8445,6 @@ def _web_ui_html():
           <div class="section-head">
             <div>
               <h2>Основное</h2>
-              <p>Базовые параметры шаблона: название, запросы и опыт.</p>
             </div>
           </div>
           <div class="filters-grid">
@@ -8285,9 +8463,15 @@ def _web_ui_html():
                 Запросы и синонимы
                 <textarea id="queries" placeholder="По одному на строке или через запятую"></textarea>
               </label>
-              <div class="field" style="margin-top: 14px;">
-                Опыт работы
-                <div id="experienceGroup" class="check-grid"></div>
+              <div class="grid-2">
+                <div class="mode-card">
+                  <h3>Искать только с опытом</h3>
+                  <div id="experienceGroup" class="check-grid"></div>
+                </div>
+                <div class="mode-card">
+                  <h3>Исключить опыт</h3>
+                  <div id="excludedExperienceGroup" class="check-grid"></div>
+                </div>
               </div>
           </div>
         </section>
@@ -8296,20 +8480,19 @@ def _web_ui_html():
           <div class="section-head">
             <div>
               <h2>География</h2>
-              <p>Включайте страны и города, исключайте отдельные регионы и сразу видьте подсказки по вводу.</p>
             </div>
           </div>
           <div class="grid-2">
-            <label class="field">
-              Включить регионы
-              <textarea id="includedAreas" placeholder="Например: Грузия, Казахстан, Тбилиси"></textarea>
-              <small>Если оставить пустым, поиск идёт по всем регионам.</small>
-            </label>
-            <label class="field">
-              Исключить регионы
-              <textarea id="excludedAreas" placeholder="Например: Россия, Москва"></textarea>
-              <small>Если исключаете страну, её города тоже исключаются автоматически.</small>
-            </label>
+            <div class="mode-card">
+              <h3>Искать только в странах или городах</h3>
+              <textarea id="includedAreas" class="hidden-field"></textarea>
+              <div id="includedAreaEditor" class="chip-editor"></div>
+            </div>
+            <div class="mode-card">
+              <h3>Исключить страны или города</h3>
+              <textarea id="excludedAreas" class="hidden-field"></textarea>
+              <div id="excludedAreaEditor" class="chip-editor"></div>
+            </div>
           </div>
           <div class="summary-box" id="areaHint"></div>
         </section>
@@ -8317,19 +8500,32 @@ def _web_ui_html():
         <section class="panel filter-panel">
           <div class="section-head">
             <div>
-              <h2>Слова и исключения</h2>
-              <p>Уточняйте поиск обязательными словами, исключайте лишние темы и компании.</p>
+              <h2>Название и содержание</h2>
             </div>
           </div>
               <div class="grid-2">
-                <label class="field">
-                  Обязательные слова
-                  <textarea id="includeKeywords" placeholder="Например: sql, python, retention"></textarea>
-                </label>
-                <label class="field">
-                  Исключающие слова
-                  <textarea id="excludeKeywords" placeholder="Например: casino, betting, sportsbook"></textarea>
-                </label>
+                <div class="mode-card">
+                  <h3>Название содержит</h3>
+                  <textarea id="titleIncludeKeywords" class="hidden-field"></textarea>
+                  <div id="titleIncludeEditor" class="chip-editor"></div>
+                </div>
+                <div class="mode-card">
+                  <h3>Название не содержит</h3>
+                  <textarea id="titleExcludeKeywords" class="hidden-field"></textarea>
+                  <div id="titleExcludeEditor" class="chip-editor"></div>
+                </div>
+              </div>
+              <div class="grid-2">
+                <div class="mode-card">
+                  <h3>В вакансии содержится</h3>
+                  <textarea id="includeKeywords" class="hidden-field"></textarea>
+                  <div id="includeKeywordEditor" class="chip-editor"></div>
+                </div>
+                <div class="mode-card">
+                  <h3>В вакансии не содержится</h3>
+                  <textarea id="excludeKeywords" class="hidden-field"></textarea>
+                  <div id="excludeKeywordEditor" class="chip-editor"></div>
+                </div>
               </div>
               <div class="grid-2" style="margin-top: 14px;">
                 <label class="field">
@@ -8359,7 +8555,6 @@ def _web_ui_html():
           <div class="section-head">
             <div>
               <h2>Формат работы и зарплата</h2>
-              <p>Выберите формат, занятость и ограничения по зарплате.</p>
             </div>
           </div>
               <div class="field">
@@ -8394,7 +8589,6 @@ def _web_ui_html():
           <div class="section-head">
             <div>
               <h2>Выдача и расписание</h2>
-              <p>Настройте сортировку, глубину поиска, размер страницы и интервал автопроверки.</p>
             </div>
           </div>
               <div class="grid-4">
@@ -8429,7 +8623,6 @@ def _web_ui_html():
           <div class="section-head">
             <div>
               <h2>Управление шаблоном</h2>
-              <p>Сохраните изменения, сделайте шаблон текущим или очистите историю отправок.</p>
             </div>
           </div>
           <div class="actions">
@@ -8447,7 +8640,6 @@ def _web_ui_html():
           <div class="section-head">
             <div>
               <h2>Текущий шаблон и автопроверка</h2>
-              <p>Текущий шаблон — это выбранный набор фильтров. Автопроверка — его автоматический запуск по расписанию.</p>
             </div>
           </div>
           <div class="status-grid">
@@ -8484,9 +8676,18 @@ def _web_ui_html():
           <div class="results-toolbar">
             <div>
               <h2>Результаты поиска</h2>
-              <div id="resultsMeta" class="hint">После проверки найденные вакансии появятся именно в этом блоке.</div>
+              <div id="resultsMeta" class="hint">Результатов пока нет.</div>
             </div>
-            <div class="pager">
+            <div class="result-controls">
+              <label class="field">
+                На странице
+                <select id="resultsPageSize">
+                  <option value="5">5</option>
+                  <option value="10">10</option>
+                  <option value="20">20</option>
+                  <option value="50">50</option>
+                </select>
+              </label>
               <span id="resultsPage" class="hint"></span>
               <div class="actions">
                 <button id="resultsPrev" class="ghost" type="button">Назад</button>
@@ -8511,7 +8712,9 @@ def _web_ui_html():
       selectedTemplateId: '',
       result: null,
       resultPage: 0,
+      resultPageSize: Number(localStorage.getItem('hh_result_page_size') || 10),
       authToken: localStorage.getItem('hh_web_admin_token') || '',
+      chipEditors: {},
     };
 
     const els = {};
@@ -8525,6 +8728,127 @@ def _web_ui_html():
         .split(/[\\n,;]+/)
         .map((item) => item.trim())
         .filter(Boolean);
+    }
+
+    function setHiddenValues(hiddenEl, values) {
+      hiddenEl.value = Array.from(new Set((values || []).map((item) => String(item || '').trim()).filter(Boolean))).join('\\n');
+    }
+
+    function hiddenValues(hiddenEl) {
+      return splitValues(hiddenEl.value);
+    }
+
+    function createChipEditor(editorEl, hiddenEl, options = {}) {
+      editorEl.innerHTML = (
+        '<div class="chip-input-row">' +
+          '<input type="text" class="chip-input" placeholder="' + escapeHtml(options.placeholder || 'Введите значение') + '">' +
+          '<button type="button" class="secondary chip-add">Добавить</button>' +
+        '</div>' +
+        '<div class="suggestions"></div>' +
+        '<div class="chip-list"></div>'
+      );
+      const input = editorEl.querySelector('.chip-input');
+      const addBtn = editorEl.querySelector('.chip-add');
+      const listEl = editorEl.querySelector('.chip-list');
+      const suggestionsEl = editorEl.querySelector('.suggestions');
+      let searchSeq = 0;
+
+      function values() {
+        return hiddenValues(hiddenEl);
+      }
+
+      function setValues(nextValues) {
+        setHiddenValues(hiddenEl, nextValues);
+        render();
+      }
+
+      function addValue(rawValue) {
+        const value = String(rawValue || input.value || '').trim();
+        if (!value) {
+          return;
+        }
+        setValues(values().concat([value]));
+        input.value = '';
+        suggestionsEl.classList.remove('visible');
+        suggestionsEl.innerHTML = '';
+      }
+
+      function removeValue(value) {
+        setValues(values().filter((item) => item !== value));
+      }
+
+      function render() {
+        const current = values();
+        if (!current.length) {
+          listEl.innerHTML = '<span class="hint">' + escapeHtml(options.emptyText || 'Ничего не выбрано') + '</span>';
+          return;
+        }
+        listEl.innerHTML = current.map((value) => (
+          '<span class="chip">' +
+            '<span>' + escapeHtml(value) + '</span>' +
+            '<button type="button" aria-label="Удалить" data-value="' + escapeHtml(value) + '">x</button>' +
+          '</span>'
+        )).join('');
+      }
+
+      async function searchAreas() {
+        if (options.kind !== 'area') {
+          return;
+        }
+        const query = input.value.trim();
+        searchSeq += 1;
+        const seq = searchSeq;
+        if (query.length < 2) {
+          suggestionsEl.classList.remove('visible');
+          suggestionsEl.innerHTML = '';
+          return;
+        }
+        try {
+          const payload = await api('/api/web-areas?q=' + encodeURIComponent(query));
+          if (seq !== searchSeq) {
+            return;
+          }
+          const items = payload.items || [];
+          if (!items.length) {
+            suggestionsEl.innerHTML = '<div class="suggestion-item"><span>Не найдено</span></div>';
+            suggestionsEl.classList.add('visible');
+            return;
+          }
+          suggestionsEl.innerHTML = items.map((item) => (
+            '<div class="suggestion-item" data-name="' + escapeHtml(item.name) + '">' +
+              '<span>' + escapeHtml(item.name) + '</span>' +
+              '<span class="suggestion-kind">' + (item.type === 'country' ? 'страна' : 'город') + '</span>' +
+            '</div>'
+          )).join('');
+          suggestionsEl.classList.add('visible');
+        } catch (error) {
+          suggestionsEl.classList.remove('visible');
+          suggestionsEl.innerHTML = '';
+        }
+      }
+
+      addBtn.addEventListener('click', () => addValue());
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          addValue();
+        }
+      });
+      input.addEventListener('input', searchAreas);
+      listEl.addEventListener('click', (event) => {
+        const button = event.target.closest('button[data-value]');
+        if (button) {
+          removeValue(button.dataset.value);
+        }
+      });
+      suggestionsEl.addEventListener('click', (event) => {
+        const item = event.target.closest('.suggestion-item[data-name]');
+        if (item) {
+          addValue(item.dataset.name);
+        }
+      });
+      render();
+      return { render, setValues, values };
     }
 
     function escapeHtml(value) {
@@ -8675,7 +8999,7 @@ def _web_ui_html():
       els.statusChat.textContent = status.chat_configured ? 'Чат подключён' : 'Чат ещё не подключён';
       els.statusLastCheck.textContent = formatDate(status.last_check);
       els.toggleBtn.textContent = status.searching ? 'Поставить на паузу' : 'Включить автопроверку';
-      els.areaHint.textContent = 'Подсказка: популярные регионы для быстрого ввода — ' + state.data.options.popular_areas.join(', ');
+      els.areaHint.textContent = '';
     }
 
     function renderTemplateList() {
@@ -8734,10 +9058,14 @@ def _web_ui_html():
       els.queries.value = (current.queries || []).join('\\n');
       renderMultiSelect(els.searchFields, options.search_fields, current.search_fields || []);
       renderCheckGroup(els.experienceGroup, options.experience, current.experience || []);
+      renderCheckGroup(els.excludedExperienceGroup, options.experience.filter((item) => item.id !== 'any'), current.excluded_experience || []);
       els.includedAreas.value = (current.included_area_names || []).join('\\n');
       els.excludedAreas.value = (current.excluded_area_names || []).join('\\n');
       els.includeKeywords.value = (current.include_keywords || []).join('\\n');
       els.excludeKeywords.value = (current.exclude_keywords || []).join('\\n');
+      els.titleIncludeKeywords.value = (current.title_include_keywords || []).join('\\n');
+      els.titleExcludeKeywords.value = (current.title_exclude_keywords || []).join('\\n');
+      Object.values(state.chipEditors).forEach((editor) => editor && editor.render && editor.render());
       els.includeIn.value = current.include_in || 'both';
       els.excludeIn.value = current.exclude_in || 'both';
       els.excludedEmployers.value = (current.excluded_employers || []).join('\\n');
@@ -8762,12 +9090,15 @@ def _web_ui_html():
         queries: splitValues(els.queries.value),
         search_fields: Array.from(els.searchFields.selectedOptions).map((option) => option.value),
         experience: readCheckedValues(els.experienceGroup),
+        excluded_experience: readCheckedValues(els.excludedExperienceGroup),
         included_area_names: splitValues(els.includedAreas.value),
         excluded_area_names: splitValues(els.excludedAreas.value),
         include_keywords: splitValues(els.includeKeywords.value),
         include_in: els.includeIn.value,
         exclude_keywords: splitValues(els.excludeKeywords.value),
         exclude_in: els.excludeIn.value,
+        title_include_keywords: splitValues(els.titleIncludeKeywords.value),
+        title_exclude_keywords: splitValues(els.titleExcludeKeywords.value),
         work_formats: readCheckedValues(els.workFormatsGroup),
         area_work_format_rules_text: els.areaWorkFormats.value,
         employment_types: readCheckedValues(els.employmentGroup),
@@ -8786,7 +9117,7 @@ def _web_ui_html():
     function renderResults() {
       const result = state.result;
       if (!result) {
-        els.resultsMeta.textContent = 'После проверки найденные вакансии появятся именно в этом блоке.';
+        els.resultsMeta.textContent = 'Результатов пока нет.';
         els.resultsList.innerHTML = '<div class="empty-results">Нажмите «Проверить сейчас» или «Предпросмотр», чтобы увидеть результаты здесь.</div>';
         els.resultsPage.textContent = '';
         els.resultsPrev.disabled = true;
@@ -8794,7 +9125,7 @@ def _web_ui_html():
         return;
       }
 
-      const pageSize = Math.max(1, Number(result.page_size || 5));
+      const pageSize = Math.max(1, Number(state.resultPageSize || result.page_size || 10));
       const vacancies = result.vacancies || [];
       const pageCount = Math.max(1, Math.ceil(vacancies.length / pageSize));
       if (state.resultPage >= pageCount) {
@@ -9014,6 +9345,12 @@ def _web_ui_html():
         state.resultPage += 1;
         renderResults();
       });
+      els.resultsPageSize.addEventListener('change', () => {
+        state.resultPageSize = Math.max(1, Number(els.resultsPageSize.value || 10));
+        localStorage.setItem('hh_result_page_size', String(state.resultPageSize));
+        state.resultPage = 0;
+        renderResults();
+      });
       els.saveTokenBtn.addEventListener('click', async () => {
         state.authToken = els.authToken.value.trim();
         localStorage.setItem('hh_web_admin_token', state.authToken);
@@ -9045,11 +9382,20 @@ def _web_ui_html():
       els.queries = qs('queries');
       els.searchFields = qs('searchFields');
       els.experienceGroup = qs('experienceGroup');
+      els.excludedExperienceGroup = qs('excludedExperienceGroup');
       els.includedAreas = qs('includedAreas');
       els.excludedAreas = qs('excludedAreas');
+      els.includedAreaEditor = qs('includedAreaEditor');
+      els.excludedAreaEditor = qs('excludedAreaEditor');
       els.areaHint = qs('areaHint');
       els.includeKeywords = qs('includeKeywords');
       els.excludeKeywords = qs('excludeKeywords');
+      els.titleIncludeKeywords = qs('titleIncludeKeywords');
+      els.titleExcludeKeywords = qs('titleExcludeKeywords');
+      els.titleIncludeEditor = qs('titleIncludeEditor');
+      els.titleExcludeEditor = qs('titleExcludeEditor');
+      els.includeKeywordEditor = qs('includeKeywordEditor');
+      els.excludeKeywordEditor = qs('excludeKeywordEditor');
       els.includeIn = qs('includeIn');
       els.excludeIn = qs('excludeIn');
       els.excludedEmployers = qs('excludedEmployers');
@@ -9075,6 +9421,35 @@ def _web_ui_html():
       els.resultsPrev = qs('resultsPrev');
       els.resultsNext = qs('resultsNext');
       els.resultsPage = qs('resultsPage');
+      els.resultsPageSize = qs('resultsPageSize');
+      els.resultsPageSize.value = String(state.resultPageSize);
+
+      state.chipEditors.includedAreas = createChipEditor(els.includedAreaEditor, els.includedAreas, {
+        kind: 'area',
+        placeholder: 'Страна или город',
+        emptyText: 'Все страны и города'
+      });
+      state.chipEditors.excludedAreas = createChipEditor(els.excludedAreaEditor, els.excludedAreas, {
+        kind: 'area',
+        placeholder: 'Страна или город',
+        emptyText: 'Нет исключений'
+      });
+      state.chipEditors.titleInclude = createChipEditor(els.titleIncludeEditor, els.titleIncludeKeywords, {
+        placeholder: 'Текст в названии',
+        emptyText: 'Нет обязательного текста'
+      });
+      state.chipEditors.titleExclude = createChipEditor(els.titleExcludeEditor, els.titleExcludeKeywords, {
+        placeholder: 'Текст в названии',
+        emptyText: 'Нет исключений'
+      });
+      state.chipEditors.includeKeywords = createChipEditor(els.includeKeywordEditor, els.includeKeywords, {
+        placeholder: 'Навык или слово',
+        emptyText: 'Нет обязательных слов'
+      });
+      state.chipEditors.excludeKeywords = createChipEditor(els.excludeKeywordEditor, els.excludeKeywords, {
+        placeholder: 'Слово для исключения',
+        emptyText: 'Нет исключений'
+      });
 
       if (TOKEN_REQUIRED) {
         els.tokenBox.classList.add('visible');
@@ -9279,6 +9654,13 @@ if FastAPI is not None:
             return _web_unauthorized_response()
         data = load_data()
         return {"ok": True, "state": _build_web_state(data)}
+
+    @app.get("/api/web/areas")
+    @app.get("/api/web-areas")
+    def api_web_areas(request: Request, q: str = ""):
+        if not _web_request_authorized(request):
+            return _web_unauthorized_response()
+        return {"ok": True, "items": _search_area_options(q, limit=24)}
 
     @app.post("/api/web/template/save")
     @app.post("/api/web-template-save")
