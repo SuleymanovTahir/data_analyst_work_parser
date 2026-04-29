@@ -102,6 +102,9 @@ HH_BLOCK_RATE_LIMIT_SECONDS = max(60, int(os.getenv("HH_BLOCK_RATE_LIMIT_SECONDS
 HH_BLOCK_TRIGGER_COUNT = max(1, int(os.getenv("HH_BLOCK_TRIGGER_COUNT", "3") or 3))
 HH_MAX_REQUESTS_PER_RUN = max(1, int(os.getenv("HH_MAX_REQUESTS_PER_RUN", "720") or 720))
 HH_MAX_QUERY_TASKS_PER_RUN = max(1, int(os.getenv("HH_MAX_QUERY_TASKS_PER_RUN", "240") or 240))
+HH_PUBLIC_MAX_REQUESTS_PER_RUN = max(1, int(os.getenv("HH_PUBLIC_MAX_REQUESTS_PER_RUN", "60") or 60))
+HH_PUBLIC_MAX_QUERY_TASKS_PER_RUN = max(1, int(os.getenv("HH_PUBLIC_MAX_QUERY_TASKS_PER_RUN", "20") or 20))
+HH_PUBLIC_SEARCH_WORKERS = max(1, int(os.getenv("HH_PUBLIC_SEARCH_WORKERS", "2") or 2))
 HH_SAFE_MAX_PAGES = max(1, int(os.getenv("HH_SAFE_MAX_PAGES", "3") or 3))
 HH_BATCH_DEADLINE_SECONDS = max(5, int(os.getenv("HH_BATCH_DEADLINE_SECONDS", "8") or 8))
 HH_RUN_DEADLINE_SECONDS = max(6, int(os.getenv("HH_RUN_DEADLINE_SECONDS", "45") or 45))
@@ -2625,6 +2628,7 @@ def _fetch_vacancy_batch(
     salary_min,
     excluded_employers,
     unrestricted_hh_token_search=False,
+    auth_data=None,
 ):
     collected = []
     seen_ids = set()
@@ -2675,7 +2679,7 @@ def _fetch_vacancy_batch(
                 if not unrestricted_hh_token_search:
                     _wait_hh_backoff()
                 requests_made += 1
-                response = _hh_request_get("/vacancies", params=params, timeout=_hh_http_timeout())
+                response = _hh_request_get("/vacancies", params=params, timeout=_hh_http_timeout(), data=auth_data)
                 status_code = int(response.status_code or 0)
                 if status_code in (403, 429, 500, 502, 503, 504):
                     response.raise_for_status()
@@ -2856,8 +2860,11 @@ def fetch_vacancies(template, on_batch=None, runtime_options=None):
     template = _normalize_template(template)
     runtime_options = runtime_options or {}
     unrestricted_hh_token_search = bool(runtime_options.get("unrestricted_hh_token_search"))
+    auth_data = runtime_options.get("auth_data") if isinstance(runtime_options.get("auth_data"), dict) else None
     task_cursor = max(0, int(runtime_options.get("task_cursor", 0) or 0))
     task_limit = max(1, int(runtime_options.get("task_limit", HH_MAX_QUERY_TASKS_PER_RUN) or HH_MAX_QUERY_TASKS_PER_RUN))
+    request_limit = max(1, int(runtime_options.get("request_limit", HH_MAX_REQUESTS_PER_RUN) or HH_MAX_REQUESTS_PER_RUN))
+    max_workers_limit = max(1, int(runtime_options.get("max_workers", HH_SEARCH_WORKERS) or HH_SEARCH_WORKERS))
     runtime_key = str(runtime_options.get("runtime_key") or "")
     if runtime_key:
         template["_hh_runtime_key"] = runtime_key
@@ -2949,11 +2956,11 @@ def fetch_vacancies(template, on_batch=None, runtime_options=None):
     stopped_early = False
     stop_reason = ""
     if query_exp_tasks:
-        max_workers = min(HH_SEARCH_WORKERS, len(query_exp_tasks))
+        max_workers = min(max_workers_limit, len(query_exp_tasks))
         print(
             f"🔧 HH поиск: {len(query_exp_tasks)} комбинаций из {total_task_count}, "
             f"{max_pages} стр./запрос, воркеров {max_workers}, "
-            f"лимит запросов {HH_MAX_REQUESTS_PER_RUN}, окно с позиции {safe_cursor + 1}"
+            f"лимит запросов {request_limit}, окно с позиции {safe_cursor + 1}"
         )
         if max_workers <= 1:
             for query, exp in query_exp_tasks:
@@ -2963,9 +2970,9 @@ def fetch_vacancies(template, on_batch=None, runtime_options=None):
                     print(f"⚠️ {stop_reason}")
                     errors.append(stop_reason)
                     break
-                if not unrestricted_hh_token_search and requests_made >= HH_MAX_REQUESTS_PER_RUN:
+                if not unrestricted_hh_token_search and requests_made >= request_limit:
                     stopped_early = True
-                    stop_reason = f"Достигнут безопасный лимит запросов HH за один запуск ({HH_MAX_REQUESTS_PER_RUN})."
+                    stop_reason = f"Достигнут безопасный лимит запросов HH за один запуск ({request_limit})."
                     print(f"⚠️ {stop_reason}")
                     errors.append(stop_reason)
                     break
@@ -2993,6 +3000,7 @@ def fetch_vacancies(template, on_batch=None, runtime_options=None):
                     salary_min,
                     excluded_employers,
                     unrestricted_hh_token_search=unrestricted_hh_token_search,
+                    auth_data=auth_data,
                 )
                 requests_made += int(batch.get("requests_made", 0) or 0)
                 errors.extend(batch.get("errors", []))
@@ -3050,6 +3058,7 @@ def fetch_vacancies(template, on_batch=None, runtime_options=None):
                         salary_min,
                         excluded_employers,
                         unrestricted_hh_token_search=unrestricted_hh_token_search,
+                        auth_data=auth_data,
                     ): (query, exp)
                     for query, exp in query_exp_tasks
                 }
@@ -3095,9 +3104,9 @@ def fetch_vacancies(template, on_batch=None, runtime_options=None):
                                 pending_future.cancel()
                             break
                         continue
-                    if not unrestricted_hh_token_search and requests_made >= HH_MAX_REQUESTS_PER_RUN:
+                    if not unrestricted_hh_token_search and requests_made >= request_limit:
                         stopped_early = True
-                        stop_reason = f"Достигнут безопасный лимит запросов HH за один запуск ({HH_MAX_REQUESTS_PER_RUN})."
+                        stop_reason = f"Достигнут безопасный лимит запросов HH за один запуск ({request_limit})."
                         print(f"⚠️ {stop_reason}")
                         errors.append(stop_reason)
                         for pending_future in future_map:
@@ -4058,12 +4067,12 @@ def _friendly_fetch_error_summary(fetch_errors):
     if "HH не ответил вовремя" in joined or "HH отвечает слишком медленно" in joined:
         return "HH не ответил вовремя. Я остановил запуск раньше, чтобы бот не зависал."
     if "ограничил запросы (403)" in joined:
-        return "HH вернул 403. Похоже, HH временно ограничил запросы с этого источника."
+        return "HH вернул 403. Public-поиск временно ограничен с этого источника; подключите HH OAuth в панели или добавьте HH_ACCESS_TOKEN в ENV."
     if "ограничил частоту запросов (429)" in joined:
         return "HH вернул 429. Похоже, HH временно ограничил частоту запросов."
     if "Достигнут безопасный лимит запросов HH" in joined:
-        return "Для HH сработал безопасный лимит. В этом запуске я сделал только один HH-запрос."
-    return f"Ошибка запроса: <code>{_esc('; '.join(fetch_errors[:2]))}</code>"
+        return "Для HH сработал безопасный лимит. В этом запуске я проверил только часть HH-запросов."
+    return f"Ошибка запроса: {'; '.join(str(item) for item in fetch_errors[:2])}"
 
 
 def wizard_start(chat_id, data, template_id=None):
@@ -5058,22 +5067,19 @@ def _set_current_source(data, source):
 def _execute_search_result(data, tmpl, persist=True):
     _ensure_hh_oauth_token_fresh(data)
     hh_access_token = _hh_access_token_from_state(data)
-    if not hh_access_token:
-        oauth = _normalize_hh_oauth_state(data.get("hh_oauth"))
-        detail = oauth.get("last_error") or "HH access token недоступен."
-        return {
-            "fetched_vacancies": [],
-            "visible_vacancies": [],
-            "errors": [
-                "HH OAuth не авторизован. Добавьте готовый HH_ACCESS_TOKEN в ENV "
-                f"или повторите OAuth-подключение. Детали: {detail}"
-            ],
-            "filter_stats": _empty_filter_stats(),
-            "hh_temporarily_blocked": False,
-        }
 
     runtime_options = _hh_runtime_options(data, tmpl, advance_cursor=bool(persist))
-    runtime_options["unrestricted_hh_token_search"] = bool(hh_access_token)
+    runtime_options["auth_data"] = data
+    if hh_access_token:
+        runtime_options["unrestricted_hh_token_search"] = True
+    else:
+        runtime_options["unrestricted_hh_token_search"] = False
+        runtime_options["task_limit"] = min(
+            max(1, int(runtime_options.get("task_limit", HH_PUBLIC_MAX_QUERY_TASKS_PER_RUN) or HH_PUBLIC_MAX_QUERY_TASKS_PER_RUN)),
+            HH_PUBLIC_MAX_QUERY_TASKS_PER_RUN,
+        )
+        runtime_options["request_limit"] = HH_PUBLIC_MAX_REQUESTS_PER_RUN
+        runtime_options["max_workers"] = HH_PUBLIC_SEARCH_WORKERS
     result = fetch_vacancies(tmpl, runtime_options=runtime_options)
     fetched_vacancies = result.get("vacancies", [])
     fetch_errors = list(result.get("errors", []))
@@ -9273,6 +9279,7 @@ def _web_ui_html():
             <button id="toggleBtn" class="secondary" type="button">Пауза автопроверки</button>
             <button id="runBtn" class="primary" type="button">Проверить сейчас</button>
             <button id="previewBtn" class="ghost" type="button">Предпросмотр</button>
+            <button id="connectHhBtn" class="ghost" type="button">Подключить HH</button>
           </div>
           <div class="summary-shell">
             <div class="summary-title">Сводка шаблона</div>
@@ -9603,11 +9610,14 @@ def _web_ui_html():
 
     function renderStatus() {
       const status = state.data.status;
+      const hhOauth = status.hh_oauth || {};
       els.statusSearch.textContent = status.searching ? 'Автопроверка включена' : 'Автопроверка на паузе';
       els.statusTemplate.textContent = status.active_template_name || 'не выбран';
       els.statusChat.textContent = status.chat_configured ? 'Чат подключён' : 'Чат ещё не подключён';
       els.statusLastCheck.textContent = formatDate(status.last_check);
       els.toggleBtn.textContent = status.searching ? 'Поставить на паузу' : 'Включить автопроверку';
+      els.connectHhBtn.textContent = hhOauth.authorized ? 'HH подключён' : 'Подключить HH';
+      els.connectHhBtn.disabled = !hhOauth.configured || !!hhOauth.authorized;
       els.areaHint.textContent = '';
     }
 
@@ -9958,6 +9968,9 @@ def _web_ui_html():
       els.toggleBtn.addEventListener('click', () => toggleSearching().catch((error) => showMessage(error.message, 'error')));
       els.runBtn.addEventListener('click', () => runSearch(true).catch((error) => showMessage(error.message, 'error')));
       els.previewBtn.addEventListener('click', () => runSearch(false).catch((error) => showMessage(error.message, 'error')));
+      els.connectHhBtn.addEventListener('click', () => {
+        window.location.href = '/hh/oauth/start';
+      });
       els.newSearchBtn.addEventListener('click', createNewTemplate);
       els.saveBtn.addEventListener('click', () => saveTemplate(false).catch((error) => showMessage(error.message, 'error')));
       els.saveActivateBtn.addEventListener('click', () => saveTemplate(true).catch((error) => showMessage(error.message, 'error')));
@@ -10010,6 +10023,7 @@ def _web_ui_html():
       els.refreshBtn = qs('refreshBtn');
       els.runBtn = qs('runBtn');
       els.previewBtn = qs('previewBtn');
+      els.connectHhBtn = qs('connectHhBtn');
       els.newSearchBtn = qs('newSearchBtn');
       els.templateList = qs('templateList');
       els.name = qs('name');
