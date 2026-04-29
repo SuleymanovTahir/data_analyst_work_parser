@@ -9183,6 +9183,8 @@ if FastAPI is not None:
             return _handle_hh_oauth_callback(request)
         return HTMLResponse(_web_ui_html())
 
+    @app.get("/oauth-start")
+    @app.get("/api/oauth-start")
     @app.get("/hh/oauth/start")
     @app.get("/api/hh/oauth/start")
     def api_hh_oauth_start(request: Request):
@@ -9215,6 +9217,8 @@ if FastAPI is not None:
         }
         return RedirectResponse(f"{HH_OAUTH_AUTHORIZE_URL}?{urlencode(params)}", status_code=302)
 
+    @app.get("/oauth-callback")
+    @app.get("/api/oauth-callback")
     @app.get("/hh/oauth/callback")
     @app.get("/api/hh/oauth/callback")
     def api_hh_oauth_callback(request: Request):
