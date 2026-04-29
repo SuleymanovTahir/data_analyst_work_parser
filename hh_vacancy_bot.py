@@ -4971,6 +4971,19 @@ def _set_current_source(data, source):
 
 def _execute_search_result(data, tmpl, persist=True):
     _ensure_hh_oauth_token_fresh(data)
+    if not _hh_access_token_from_state(data):
+        oauth = _normalize_hh_oauth_state(data.get("hh_oauth"))
+        detail = oauth.get("last_error") or "HH access token недоступен."
+        return {
+            "fetched_vacancies": [],
+            "visible_vacancies": [],
+            "errors": [
+                "HH OAuth не авторизован. Добавьте готовый HH_ACCESS_TOKEN в ENV "
+                f"или повторите OAuth-подключение. Детали: {detail}"
+            ],
+            "filter_stats": _empty_filter_stats(),
+            "hh_temporarily_blocked": False,
+        }
     hh_block_message = _hh_guard_before_search(data)
     if hh_block_message:
         save_data(data)
