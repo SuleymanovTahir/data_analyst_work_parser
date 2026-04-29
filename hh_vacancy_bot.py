@@ -8409,6 +8409,223 @@ def _web_ui_html():
         width: 100%;
       }
     }
+    .page {
+      max-width: 1480px;
+      padding: 14px 16px 28px;
+    }
+    body {
+      background: #eef3f8;
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+    .app-header,
+    .panel,
+    .stat-card {
+      border-radius: 12px;
+      box-shadow: 0 10px 28px rgba(29, 45, 73, 0.07);
+    }
+    .app-header {
+      grid-template-columns: minmax(0, 1fr) auto;
+      padding: 14px 16px;
+      margin-bottom: 12px;
+    }
+    .app-header h1 {
+      font-size: 24px;
+      letter-spacing: 0;
+    }
+    .eyebrow,
+    button,
+    input[type="text"],
+    input[type="number"],
+    textarea,
+    select,
+    .check-pill,
+    .chip,
+    .mode-card,
+    .template-card,
+    .summary-box,
+    .empty-results,
+    .result-card,
+    .meta-pill,
+    .result-link,
+    .message,
+    .token-box,
+    .suggestions {
+      border-radius: 9px;
+    }
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(0, 1.08fr) minmax(420px, 0.92fr);
+      gap: 14px;
+      align-items: start;
+    }
+    .sidebar-column,
+    .content-column,
+    .overview-panel,
+    .results-panel,
+    .save-panel,
+    .filter-panel,
+    .scenario-panel {
+      gap: 12px;
+    }
+    .content-column {
+      position: sticky;
+      top: 12px;
+      max-height: calc(100vh - 24px);
+      overflow: auto;
+    }
+    .panel {
+      padding: 14px;
+    }
+    .panel h2,
+    .sidebar-head h2,
+    .section-head h2,
+    .results-toolbar h2 {
+      font-size: 18px;
+      letter-spacing: 0;
+    }
+    .section-head,
+    .sidebar-head,
+    .results-toolbar {
+      align-items: center;
+    }
+    .editor-tabs {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .editor-tab {
+      min-height: 42px;
+      border: 1px solid var(--line-strong);
+      background: #fff;
+      color: var(--muted);
+      padding: 9px 10px;
+    }
+    .editor-tab.active {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #fff;
+    }
+    .sidebar-column .filter-panel {
+      display: none;
+    }
+    .sidebar-column .filter-panel.active-panel {
+      display: grid;
+    }
+    .save-panel {
+      position: sticky;
+      bottom: 10px;
+      z-index: 5;
+      border-color: #c8d6ea;
+    }
+    .template-list {
+      max-height: 228px;
+    }
+    .template-card {
+      padding: 12px;
+    }
+    .template-card h4 {
+      font-size: 14px;
+    }
+    .template-meta {
+      font-size: 12px;
+    }
+    .grid-2,
+    .grid-4 {
+      gap: 12px;
+    }
+    .grid-4 {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    .mode-card {
+      padding: 12px;
+      background: #f8fafc;
+    }
+    .mode-card h3 {
+      font-size: 14px;
+    }
+    label.field {
+      gap: 6px;
+    }
+    input[type="text"],
+    input[type="number"],
+    textarea,
+    select {
+      padding: 9px 10px;
+    }
+    textarea {
+      min-height: 86px;
+    }
+    select[multiple] {
+      min-height: 96px;
+    }
+    .chip-input-row {
+      grid-template-columns: minmax(0, 1fr) auto;
+    }
+    .chip-list {
+      gap: 6px;
+      max-height: 166px;
+      overflow: auto;
+      padding-right: 2px;
+    }
+    .chip {
+      padding: 6px 8px;
+      font-size: 12px;
+    }
+    .chip button {
+      width: 18px;
+      height: 18px;
+      border-radius: 6px;
+    }
+    .check-grid {
+      gap: 8px;
+    }
+    .check-pill {
+      padding: 8px 10px;
+    }
+    .summary-box {
+      max-height: 170px;
+      font-size: 13px;
+      padding: 12px;
+    }
+    .overview-panel .summary-shell {
+      display: none;
+    }
+    .stat-card {
+      min-height: 72px;
+      padding: 12px;
+    }
+    .stat-card strong {
+      font-size: 11px;
+      margin-bottom: 7px;
+    }
+    .stat-value {
+      font-size: 15px;
+    }
+    .result-card {
+      padding: 14px;
+      background: #fff;
+    }
+    .result-card h4 {
+      font-size: 17px;
+    }
+    .empty-results {
+      padding: 16px;
+    }
+    @media (max-width: 1180px) {
+      .workspace,
+      .app-header,
+      .editor-tabs {
+        grid-template-columns: 1fr;
+      }
+      .content-column,
+      .save-panel {
+        position: static;
+        max-height: none;
+        overflow: visible;
+      }
+    }
   </style>
 </head>
 <body>
@@ -8428,6 +8645,14 @@ def _web_ui_html():
     </section>
 
     <div id="messageBox" class="message"></div>
+
+    <nav class="editor-tabs" aria-label="Разделы редактора">
+      <button class="editor-tab active" type="button" data-panel-index="0">Основное</button>
+      <button class="editor-tab" type="button" data-panel-index="1">География</button>
+      <button class="editor-tab" type="button" data-panel-index="2">Слова</button>
+      <button class="editor-tab" type="button" data-panel-index="3">Формат</button>
+      <button class="editor-tab" type="button" data-panel-index="4">Выдача</button>
+    </nav>
 
     <section class="workspace">
       <aside class="sidebar-column">
@@ -8713,6 +8938,7 @@ def _web_ui_html():
       result: null,
       resultPage: 0,
       resultPageSize: Number(localStorage.getItem('hh_result_page_size') || 10),
+      activeEditorPanel: Number(localStorage.getItem('hh_active_editor_panel') || 0),
       authToken: localStorage.getItem('hh_web_admin_token') || '',
       chipEditors: {},
     };
@@ -9002,6 +9228,23 @@ def _web_ui_html():
       els.areaHint.textContent = '';
     }
 
+    function renderEditorPanels() {
+      const panels = Array.from(document.querySelectorAll('.sidebar-column > .filter-panel'));
+      const tabs = Array.from(document.querySelectorAll('.editor-tab'));
+      if (!panels.length) {
+        return;
+      }
+      if (state.activeEditorPanel < 0 || state.activeEditorPanel >= panels.length) {
+        state.activeEditorPanel = 0;
+      }
+      panels.forEach((panel, index) => {
+        panel.classList.toggle('active-panel', index === state.activeEditorPanel);
+      });
+      tabs.forEach((tab) => {
+        tab.classList.toggle('active', Number(tab.dataset.panelIndex) === state.activeEditorPanel);
+      });
+    }
+
     function renderTemplateList() {
       const templates = currentTemplates();
       if (!templates.length) {
@@ -9191,6 +9434,7 @@ def _web_ui_html():
       renderTemplateList();
       fillForm(getSelectedTemplate() || state.data.active_template || state.data.new_template);
       renderResults();
+      renderEditorPanels();
     }
 
     async function loadState(preferredTemplateId) {
@@ -9360,6 +9604,13 @@ def _web_ui_html():
         } catch (error) {
           showMessage(error.message, 'error');
         }
+      });
+      document.querySelectorAll('.editor-tab').forEach((tab) => {
+        tab.addEventListener('click', () => {
+          state.activeEditorPanel = Number(tab.dataset.panelIndex || 0);
+          localStorage.setItem('hh_active_editor_panel', String(state.activeEditorPanel));
+          renderEditorPanels();
+        });
       });
     }
 
