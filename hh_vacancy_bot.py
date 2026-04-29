@@ -2566,6 +2566,7 @@ def _fetch_vacancy_batch(
     only_with_salary,
     salary_min,
     excluded_employers,
+    unrestricted_hh_token_search=False,
 ):
     collected = []
     seen_ids = set()
@@ -2580,8 +2581,11 @@ def _fetch_vacancy_batch(
     batch_started_at = time.monotonic()
     exp_label = EXPERIENCE_OPTIONS.get(exp, "любой опыт") if exp else "любой опыт"
 
-    for page in range(max_pages):
-        if (time.monotonic() - batch_started_at) >= HH_BATCH_DEADLINE_SECONDS:
+    page = 0
+    while True:
+        if not unrestricted_hh_token_search and page >= max_pages:
+            break
+        if not unrestricted_hh_token_search and (time.monotonic() - batch_started_at) >= HH_BATCH_DEADLINE_SECONDS:
             error_text = _format_hh_request_error(query, exp_label, page, None, "__hh_batch_deadline__")
             print(f"⚠️ HH батч остановлен по дедлайну: {error_text}")
             errors.append(error_text)
@@ -2589,7 +2593,7 @@ def _fetch_vacancy_batch(
         params = {
             "text": query,
             "search_field": search_fields,
-            "per_page": 50,
+            "per_page": 100 if unrestricted_hh_token_search else 50,
             "page": page,
             "order_by": api_sort,
             "enable_snippets": "true",
@@ -2604,13 +2608,14 @@ def _fetch_vacancy_batch(
 
         data = None
         for attempt in range(HH_REQUEST_RETRIES + 1):
-            if (time.monotonic() - batch_started_at) >= HH_BATCH_DEADLINE_SECONDS:
+            if not unrestricted_hh_token_search and (time.monotonic() - batch_started_at) >= HH_BATCH_DEADLINE_SECONDS:
                 error_text = _format_hh_request_error(query, exp_label, page, None, "__hh_batch_deadline__")
                 print(f"⚠️ HH батч остановлен по дедлайну: {error_text}")
                 errors.append(error_text)
                 break
             try:
-                _wait_hh_backoff()
+                if not unrestricted_hh_token_search:
+                    _wait_hh_backoff()
                 requests_made += 1
                 response = _hh_request_get("/vacancies", params=params, timeout=_hh_http_timeout())
                 status_code = int(response.status_code or 0)
@@ -2642,7 +2647,7 @@ def _fetch_vacancy_batch(
                 error_text = _format_hh_request_error(query, exp_label, page, status_code, str(e))
                 print(f"❌ Ошибка запроса hh.ru: {error_text}")
                 errors.append(error_text)
-                if status_code in (403, 429):
+                if status_code in (403, 429) and not unrestricted_hh_token_search:
                     blocked = True
                     blocked_reason = error_text
                     blocked_seconds = HH_BLOCK_FORBIDDEN_SECONDS if status_code == 403 else HH_BLOCK_RATE_LIMIT_SECONDS
@@ -2652,7 +2657,6 @@ def _fetch_vacancy_batch(
                 print(f"❌ Ошибка запроса hh.ru: {error_text}")
                 errors.append(error_text)
                 break
-
         if data is None:
             break
 
@@ -2731,6 +2735,7 @@ def _fetch_vacancy_batch(
         total_pages = data.get("pages", 1)
         if page >= total_pages - 1:
             break
+        page += 1
 
     return {
         "vacancies": collected,
@@ -2744,6 +2749,8 @@ def _fetch_vacancy_batch(
 
 
 def _merge_priority_vacancies(sorted_vacancies, priority_ids, max_results):
+    if max_results is None:
+        max_results = len(sorted_vacancies)
     if not priority_ids:
         return sorted_vacancies[:max_results]
 
@@ -2778,6 +2785,7 @@ def _merge_priority_vacancies(sorted_vacancies, priority_ids, max_results):
 def fetch_vacancies(template, on_batch=None, runtime_options=None):
     template = _normalize_template(template)
     runtime_options = runtime_options or {}
+    unrestricted_hh_token_search = bool(runtime_options.get("unrestricted_hh_token_search"))
     task_cursor = max(0, int(runtime_options.get("task_cursor", 0) or 0))
     task_limit = max(1, int(runtime_options.get("task_limit", HH_MAX_QUERY_TASKS_PER_RUN) or HH_MAX_QUERY_TASKS_PER_RUN))
     runtime_key = str(runtime_options.get("runtime_key") or "")
@@ -2816,12 +2824,10 @@ def fetch_vacancies(template, on_batch=None, runtime_options=None):
     excluded_employers = [name.lower() for name in template.get("excluded_employers", [])]
     sort_by = template.get("sort", "publication_time")
     queries = template.get("queries", DEFAULT_QUERIES)
-    max_pages = min(
-        max(1, int(template.get("max_pages", 1) or 1)),
-        HH_SAFE_MAX_PAGES,
-    )
+    requested_max_pages = max(1, int(template.get("max_pages", 1) or 1))
+    max_pages = requested_max_pages if unrestricted_hh_token_search else min(requested_max_pages, HH_SAFE_MAX_PAGES)
     period_days = max(0, int(template.get("period_days", 0) or 0))
-    max_results = int(template.get("max_results", 50) or 50)
+    max_results = None if unrestricted_hh_token_search else int(template.get("max_results", 50) or 50)
     search_fields = template.get("search_fields", ["name", "company_name", "description"])
 
     exp_list = _effective_experience_codes(template.get("experience", [ANY_EXPERIENCE]))
@@ -2847,7 +2853,7 @@ def fetch_vacancies(template, on_batch=None, runtime_options=None):
     total_task_count = len(query_exp_tasks)
     selected_task_count = total_task_count
     safe_cursor = 0
-    if total_task_count > task_limit:
+    if not unrestricted_hh_token_search and total_task_count > task_limit:
         safe_cursor = task_cursor % total_task_count
         rotated_tasks = query_exp_tasks[safe_cursor:] + query_exp_tasks[:safe_cursor]
         selected_task_count = min(task_limit, len(rotated_tasks))
@@ -2875,13 +2881,13 @@ def fetch_vacancies(template, on_batch=None, runtime_options=None):
         )
         if max_workers <= 1:
             for query, exp in query_exp_tasks:
-                if (time.monotonic() - started_at_mono) >= HH_RUN_DEADLINE_SECONDS:
+                if not unrestricted_hh_token_search and (time.monotonic() - started_at_mono) >= HH_RUN_DEADLINE_SECONDS:
                     stopped_early = True
                     stop_reason = "HH отвечает слишком медленно. Я остановил этот запуск раньше, чтобы бот не зависал."
                     print(f"⚠️ {stop_reason}")
                     errors.append(stop_reason)
                     break
-                if requests_made >= HH_MAX_REQUESTS_PER_RUN:
+                if not unrestricted_hh_token_search and requests_made >= HH_MAX_REQUESTS_PER_RUN:
                     stopped_early = True
                     stop_reason = f"Достигнут безопасный лимит запросов HH за один запуск ({HH_MAX_REQUESTS_PER_RUN})."
                     print(f"⚠️ {stop_reason}")
@@ -2907,6 +2913,7 @@ def fetch_vacancies(template, on_batch=None, runtime_options=None):
                     only_with_salary,
                     salary_min,
                     excluded_employers,
+                    unrestricted_hh_token_search=unrestricted_hh_token_search,
                 )
                 requests_made += int(batch.get("requests_made", 0) or 0)
                 errors.extend(batch.get("errors", []))
@@ -2922,7 +2929,7 @@ def fetch_vacancies(template, on_batch=None, runtime_options=None):
                                 priority_ids.append(vacancy_id)
                     except Exception as e:
                         print(f"⚠️ Ошибка live-выдачи вакансий: {e}")
-                if batch.get("blocked"):
+                if batch.get("blocked") and not unrestricted_hh_token_search:
                     blocked_batches += 1
                     blocked_reason = str(batch.get("blocked_reason") or "")
                     blocked_seconds = max(0, int(batch.get("blocked_seconds", 0) or 0))
@@ -2960,6 +2967,7 @@ def fetch_vacancies(template, on_batch=None, runtime_options=None):
                         only_with_salary,
                         salary_min,
                         excluded_employers,
+                        unrestricted_hh_token_search=unrestricted_hh_token_search,
                     ): (query, exp)
                     for query, exp in query_exp_tasks
                 }
@@ -2989,7 +2997,7 @@ def fetch_vacancies(template, on_batch=None, runtime_options=None):
                                     priority_ids.append(vacancy_id)
                         except Exception as e:
                             print(f"⚠️ Ошибка live-выдачи вакансий: {e}")
-                    if batch.get("blocked"):
+                    if batch.get("blocked") and not unrestricted_hh_token_search:
                         blocked_batches += 1
                         blocked_reason = str(batch.get("blocked_reason") or "")
                         blocked_seconds = max(0, int(batch.get("blocked_seconds", 0) or 0))
@@ -3005,7 +3013,7 @@ def fetch_vacancies(template, on_batch=None, runtime_options=None):
                                 pending_future.cancel()
                             break
                         continue
-                    if requests_made >= HH_MAX_REQUESTS_PER_RUN:
+                    if not unrestricted_hh_token_search and requests_made >= HH_MAX_REQUESTS_PER_RUN:
                         stopped_early = True
                         stop_reason = f"Достигнут безопасный лимит запросов HH за один запуск ({HH_MAX_REQUESTS_PER_RUN})."
                         print(f"⚠️ {stop_reason}")
@@ -4903,11 +4911,6 @@ def cmd_templates(chat_id, data, page=0):
 def cmd_run(chat_id, data):
     data["chat_id"] = chat_id
     _set_current_source(data, "hh")
-    hh_block_message = _hh_guard_before_search(data)
-    if hh_block_message:
-        save_data(data)
-        send_msg(chat_id, hh_block_message, reply_markup=_current_search_keyboard(data))
-        return
     save_data(data)
     tmpl = _active_template(data)
     if not tmpl:
@@ -4932,11 +4935,6 @@ def cmd_run(chat_id, data):
 def cmd_preview(chat_id, data):
     data["chat_id"] = chat_id
     _set_current_source(data, "hh")
-    hh_block_message = _hh_guard_before_search(data)
-    if hh_block_message:
-        save_data(data)
-        send_msg(chat_id, hh_block_message, reply_markup=_current_search_keyboard(data))
-        return
     save_data(data)
     tmpl = _active_template(data)
     if not tmpl:
@@ -4971,7 +4969,8 @@ def _set_current_source(data, source):
 
 def _execute_search_result(data, tmpl, persist=True):
     _ensure_hh_oauth_token_fresh(data)
-    if not _hh_access_token_from_state(data):
+    hh_access_token = _hh_access_token_from_state(data)
+    if not hh_access_token:
         oauth = _normalize_hh_oauth_state(data.get("hh_oauth"))
         detail = oauth.get("last_error") or "HH access token недоступен."
         return {
@@ -4984,18 +4983,9 @@ def _execute_search_result(data, tmpl, persist=True):
             "filter_stats": _empty_filter_stats(),
             "hh_temporarily_blocked": False,
         }
-    hh_block_message = _hh_guard_before_search(data)
-    if hh_block_message:
-        save_data(data)
-        return {
-            "fetched_vacancies": [],
-            "visible_vacancies": [],
-            "errors": [hh_block_message],
-            "filter_stats": _empty_filter_stats(),
-            "hh_temporarily_blocked": True,
-        }
 
     runtime_options = _hh_runtime_options(data, tmpl, advance_cursor=bool(persist))
+    runtime_options["unrestricted_hh_token_search"] = bool(hh_access_token)
     result = fetch_vacancies(tmpl, runtime_options=runtime_options)
     fetched_vacancies = result.get("vacancies", [])
     fetch_errors = list(result.get("errors", []))
@@ -5005,7 +4995,7 @@ def _execute_search_result(data, tmpl, persist=True):
     sent_ids = _template_sent_ids(data, tmpl["id"])
     sent_set = set(sent_ids)
 
-    if result.get("hh_blocked"):
+    if result.get("hh_blocked") and not hh_access_token:
         latest_data = load_data()
         _hh_set_temporary_block(
             latest_data,
@@ -5050,6 +5040,24 @@ def _execute_search_result(data, tmpl, persist=True):
 
 def _run_search_live(chat_id, data, tmpl):
     _ensure_hh_oauth_token_fresh(data)
+    hh_access_token = _hh_access_token_from_state(data)
+    if not hh_access_token:
+        oauth = _normalize_hh_oauth_state(data.get("hh_oauth"))
+        detail = oauth.get("last_error") or "HH access token недоступен."
+        send_msg(
+            chat_id,
+            "HH OAuth не авторизован. Добавьте готовый HH_ACCESS_TOKEN в ENV "
+            f"или повторите OAuth-подключение. Детали: {_esc(detail)}",
+            reply_markup=_current_search_keyboard(data),
+        )
+        return {
+            "total_found": 0,
+            "sent_now": 0,
+            "new_count": 0,
+            "persist": True,
+            "errors": [detail],
+            "hh_temporarily_blocked": False,
+        }
     initial_sent_ids = list(_template_sent_ids(data, tmpl["id"]))
     initial_sent_set = set(initial_sent_ids)
     instant_limit = max(1, int(tmpl.get("delivery_page_size", 5) or 5))
@@ -5161,6 +5169,7 @@ def _run_search_live(chat_id, data, tmpl):
         return newly_streamed_ids
 
     runtime_options = _hh_runtime_options(data, tmpl, advance_cursor=True)
+    runtime_options["unrestricted_hh_token_search"] = bool(hh_access_token)
     result = fetch_vacancies(tmpl, on_batch=_on_batch, runtime_options=runtime_options)
     fetched_vacancies = result.get("vacancies", [])
     fetch_errors = list(result.get("errors", []))
@@ -5168,7 +5177,7 @@ def _run_search_live(chat_id, data, tmpl):
     hh_window_note = _hh_window_note(result)
     hh_temporarily_blocked = False
 
-    if result.get("hh_blocked"):
+    if result.get("hh_blocked") and not hh_access_token:
         latest_block_data = load_data()
         _hh_set_temporary_block(
             latest_block_data,
@@ -5375,15 +5384,6 @@ def run_manual_search_tick(persist=True):
         return {"ok": False, "status": "skipped", "reason": "no_active_template"}
     if _is_run_in_progress(data):
         return {"ok": False, "status": "skipped", "reason": "run_in_progress"}
-    hh_block_message = _hh_guard_before_search(data)
-    if hh_block_message:
-        save_data(data)
-        return {
-            "ok": False,
-            "status": "skipped",
-            "reason": "hh_temporarily_blocked",
-            "message": hh_block_message,
-        }
 
     _set_run_in_progress(data, True, mode="run" if persist else "preview")
     save_data(data)
@@ -7527,15 +7527,6 @@ def run_scheduled_search_tick(force=False):
     tmpl = _active_template(data)
     if not tmpl:
         return {"ok": False, "status": "skipped", "reason": "no_active_template"}
-    hh_block_message = _hh_guard_before_search(data)
-    if hh_block_message:
-        save_data(data)
-        return {
-            "ok": False,
-            "status": "skipped",
-            "reason": "hh_temporarily_blocked",
-            "message": hh_block_message,
-        }
 
     interval = tmpl.get("interval", 30) * 60
     last_chk = data.get("last_check", 0)
