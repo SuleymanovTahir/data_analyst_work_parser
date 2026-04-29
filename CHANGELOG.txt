@@ -16,7 +16,7 @@
 - Отображение опыта в шаблонах теперь явно пишет альтернативы через `или`, например `Без опыта или 1–3 года`.
 - Если после redeploy постоянный `HH_ACCESS_TOKEN` не задан, а HH временно запрещает повторную выдачу application token, поиск теперь сразу показывает ошибку OAuth вместо серии неавторизованных запросов к `/vacancies`.
 - Для Vercel добавлены одноуровневые OAuth aliases `/api/oauth-start` и `/api/oauth-callback`: nested `/api/hh/oauth/start` на Python functions может отдавать 404, поэтому rewrite `/hh/oauth/start` теперь ведёт на одноуровневый endpoint.
-- Для HH-поиска с access token сняты внутренние ограничения: игнорируется старый `hh_block_until`, не применяется окно `HH_MAX_QUERY_TASKS_PER_RUN`, не применяется `HH_MAX_REQUESTS_PER_RUN`, не режется выдача по `max_results`, страницы читаются до конца ответа HH. LinkedIn-логика не менялась.
+- Для HH-поиска с access token сняты внутренние ограничения: игнорируется старый `hh_block_until`, status не показывает HH как заблокированный при наличии token, не применяется окно `HH_MAX_QUERY_TASKS_PER_RUN`, не применяется `HH_MAX_REQUESTS_PER_RUN`, не режется выдача по `max_results`, страницы читаются до конца ответа HH. LinkedIn-логика не менялась.
 
 2026-04-20 (HH диагностический fail-fast)
 

@@ -1572,6 +1572,8 @@ def _hh_clear_temporary_block(data):
 
 
 def _hh_is_temporarily_blocked(data):
+    if _hh_access_token_from_state(data):
+        return False
     remaining = _hh_block_remaining_seconds(data)
     if remaining > 0:
         return True
