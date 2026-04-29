@@ -181,6 +181,13 @@ def _effective_experience_codes(values):
         selected = [code for code in selected if code != ANY_EXPERIENCE]
     return selected or [ANY_EXPERIENCE]
 
+
+def _join_or_labels(values, empty_text="—"):
+    items = [str(value or "").strip() for value in (values or []) if str(value or "").strip()]
+    if not items:
+        return empty_text
+    return " или ".join(items)
+
 INTERVAL_OPTIONS = {
     15:  "15 мин",
     30:  "30 мин",
@@ -3867,7 +3874,7 @@ def _format_template_summary(template, detailed=False):
         f"<b>{_esc(template.get('name', 'Новый поиск'))}</b>",
         f"Запросов: <b>{len(template.get('queries', []))}</b>",
         f"Поля поиска: {_esc(', '.join(search_fields) or '—')}",
-        f"Опыт: {_esc(', '.join(exp_names) or '—')}",
+        f"Опыт: {_esc(_join_or_labels(exp_names))}",
         f"Искать в: {include_text}",
         f"Исключить регионы: {exclude_text}",
         f"Включающие слова: <i>{include_kw_preview}</i>",
@@ -4872,7 +4879,7 @@ def cmd_templates(chat_id, data, page=0):
             f"<b>{index}. {_esc(t['name'])}</b>\n"
             f"Что ищем: {_esc(_compact_preview(t.get('queries', []), limit=2, empty_text='—'))}\n"
             f"Где ищем: {_esc(geo_text)}\n"
-            f"Опыт: {_esc(', '.join(exp_names[:2]) or 'Не важно')}\n"
+            f"Опыт: {_esc(_join_or_labels(exp_names[:2], empty_text='Не важно'))}\n"
             f"Формат: {_esc(', '.join(work_formats[:2]) or 'Любой')}\n"
             f"Статус: {status_text}\n\n"
         )
@@ -8540,6 +8547,18 @@ def _web_ui_html():
       return shown;
     }
 
+    function previewOrList(values, emptyText, limit = 2) {
+      const items = (values || []).filter(Boolean);
+      if (!items.length) {
+        return emptyText;
+      }
+      const shown = items.slice(0, limit).join(' или ');
+      if (items.length > limit) {
+        return shown + ' +' + (items.length - limit);
+      }
+      return shown;
+    }
+
     function formatDate(ts) {
       if (!ts) {
         return 'ещё не запускался';
@@ -8678,7 +8697,7 @@ def _web_ui_html():
         const meta = [
           'Что ищем: ' + ((template.queries || []).slice(0, 2).join(', ') || '—'),
           'Где ищем: ' + geographyText,
-          'Опыт: ' + previewList(experienceLabels, 'Не важно'),
+          'Опыт: ' + previewOrList(experienceLabels, 'Не важно'),
           'Формат: ' + previewList(workFormatLabels, 'Любой'),
           'Формат по регионам: ' + previewList(areaRuleLabels, 'нет'),
           isActive ? 'Сейчас используется как текущий шаблон' : 'Сохранён как отдельный шаблон'
