@@ -48,10 +48,17 @@
 Подробная отдельная инструкция:
   ДЕПЛОЙ_VERCEL.txt
 
-Главная команда production-деплоя через Vercel CLI:
+Главная команда production-деплоя через Vercel CLI.
+Важно запускать её из корня проекта, не из домашней папки:
+  cd /Users/tahir/Desktop/data_analyst_work
   npx vercel deploy --prod --yes
 
-Если деплой настроен через GitHub/Vercel Git Integration, после коммита достаточно запушить актуальную ветку:
+То же самое одной строкой:
+  cd /Users/tahir/Desktop/data_analyst_work && npx vercel deploy --prod --yes
+
+Если запустить `npx vercel deploy --prod --yes` из `~`, Vercel будет пытаться деплоить домашнюю папку и может упасть на служебных файлах вроде `/Users/tahir/.viminfo`.
+
+Если деплой настроен через GitHub/Vercel Git Integration, после коммита достаточно запушить актуальную ветку из корня проекта:
   git push origin main
 
 Если рабочая копия находится в detached HEAD, используйте:
