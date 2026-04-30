@@ -107,6 +107,7 @@ HH_PUBLIC_MAX_QUERY_TASKS_PER_RUN = max(1, int(os.getenv("HH_PUBLIC_MAX_QUERY_TA
 HH_PUBLIC_SEARCH_WORKERS = max(1, int(os.getenv("HH_PUBLIC_SEARCH_WORKERS", "2") or 2))
 HH_TOKEN_EXPIRY_WARNING_DAYS = max(1, int(os.getenv("HH_TOKEN_EXPIRY_WARNING_DAYS", "10") or 10))
 HH_TOKEN_EXPIRY_WARNING_SECONDS = HH_TOKEN_EXPIRY_WARNING_DAYS * 24 * 60 * 60
+HH_TOKEN_EXPIRY_NOTICE_INTERVAL_SECONDS = max(3600, int(os.getenv("HH_TOKEN_EXPIRY_NOTICE_INTERVAL_SECONDS", str(12 * 60 * 60)) or (12 * 60 * 60)))
 HH_SAFE_MAX_PAGES = max(1, int(os.getenv("HH_SAFE_MAX_PAGES", "3") or 3))
 HH_BATCH_DEADLINE_SECONDS = max(5, int(os.getenv("HH_BATCH_DEADLINE_SECONDS", "8") or 8))
 HH_RUN_DEADLINE_SECONDS = max(6, int(os.getenv("HH_RUN_DEADLINE_SECONDS", "45") or 45))
@@ -634,12 +635,28 @@ def _hh_oauth_ready():
     return bool(HH_CLIENT_ID and HH_CLIENT_SECRET)
 
 
-def _hh_access_token_from_state(data=None):
+def _hh_raw_access_token_from_state(data=None):
     if HH_ACCESS_TOKEN:
         return HH_ACCESS_TOKEN
     source = data if isinstance(data, dict) else _state_local_snapshot
     normalized = _normalize_hh_oauth_state((source or {}).get("hh_oauth") if isinstance(source, dict) else None)
     return normalized.get("access_token", "")
+
+
+def _hh_stored_token_expired(data=None):
+    if HH_ACCESS_TOKEN:
+        return False
+    source = data if isinstance(data, dict) else _state_local_snapshot
+    normalized = _normalize_hh_oauth_state((source or {}).get("hh_oauth") if isinstance(source, dict) else None)
+    expires_at = float(normalized.get("expires_at") or 0)
+    return bool(normalized.get("access_token") and expires_at and expires_at <= time.time())
+
+
+def _hh_access_token_from_state(data=None):
+    token = _hh_raw_access_token_from_state(data)
+    if token and _hh_stored_token_expired(data):
+        return ""
+    return token
 
 
 def _hh_auth_headers(data=None):
@@ -787,7 +804,8 @@ def _ensure_hh_oauth_token_fresh(data):
 
 def _hh_token_expiry_status(data=None):
     oauth = _normalize_hh_oauth_state((data or {}).get("hh_oauth") if isinstance(data, dict) else None)
-    access_token = _hh_access_token_from_state(data)
+    access_token = _hh_raw_access_token_from_state(data)
+    usable_token = _hh_access_token_from_state(data)
     expires_at = 0 if HH_ACCESS_TOKEN else int(float(oauth.get("expires_at") or 0))
     now = int(time.time())
     remaining_seconds = expires_at - now if expires_at else 0
@@ -797,6 +815,7 @@ def _hh_token_expiry_status(data=None):
     expires_soon = bool(access_token and expires_at and remaining_seconds > 0 and remaining_seconds <= HH_TOKEN_EXPIRY_WARNING_SECONDS)
     return {
         "authorized": bool(access_token),
+        "usable": bool(usable_token),
         "expires_at": expires_at,
         "expires_at_text": expires_at_text,
         "remaining_seconds": max(0, remaining_seconds),
@@ -804,6 +823,7 @@ def _hh_token_expiry_status(data=None):
         "expired": expired,
         "expires_soon": expires_soon,
         "warning_days": HH_TOKEN_EXPIRY_WARNING_DAYS,
+        "notice_interval_seconds": HH_TOKEN_EXPIRY_NOTICE_INTERVAL_SECONDS,
         "last_expiry_warning_date": oauth.get("last_expiry_warning_date") or "",
         "last_expiry_warning_at": int(float(oauth.get("last_expiry_warning_at") or 0)),
     }
@@ -825,7 +845,7 @@ def _hh_token_expiry_notice_text(status):
     if status.get("expired"):
         return (
             f"HH OAuth token истёк {expires_at_text}. "
-            "Перед запуском поиска обновите подключение HH на странице /hh/token-status."
+            "Запускаю HH в безопасном public-режиме без token. Обновить подключение можно на странице /hh/token-status."
         )
     if status.get("expires_soon"):
         days_left = int(status.get("remaining_days") or 0)
@@ -837,10 +857,6 @@ def _hh_token_expiry_notice_text(status):
     return ""
 
 
-def _hh_token_expiry_warning_date():
-    return datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d")
-
-
 def _hh_token_expiry_notice_for_search(data, mark=True):
     if not isinstance(data, dict):
         return ""
@@ -850,13 +866,14 @@ def _hh_token_expiry_notice_for_search(data, mark=True):
         return ""
     if status.get("expired"):
         return notice
-    today = _hh_token_expiry_warning_date()
     oauth = _normalize_hh_oauth_state(data.get("hh_oauth"))
-    if oauth.get("last_expiry_warning_date") == today:
+    now = time.time()
+    last_warning_at = float(oauth.get("last_expiry_warning_at") or 0)
+    if last_warning_at and now - last_warning_at < HH_TOKEN_EXPIRY_NOTICE_INTERVAL_SECONDS:
         return ""
     if mark:
-        oauth["last_expiry_warning_date"] = today
-        oauth["last_expiry_warning_at"] = time.time()
+        oauth["last_expiry_warning_date"] = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+        oauth["last_expiry_warning_at"] = now
         data["hh_oauth"] = oauth
         save_data(data)
     return notice
@@ -5131,6 +5148,7 @@ def cmd_status(chat_id, data):
 
 def cmd_status_source(chat_id, data, source):
     data["chat_id"] = chat_id
+    _set_current_source(data, source)
     save_data(data)
     meta = _auto_source_meta(data, source)
     tmpl = meta["template"]
@@ -5158,6 +5176,7 @@ def cmd_status_source(chat_id, data, source):
 
 def cmd_toggle_source(chat_id, data, source, enabled):
     data["chat_id"] = chat_id
+    _set_current_source(data, source)
     meta = _auto_source_meta(data, source)
     tmpl = meta["template"]
     if not tmpl:
@@ -5309,17 +5328,6 @@ def _execute_search_result(data, tmpl, persist=True):
         save_data(data)
     token_status = _hh_token_expiry_status(data)
     token_notice = _hh_token_expiry_notice_for_search(data, mark=True)
-    if token_status.get("expired"):
-        return {
-            "fetched_vacancies": [],
-            "visible_vacancies": [],
-            "errors": [token_notice],
-            "filter_stats": _empty_filter_stats(),
-            "hh_window_note": "",
-            "hh_temporarily_blocked": False,
-            "hh_token_expired": True,
-            "token_notice": token_notice,
-        }
 
     runtime_options = _hh_runtime_options(data, tmpl, advance_cursor=bool(persist))
     runtime_options["auth_data"] = data
@@ -5383,7 +5391,7 @@ def _execute_search_result(data, tmpl, persist=True):
         "filter_stats": filter_stats,
         "hh_window_note": hh_window_note,
         "hh_temporarily_blocked": hh_temporarily_blocked,
-        "hh_token_expired": False,
+        "hh_token_expired": bool(token_status.get("expired")),
         "token_notice": token_notice,
     }
 
@@ -5395,21 +5403,9 @@ def _run_search_live(chat_id, data, tmpl):
         save_data(data)
     token_status = _hh_token_expiry_status(data)
     token_notice = _hh_token_expiry_notice_for_search(data, mark=True)
-    if token_status.get("expired"):
-        send_msg(chat_id, _esc(token_notice), reply_markup=_current_search_keyboard(data))
-        return {
-            "total_found": 0,
-            "sent_now": 0,
-            "new_count": 0,
-            "persist": True,
-            "errors": [token_notice],
-            "hh_temporarily_blocked": False,
-            "hh_token_expired": True,
-            "token_notice": token_notice,
-        }
     if token_notice:
         send_msg(chat_id, _esc(token_notice))
-    if not hh_access_token:
+    if not hh_access_token and not token_status.get("expired"):
         oauth = _normalize_hh_oauth_state(data.get("hh_oauth"))
         detail = oauth.get("last_error") or "HH access token недоступен."
         send_msg(
@@ -5540,6 +5536,13 @@ def _run_search_live(chat_id, data, tmpl):
 
     runtime_options = _hh_runtime_options(data, tmpl, advance_cursor=True)
     runtime_options["unrestricted_hh_token_search"] = bool(hh_access_token)
+    if not hh_access_token:
+        runtime_options["task_limit"] = min(
+            max(1, int(runtime_options.get("task_limit", HH_PUBLIC_MAX_QUERY_TASKS_PER_RUN) or HH_PUBLIC_MAX_QUERY_TASKS_PER_RUN)),
+            HH_PUBLIC_MAX_QUERY_TASKS_PER_RUN,
+        )
+        runtime_options["request_limit"] = HH_PUBLIC_MAX_REQUESTS_PER_RUN
+        runtime_options["max_workers"] = HH_PUBLIC_SEARCH_WORKERS
     result = fetch_vacancies(tmpl, on_batch=_on_batch, runtime_options=runtime_options)
     fetched_vacancies = result.get("vacancies", [])
     fetch_errors = list(result.get("errors", []))
@@ -5596,7 +5599,7 @@ def _run_search_live(chat_id, data, tmpl):
             "persist": True,
             "errors": fetch_errors,
             "hh_temporarily_blocked": hh_temporarily_blocked,
-            "hh_token_expired": False,
+            "hh_token_expired": bool(token_status.get("expired")),
             "token_notice": token_notice,
         }
 
@@ -5643,7 +5646,7 @@ def _run_search_live(chat_id, data, tmpl):
         "errors": fetch_errors,
         "filter_stats": filter_stats,
         "hh_temporarily_blocked": hh_temporarily_blocked,
-        "hh_token_expired": False,
+        "hh_token_expired": bool(token_status.get("expired")),
         "token_notice": token_notice,
     }
 
@@ -8051,9 +8054,7 @@ def _web_search_response(data, tmpl, persist):
     friendly_error = _friendly_fetch_error_summary(fetch_errors)
     token_notice = _web_plain_text(result.get("token_notice") or "")
 
-    if result.get("hh_token_expired") and token_notice:
-        reason = token_notice
-    elif result.get("hh_temporarily_blocked") and fetch_errors:
+    if result.get("hh_temporarily_blocked") and fetch_errors:
         reason = fetch_errors[0]
     elif friendly_error and not visible_vacancies:
         reason = friendly_error
@@ -8064,8 +8065,8 @@ def _web_search_response(data, tmpl, persist):
             reason = "По текущим фильтрам ничего не найдено."
     else:
         reason = ""
-        if token_notice:
-            reason = token_notice
+    if token_notice:
+        reason = f"{token_notice} {reason}".strip()
 
     return {
         "template_id": tmpl["id"],
@@ -9676,13 +9677,90 @@ def _web_ui_html():
         grid-template-columns: 1fr;
       }
     }
+    .source-card {
+      align-items: center;
+      justify-items: center;
+      text-align: center;
+    }
+    .source-title {
+      line-height: 1.2;
+    }
+    .templates-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: #1f2533;
+      font-size: 20px;
+      font-weight: 700;
+      line-height: 1.2;
+      text-align: left;
+    }
+    .templates-toggle:hover {
+      transform: none;
+      background: transparent;
+    }
+    .templates-toggle:focus-visible {
+      outline: 2px solid #356dff;
+      outline-offset: 4px;
+      border-radius: 8px;
+    }
+    .templates-toggle-icon {
+      width: 9px;
+      height: 9px;
+      border-right: 2px solid currentColor;
+      border-bottom: 2px solid currentColor;
+      transform: rotate(45deg) translateY(-2px);
+      transition: transform 0.16s ease;
+      flex: 0 0 auto;
+    }
+    .scenario-panel.collapsed .templates-toggle-icon {
+      transform: rotate(-45deg);
+    }
+    .scenario-panel.collapsed .template-list {
+      display: none;
+    }
+    @media (max-width: 820px) {
+      .editor-tabs {
+        position: sticky;
+        top: 0;
+        z-index: 30;
+        display: flex;
+        flex-wrap: nowrap;
+        gap: 8px;
+        overflow-x: auto;
+        overflow-y: hidden;
+        margin: 0 -16px 14px;
+        padding: 8px 16px 12px;
+        background: #f4f6f9;
+        scrollbar-gutter: stable;
+        -webkit-overflow-scrolling: touch;
+      }
+      .editor-tab {
+        flex: 0 0 auto;
+        width: auto;
+        min-width: 118px;
+        white-space: nowrap;
+        border-radius: 18px;
+      }
+      .source-card {
+        justify-content: center;
+        text-align: center;
+      }
+      .templates-toggle {
+        font-size: 22px;
+      }
+    }
   </style>
 </head>
 <body class="source-hh">
   <div class="page">
     <section class="app-header">
       <div class="app-header-main">
-        <span class="eyebrow">HH.ru</span>
+        <span class="eyebrow">HH</span>
         <h1>Шаблоны поиска</h1>
       </div>
       <div class="app-header-side">
@@ -9698,7 +9776,7 @@ def _web_ui_html():
 
     <section class="source-picker" aria-label="Источник вакансий">
       <button id="sourceHhBtn" class="source-card active" type="button" data-source="hh">
-        <span class="source-title">HH.ru</span>
+        <span class="source-title">HH</span>
         <span class="source-note">Шаблоны, OAuth-поиск, страны и города из справочника HH.</span>
       </button>
       <button id="sourceLinkedinBtn" class="source-card" type="button" data-source="linkedin">
@@ -9717,11 +9795,12 @@ def _web_ui_html():
 
     <section class="workspace">
       <aside class="sidebar-column">
-        <section class="panel scenario-panel">
+        <section id="scenarioPanel" class="panel scenario-panel">
         <div class="sidebar-head">
-          <div>
-            <h2>Мои шаблоны</h2>
-          </div>
+          <button id="templatesToggleBtn" class="templates-toggle" type="button" aria-expanded="true">
+            <span>Мои шаблоны</span>
+            <span class="templates-toggle-icon" aria-hidden="true"></span>
+          </button>
           <button id="newSearchBtn" class="primary" type="button">Создать шаблон</button>
         </div>
         <div id="templateList" class="template-list"></div>
@@ -10029,13 +10108,14 @@ def _web_ui_html():
     const TOKEN_REQUIRED = __TOKEN_REQUIRED__;
     const state = {
       data: null,
-      selectedTemplateId: '',
-      selectedLinkedinTemplateId: '',
+      selectedTemplateId: localStorage.getItem('hh_selected_template_id') || '',
+      selectedLinkedinTemplateId: localStorage.getItem('hh_selected_linkedin_template_id') || '',
       currentSource: localStorage.getItem('hh_web_source') || 'hh',
       result: null,
       resultPage: 0,
       resultPageSize: Number(localStorage.getItem('hh_result_page_size') || 10),
       activeEditorPanel: Number(localStorage.getItem('hh_active_editor_panel') || 0),
+      templatesCollapsed: localStorage.getItem('hh_templates_collapsed') === '1',
       authToken: localStorage.getItem('hh_web_admin_token') || '',
       chipEditors: {},
     };
@@ -10406,7 +10486,22 @@ def _web_ui_html():
       });
     }
 
+    function renderTemplatesPanelState() {
+      if (!els.scenarioPanel || !els.templatesToggleBtn) {
+        return;
+      }
+      els.scenarioPanel.classList.toggle('collapsed', !!state.templatesCollapsed);
+      els.templatesToggleBtn.setAttribute('aria-expanded', state.templatesCollapsed ? 'false' : 'true');
+      els.templatesToggleBtn.setAttribute('title', state.templatesCollapsed ? 'Показать мои шаблоны' : 'Свернуть мои шаблоны');
+    }
+
+    function persistTemplateSelection() {
+      localStorage.setItem('hh_selected_template_id', state.selectedTemplateId || '');
+      localStorage.setItem('hh_selected_linkedin_template_id', state.selectedLinkedinTemplateId || '');
+    }
+
     function renderTemplateList() {
+      renderTemplatesPanelState();
       const templates = currentTemplates();
       if (!templates.length) {
         els.templateList.innerHTML = '<div class="empty-sidebar">Сохранённых шаблонов пока нет.</div>';
@@ -10732,6 +10827,7 @@ def _web_ui_html():
           state.selectedTemplateId = preferredTemplateId;
         }
       }
+      persistTemplateSelection();
       renderAll();
     }
 
@@ -10848,6 +10944,7 @@ def _web_ui_html():
       } else {
         state.selectedTemplateId = id;
       }
+      persistTemplateSelection();
       renderAll();
       showMessage('', 'info');
     }
@@ -10861,6 +10958,7 @@ def _web_ui_html():
       } else {
         state.selectedTemplateId = draft.id;
       }
+      persistTemplateSelection();
       fillForm(draft);
       renderTemplateList();
       renderResults();
@@ -10892,6 +10990,11 @@ def _web_ui_html():
         const status = state.data && state.data.status ? state.data.status : {};
         const hhOauth = status.hh_oauth || {};
         window.location.href = hhOauth.authorized ? '/hh/token-status' : '/hh/oauth/start';
+      });
+      els.templatesToggleBtn.addEventListener('click', () => {
+        state.templatesCollapsed = !state.templatesCollapsed;
+        localStorage.setItem('hh_templates_collapsed', state.templatesCollapsed ? '1' : '0');
+        renderTemplatesPanelState();
       });
       els.newSearchBtn.addEventListener('click', createNewTemplate);
       els.saveBtn.addEventListener('click', () => saveTemplate(false).catch((error) => showMessage(error.message, 'error')));
@@ -10962,6 +11065,8 @@ def _web_ui_html():
       els.previewBtn = qs('previewBtn');
       els.connectHhBtn = qs('connectHhBtn');
       els.newSearchBtn = qs('newSearchBtn');
+      els.scenarioPanel = qs('scenarioPanel');
+      els.templatesToggleBtn = qs('templatesToggleBtn');
       els.templateList = qs('templateList');
       els.name = qs('name');
       els.queries = qs('queries');
@@ -11295,7 +11400,8 @@ def _hh_oauth_public_status(data=None):
     expires_at = int(expiry_status.get("expires_at") or 0)
     return {
         "configured": _hh_oauth_ready(),
-        "authorized": bool(_hh_access_token_from_state(data)),
+        "authorized": bool(_hh_raw_access_token_from_state(data)),
+        "usable": bool(_hh_access_token_from_state(data)),
         "has_refresh_token": bool(oauth.get("refresh_token") or HH_REFRESH_TOKEN),
         "expires_at": expires_at,
         "expires_at_text": expiry_status.get("expires_at_text") or "",
@@ -11304,6 +11410,7 @@ def _hh_oauth_public_status(data=None):
         "expired": bool(expiry_status.get("expired")),
         "expires_soon": bool(expiry_status.get("expires_soon")),
         "warning_days": int(expiry_status.get("warning_days") or HH_TOKEN_EXPIRY_WARNING_DAYS),
+        "notice_interval_seconds": int(expiry_status.get("notice_interval_seconds") or HH_TOKEN_EXPIRY_NOTICE_INTERVAL_SECONDS),
         "last_expiry_warning_date": oauth.get("last_expiry_warning_date") or "",
         "last_error": oauth.get("last_error") or "",
     }
