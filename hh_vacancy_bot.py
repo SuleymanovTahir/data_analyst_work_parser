@@ -9973,6 +9973,60 @@ def _web_ui_html():
         min-width: 112px;
       }
     }
+    .overview-panel .quick-actions {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+      padding: 16px 24px 22px;
+    }
+    .quick-action-primary,
+    .quick-action-secondary {
+      display: grid;
+      min-width: 0;
+      gap: 10px;
+    }
+    .quick-action-primary {
+      grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr);
+      padding: 10px;
+      border: 1px solid #dfe7f2;
+      border-radius: 14px;
+      background: #f8fbff;
+    }
+    .quick-action-secondary {
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    }
+    .quick-action-primary button,
+    .quick-action-secondary button {
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+    .quick-action-primary button {
+      min-height: 52px;
+      font-size: 15px;
+    }
+    .quick-action-secondary button {
+      min-height: 42px;
+      border-radius: 10px;
+    }
+    .quick-actions .hidden-field {
+      display: none !important;
+    }
+    .results-panel[aria-busy="true"] {
+      border-color: #b9c9ff;
+      box-shadow: inset 0 0 0 1px rgba(53, 109, 255, 0.12);
+    }
+    @media (max-width: 640px) {
+      .overview-panel .quick-actions {
+        padding: 14px 16px 18px;
+      }
+      .quick-action-primary,
+      .quick-action-secondary {
+        grid-template-columns: 1fr;
+      }
+    }
   </style>
 </head>
 <body class="source-hh">
@@ -10278,11 +10332,15 @@ def _web_ui_html():
             </article>
           </div>
           <div class="quick-actions">
-            <button id="refreshBtn" class="ghost" type="button">Обновить данные</button>
-            <button id="toggleBtn" class="secondary" type="button">Пауза автопроверки</button>
-            <button id="runBtn" class="primary" type="button">Проверить сейчас</button>
-            <button id="previewBtn" class="ghost" type="button">Предпросмотр</button>
-            <button id="connectHhBtn" class="ghost" type="button">Подключить hh</button>
+            <div class="quick-action-primary">
+              <button id="runBtn" class="primary" type="button">Проверить сейчас</button>
+              <button id="previewBtn" class="secondary" type="button">Тест без истории</button>
+            </div>
+            <div class="quick-action-secondary">
+              <button id="refreshBtn" class="ghost" type="button">Обновить данные</button>
+              <button id="toggleBtn" class="ghost" type="button">Пауза автопроверки</button>
+              <button id="connectHhBtn" class="ghost" type="button">hh token</button>
+            </div>
           </div>
           <div class="summary-shell">
             <div class="summary-title">Сводка шаблона</div>
@@ -10290,7 +10348,7 @@ def _web_ui_html():
           </div>
         </section>
 
-        <section class="panel results-panel">
+        <section id="resultsPanel" class="panel results-panel">
           <div class="results-toolbar">
             <div>
               <h2>Результаты поиска</h2>
@@ -10315,7 +10373,7 @@ def _web_ui_html():
           </div>
           <div id="resultsList" class="results-list">
             <div class="empty-results">
-              Здесь появятся найденные вакансии после нажатия на «Проверить сейчас» или «Предпросмотр».
+              Здесь появятся найденные вакансии после нажатия на «Проверить сейчас» или «Тест без истории».
             </div>
           </div>
           <div id="resultsPagerBottom" class="result-pagination"></div>
@@ -10701,6 +10759,10 @@ def _web_ui_html():
       return Array.from(container.querySelectorAll('input[type="checkbox"]:checked')).map((input) => input.value);
     }
 
+    function searchModeLabel(result) {
+      return result && result.persist ? 'Проверка' : 'Тест без истории';
+    }
+
     function currentTemplates() {
       if (!state.data) {
         return [];
@@ -10743,8 +10805,20 @@ def _web_ui_html():
       els.statusChat.textContent = status.chat_configured ? 'Чат подключён' : 'Чат ещё не подключён';
       els.statusLastCheck.textContent = formatDate(lastCheck);
       els.toggleBtn.textContent = searching ? 'Поставить на паузу' : 'Включить автопроверку';
-      els.connectHhBtn.textContent = hhOauth.authorized ? 'Статус hh token' : 'Подключить hh';
-      els.connectHhBtn.disabled = isLinkedin || (!hhOauth.configured && !hhOauth.authorized);
+      els.connectHhBtn.classList.toggle('hidden-field', isLinkedin);
+      if (hhOauth.authorized) {
+        els.connectHhBtn.textContent = 'Статус hh token';
+        els.connectHhBtn.disabled = false;
+        els.connectHhBtn.setAttribute('title', 'Открыть срок действия и состояние hh token');
+      } else if (hhOauth.configured) {
+        els.connectHhBtn.textContent = 'Подключить hh token';
+        els.connectHhBtn.disabled = false;
+        els.connectHhBtn.setAttribute('title', 'Открыть OAuth-подключение hh');
+      } else {
+        els.connectHhBtn.textContent = 'hh token не настроен';
+        els.connectHhBtn.disabled = true;
+        els.connectHhBtn.setAttribute('title', 'На сервере не заданы HH_CLIENT_ID и HH_CLIENT_SECRET');
+      }
       els.areaHint.textContent = isLinkedin
         ? 'Для LinkedIn основная локация задаётся в поле выше, а исключения добавляются отдельными chips.'
         : 'Начните вводить страну или город, выберите вариант из подсказок и нажмите добавить.';
@@ -10993,7 +11067,7 @@ def _web_ui_html():
       const result = state.result;
       if (!result) {
         els.resultsMeta.textContent = 'Результатов пока нет.';
-        els.resultsList.innerHTML = '<div class="empty-results">Нажмите «Проверить сейчас» или «Предпросмотр», чтобы увидеть результаты здесь.</div>';
+        els.resultsList.innerHTML = '<div class="empty-results">Нажмите «Проверить сейчас» или «Тест без истории», чтобы увидеть результаты здесь.</div>';
         els.resultsPage.textContent = '';
         els.resultsPrev.disabled = true;
         els.resultsNext.disabled = true;
@@ -11013,7 +11087,7 @@ def _web_ui_html():
       const start = state.resultPage * pageSize;
       const pageItems = vacancies.slice(start, start + pageSize);
       const parts = [
-        (result.persist ? 'Проверка' : 'Предпросмотр') + ': ' + result.template_name,
+        searchModeLabel(result) + ': ' + result.template_name,
         'Показано: ' + result.shown_count,
         'Всего найдено: ' + result.total_found
       ];
@@ -11194,30 +11268,50 @@ def _web_ui_html():
         showMessage('Сначала сохраните шаблон, потом запускайте обычный режим.', 'error');
         return;
       }
-      const path = persist ? '/api/web-search-run' : '/api/web-search-preview';
-      const payload = await api(path, {
-        method: 'POST',
-        body: JSON.stringify({
-          source: state.currentSource,
-          template_id: form.id || '',
-          template: persist ? null : form
-        })
-      });
-      state.result = payload.result;
-      state.resultPage = 0;
-      state.data = payload.state;
-      if (payload.template && payload.template.id) {
-        if (state.currentSource === 'linkedin') {
-          state.selectedLinkedinTemplateId = payload.template.id;
-        } else {
-          state.selectedTemplateId = payload.template.id;
+      setSearchBusy(true, persist);
+      showMessage(persist ? 'Запускаю проверку текущего шаблона...' : 'Запускаю тест без записи в историю...', 'info');
+      try {
+        const path = persist ? '/api/web-search-run' : '/api/web-search-preview';
+        const payload = await api(path, {
+          method: 'POST',
+          body: JSON.stringify({
+            source: state.currentSource,
+            template_id: form.id || '',
+            template: persist ? null : form
+          })
+        });
+        state.result = payload.result;
+        state.resultPage = 0;
+        state.data = payload.state;
+        if (payload.template && payload.template.id) {
+          if (state.currentSource === 'linkedin') {
+            state.selectedLinkedinTemplateId = payload.template.id;
+          } else {
+            state.selectedTemplateId = payload.template.id;
+          }
         }
+        renderAll();
+        if (els.resultsList) {
+          els.resultsList.scrollIntoView({ block: 'start', behavior: 'smooth' });
+        }
+        if (payload.result.reason) {
+          showMessage(payload.result.reason, payload.result.errors && payload.result.errors.length ? 'error' : 'info');
+        } else {
+          const doneText = payload.result.persist ? 'Проверка завершена.' : 'Тест без истории завершён.';
+          showMessage(doneText + ' Найдено к показу: ' + payload.result.shown_count, 'success');
+        }
+      } finally {
+        setSearchBusy(false, persist);
       }
-      renderAll();
-      if (payload.result.reason) {
-        showMessage(payload.result.reason, payload.result.errors && payload.result.errors.length ? 'error' : 'info');
-      } else {
-        showMessage((persist ? 'Проверка' : 'Предпросмотр') + ' завершена. Найдено к показу: ' + payload.result.shown_count, 'success');
+    }
+
+    function setSearchBusy(isBusy, persist) {
+      els.runBtn.disabled = !!isBusy;
+      els.previewBtn.disabled = !!isBusy;
+      els.runBtn.textContent = isBusy && persist ? 'Проверяю...' : 'Проверить сейчас';
+      els.previewBtn.textContent = isBusy && !persist ? 'Тестирую...' : 'Тест без истории';
+      if (els.resultsPanel) {
+        els.resultsPanel.setAttribute('aria-busy', isBusy ? 'true' : 'false');
       }
     }
 
@@ -11405,6 +11499,7 @@ def _web_ui_html():
       els.deleteBtn = qs('deleteBtn');
       els.currentSummary = qs('currentSummary');
       els.resultsMeta = qs('resultsMeta');
+      els.resultsPanel = qs('resultsPanel');
       els.resultsList = qs('resultsList');
       els.resultsPrev = qs('resultsPrev');
       els.resultsNext = qs('resultsNext');
