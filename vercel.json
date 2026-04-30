@@ -38,6 +38,10 @@
       "destination": "/api/oauth-start"
     },
     {
+      "source": "/hh/token-status",
+      "destination": "/api/token-status"
+    },
+    {
       "source": "/hh/oauth/callback",
       "destination": "/api/oauth-callback"
     },

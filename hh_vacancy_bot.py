@@ -105,6 +105,8 @@ HH_MAX_QUERY_TASKS_PER_RUN = max(1, int(os.getenv("HH_MAX_QUERY_TASKS_PER_RUN", 
 HH_PUBLIC_MAX_REQUESTS_PER_RUN = max(1, int(os.getenv("HH_PUBLIC_MAX_REQUESTS_PER_RUN", "60") or 60))
 HH_PUBLIC_MAX_QUERY_TASKS_PER_RUN = max(1, int(os.getenv("HH_PUBLIC_MAX_QUERY_TASKS_PER_RUN", "20") or 20))
 HH_PUBLIC_SEARCH_WORKERS = max(1, int(os.getenv("HH_PUBLIC_SEARCH_WORKERS", "2") or 2))
+HH_TOKEN_EXPIRY_WARNING_DAYS = max(1, int(os.getenv("HH_TOKEN_EXPIRY_WARNING_DAYS", "10") or 10))
+HH_TOKEN_EXPIRY_WARNING_SECONDS = HH_TOKEN_EXPIRY_WARNING_DAYS * 24 * 60 * 60
 HH_SAFE_MAX_PAGES = max(1, int(os.getenv("HH_SAFE_MAX_PAGES", "3") or 3))
 HH_BATCH_DEADLINE_SECONDS = max(5, int(os.getenv("HH_BATCH_DEADLINE_SECONDS", "8") or 8))
 HH_RUN_DEADLINE_SECONDS = max(6, int(os.getenv("HH_RUN_DEADLINE_SECONDS", "45") or 45))
@@ -595,6 +597,8 @@ def _default_hh_oauth_state():
         "last_error": "",
         "oauth_state": "",
         "oauth_state_expires_at": 0,
+        "last_expiry_warning_date": "",
+        "last_expiry_warning_at": 0,
     }
 
 
@@ -611,6 +615,8 @@ def _normalize_hh_oauth_state(value):
         "last_error": str(value.get("last_error") or "").strip(),
         "oauth_state": str(value.get("oauth_state") or "").strip(),
         "oauth_state_expires_at": float(value.get("oauth_state_expires_at") or 0),
+        "last_expiry_warning_date": str(value.get("last_expiry_warning_date") or "").strip(),
+        "last_expiry_warning_at": float(value.get("last_expiry_warning_at") or 0),
     })
     if base["access_token"] and not base["token_type"]:
         base["token_type"] = "Bearer"
@@ -777,6 +783,83 @@ def _ensure_hh_oauth_token_fresh(data):
         _save_hh_oauth_error(data, e)
         print(f"⚠️ Не удалось обновить HH OAuth token: {e}")
         return False
+
+
+def _hh_token_expiry_status(data=None):
+    oauth = _normalize_hh_oauth_state((data or {}).get("hh_oauth") if isinstance(data, dict) else None)
+    access_token = _hh_access_token_from_state(data)
+    expires_at = 0 if HH_ACCESS_TOKEN else int(float(oauth.get("expires_at") or 0))
+    now = int(time.time())
+    remaining_seconds = expires_at - now if expires_at else 0
+    expires_at_text = datetime.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M:%S") if expires_at else ""
+    remaining_days = max(0, (remaining_seconds + 86399) // 86400) if expires_at and remaining_seconds > 0 else 0
+    expired = bool(access_token and expires_at and remaining_seconds <= 0)
+    expires_soon = bool(access_token and expires_at and remaining_seconds > 0 and remaining_seconds <= HH_TOKEN_EXPIRY_WARNING_SECONDS)
+    return {
+        "authorized": bool(access_token),
+        "expires_at": expires_at,
+        "expires_at_text": expires_at_text,
+        "remaining_seconds": max(0, remaining_seconds),
+        "remaining_days": remaining_days,
+        "expired": expired,
+        "expires_soon": expires_soon,
+        "warning_days": HH_TOKEN_EXPIRY_WARNING_DAYS,
+        "last_expiry_warning_date": oauth.get("last_expiry_warning_date") or "",
+        "last_expiry_warning_at": int(float(oauth.get("last_expiry_warning_at") or 0)),
+    }
+
+
+def _ru_plural(number, one, few, many):
+    value = abs(int(number or 0))
+    if value % 10 == 1 and value % 100 != 11:
+        return one
+    if 2 <= value % 10 <= 4 and not 12 <= value % 100 <= 14:
+        return few
+    return many
+
+
+def _hh_token_expiry_notice_text(status):
+    if not status.get("authorized"):
+        return ""
+    expires_at_text = status.get("expires_at_text") or "не указан"
+    if status.get("expired"):
+        return (
+            f"HH OAuth token истёк {expires_at_text}. "
+            "Перед запуском поиска обновите подключение HH на странице /hh/token-status."
+        )
+    if status.get("expires_soon"):
+        days_left = int(status.get("remaining_days") or 0)
+        day_label = _ru_plural(days_left, "день", "дня", "дней")
+        return (
+            f"HH OAuth token истекает {expires_at_text}, осталось примерно {days_left} {day_label}. "
+            "Обновите подключение HH заранее на странице /hh/token-status."
+        )
+    return ""
+
+
+def _hh_token_expiry_warning_date():
+    return datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d")
+
+
+def _hh_token_expiry_notice_for_search(data, mark=True):
+    if not isinstance(data, dict):
+        return ""
+    status = _hh_token_expiry_status(data)
+    notice = _hh_token_expiry_notice_text(status)
+    if not notice:
+        return ""
+    if status.get("expired"):
+        return notice
+    today = _hh_token_expiry_warning_date()
+    oauth = _normalize_hh_oauth_state(data.get("hh_oauth"))
+    if oauth.get("last_expiry_warning_date") == today:
+        return ""
+    if mark:
+        oauth["last_expiry_warning_date"] = today
+        oauth["last_expiry_warning_at"] = time.time()
+        data["hh_oauth"] = oauth
+        save_data(data)
+    return notice
 
 
 def _wait_hh_backoff():
@@ -5224,6 +5307,19 @@ def _execute_search_result(data, tmpl, persist=True):
     hh_access_token = _hh_access_token_from_state(data)
     if hh_access_token and _hh_clear_temporary_block(data):
         save_data(data)
+    token_status = _hh_token_expiry_status(data)
+    token_notice = _hh_token_expiry_notice_for_search(data, mark=True)
+    if token_status.get("expired"):
+        return {
+            "fetched_vacancies": [],
+            "visible_vacancies": [],
+            "errors": [token_notice],
+            "filter_stats": _empty_filter_stats(),
+            "hh_window_note": "",
+            "hh_temporarily_blocked": False,
+            "hh_token_expired": True,
+            "token_notice": token_notice,
+        }
 
     runtime_options = _hh_runtime_options(data, tmpl, advance_cursor=bool(persist))
     runtime_options["auth_data"] = data
@@ -5285,7 +5381,10 @@ def _execute_search_result(data, tmpl, persist=True):
         "visible_vacancies": visible_vacancies,
         "errors": fetch_errors,
         "filter_stats": filter_stats,
+        "hh_window_note": hh_window_note,
         "hh_temporarily_blocked": hh_temporarily_blocked,
+        "hh_token_expired": False,
+        "token_notice": token_notice,
     }
 
 
@@ -5294,6 +5393,22 @@ def _run_search_live(chat_id, data, tmpl):
     hh_access_token = _hh_access_token_from_state(data)
     if hh_access_token and _hh_clear_temporary_block(data):
         save_data(data)
+    token_status = _hh_token_expiry_status(data)
+    token_notice = _hh_token_expiry_notice_for_search(data, mark=True)
+    if token_status.get("expired"):
+        send_msg(chat_id, _esc(token_notice), reply_markup=_current_search_keyboard(data))
+        return {
+            "total_found": 0,
+            "sent_now": 0,
+            "new_count": 0,
+            "persist": True,
+            "errors": [token_notice],
+            "hh_temporarily_blocked": False,
+            "hh_token_expired": True,
+            "token_notice": token_notice,
+        }
+    if token_notice:
+        send_msg(chat_id, _esc(token_notice))
     if not hh_access_token:
         oauth = _normalize_hh_oauth_state(data.get("hh_oauth"))
         detail = oauth.get("last_error") or "HH access token недоступен."
@@ -5310,6 +5425,8 @@ def _run_search_live(chat_id, data, tmpl):
             "persist": True,
             "errors": [detail],
             "hh_temporarily_blocked": False,
+            "hh_token_expired": False,
+            "token_notice": "",
         }
     initial_sent_ids = list(_template_sent_ids(data, tmpl["id"]))
     initial_sent_set = set(initial_sent_ids)
@@ -5479,6 +5596,8 @@ def _run_search_live(chat_id, data, tmpl):
             "persist": True,
             "errors": fetch_errors,
             "hh_temporarily_blocked": hh_temporarily_blocked,
+            "hh_token_expired": False,
+            "token_notice": token_notice,
         }
 
     visible_snapshot = _build_live_snapshot()
@@ -5524,6 +5643,8 @@ def _run_search_live(chat_id, data, tmpl):
         "errors": fetch_errors,
         "filter_stats": filter_stats,
         "hh_temporarily_blocked": hh_temporarily_blocked,
+        "hh_token_expired": False,
+        "token_notice": token_notice,
     }
 
 
@@ -5536,11 +5657,16 @@ def _run_search(chat_id, data, tmpl, persist=True):
     visible_vacancies = result["visible_vacancies"]
     fetch_errors = result["errors"]
     filter_stats = result.get("filter_stats", {})
+    hh_window_note = result.get("hh_window_note") or ""
     hh_temporarily_blocked = bool(result.get("hh_temporarily_blocked"))
+    hh_token_expired = bool(result.get("hh_token_expired"))
+    token_notice = result.get("token_notice") or ""
 
     if not visible_vacancies:
         reason_lines = []
-        if hh_temporarily_blocked and fetch_errors:
+        if hh_token_expired and token_notice:
+            reason_lines.append(token_notice)
+        elif hh_temporarily_blocked and fetch_errors:
             reason_lines.append(fetch_errors[0])
         elif fetch_errors:
             reason_lines.append(_friendly_fetch_error_summary(fetch_errors))
@@ -5564,6 +5690,8 @@ def _run_search(chat_id, data, tmpl, persist=True):
             "persist": bool(persist),
             "errors": fetch_errors,
             "hh_temporarily_blocked": hh_temporarily_blocked,
+            "hh_token_expired": hh_token_expired,
+            "token_notice": token_notice,
         }
 
     session_id = _store_result_session(data, tmpl, visible_vacancies, persist, fetch_errors)
@@ -5578,6 +5706,8 @@ def _run_search(chat_id, data, tmpl, persist=True):
     ]
     if fetch_errors:
         header_lines.append(_friendly_fetch_error_summary(fetch_errors))
+    if token_notice:
+        header_lines.append(_esc(token_notice))
     if hh_window_note and not hh_temporarily_blocked:
         header_lines.append(hh_window_note)
     filter_summary = _format_filter_stats_brief(filter_stats)
@@ -5593,6 +5723,8 @@ def _run_search(chat_id, data, tmpl, persist=True):
         "persist": bool(persist),
         "errors": fetch_errors,
         "hh_temporarily_blocked": hh_temporarily_blocked,
+        "hh_token_expired": hh_token_expired,
+        "token_notice": token_notice,
     }
 
 
@@ -7917,8 +8049,11 @@ def _web_search_response(data, tmpl, persist):
     visible_vacancies = result["visible_vacancies"]
     fetch_errors = [_web_plain_text(item) for item in (result["errors"] or []) if _web_plain_text(item)]
     friendly_error = _friendly_fetch_error_summary(fetch_errors)
+    token_notice = _web_plain_text(result.get("token_notice") or "")
 
-    if result.get("hh_temporarily_blocked") and fetch_errors:
+    if result.get("hh_token_expired") and token_notice:
+        reason = token_notice
+    elif result.get("hh_temporarily_blocked") and fetch_errors:
         reason = fetch_errors[0]
     elif friendly_error and not visible_vacancies:
         reason = friendly_error
@@ -7929,6 +8064,8 @@ def _web_search_response(data, tmpl, persist):
             reason = "По текущим фильтрам ничего не найдено."
     else:
         reason = ""
+        if token_notice:
+            reason = token_notice
 
     return {
         "template_id": tmpl["id"],
@@ -7938,6 +8075,8 @@ def _web_search_response(data, tmpl, persist):
         "shown_count": len(visible_vacancies),
         "page_size": int(tmpl.get("delivery_page_size", 5) or 5),
         "reason": reason,
+        "notice": token_notice,
+        "hh_token_expired": bool(result.get("hh_token_expired")),
         "friendly_error": friendly_error,
         "errors": list(fetch_errors or []),
         "vacancies": [_vacancy_to_web_item(vacancy) for vacancy in visible_vacancies],
@@ -10082,8 +10221,8 @@ def _web_ui_html():
       els.statusChat.textContent = status.chat_configured ? 'Чат подключён' : 'Чат ещё не подключён';
       els.statusLastCheck.textContent = formatDate(lastCheck);
       els.toggleBtn.textContent = searching ? 'Поставить на паузу' : 'Включить автопроверку';
-      els.connectHhBtn.textContent = hhOauth.authorized ? 'HH подключён' : 'Подключить HH';
-      els.connectHhBtn.disabled = isLinkedin || !hhOauth.configured || !!hhOauth.authorized;
+      els.connectHhBtn.textContent = hhOauth.authorized ? 'Статус HH token' : 'Подключить HH';
+      els.connectHhBtn.disabled = isLinkedin || (!hhOauth.configured && !hhOauth.authorized);
       els.areaHint.textContent = isLinkedin
         ? 'Для LinkedIn основная локация задаётся в поле выше, а исключения добавляются отдельными chips.'
         : 'Начните вводить страну или город, выберите вариант из подсказок и нажмите добавить.';
@@ -10589,7 +10728,9 @@ def _web_ui_html():
       els.runBtn.addEventListener('click', () => runSearch(true).catch((error) => showMessage(error.message, 'error')));
       els.previewBtn.addEventListener('click', () => runSearch(false).catch((error) => showMessage(error.message, 'error')));
       els.connectHhBtn.addEventListener('click', () => {
-        window.location.href = '/hh/oauth/start';
+        const status = state.data && state.data.status ? state.data.status : {};
+        const hhOauth = status.hh_oauth || {};
+        window.location.href = hhOauth.authorized ? '/hh/token-status' : '/hh/oauth/start';
       });
       els.newSearchBtn.addEventListener('click', createNewTemplate);
       els.saveBtn.addEventListener('click', () => saveTemplate(false).catch((error) => showMessage(error.message, 'error')));
@@ -10823,14 +10964,155 @@ def _hh_oauth_result_html(title, message):
 </html>'''
 
 
+def _hh_token_status_html(data):
+    status = _hh_token_expiry_status(data)
+    oauth = _normalize_hh_oauth_state((data or {}).get("hh_oauth") if isinstance(data, dict) else None)
+    if not status.get("authorized"):
+        state_title = "HH OAuth token не подключён"
+        state_text = "Перед запуском полного HH-поиска подключите HH OAuth."
+    elif status.get("expired"):
+        state_title = "HH OAuth token истёк"
+        state_text = "Поиск через token остановится до повторного подключения HH."
+    elif status.get("expires_soon"):
+        state_title = "HH OAuth token скоро истечёт"
+        state_text = _hh_token_expiry_notice_text(status)
+    else:
+        state_title = "HH OAuth token активен"
+        state_text = "Поиск через token можно запускать."
+
+    expires_text = status.get("expires_at_text") or "срок не указан"
+    if status.get("expires_at"):
+        days_left = int(status.get("remaining_days") or 0)
+        day_label = _ru_plural(days_left, "день", "дня", "дней")
+        remaining_text = f"примерно {days_left} {day_label}"
+    else:
+        remaining_text = "HH не вернул срок действия или token задан через ENV"
+    last_warning_date = oauth.get("last_expiry_warning_date") or "ещё не показывалось"
+    configured_text = "настроен" if _hh_oauth_ready() else "не настроен"
+    refresh_text = "есть" if oauth.get("refresh_token") or HH_REFRESH_TOKEN else "нет"
+    last_error = oauth.get("last_error") or "нет"
+
+    return f'''<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HH token</title>
+  <style>
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #f4f6fb;
+      color: #1f2937;
+      font-family: Arial, sans-serif;
+    }}
+    main {{
+      width: min(720px, calc(100vw - 32px));
+      background: #ffffff;
+      border: 1px solid #d9e0ec;
+      border-radius: 18px;
+      padding: 30px;
+      box-shadow: 0 20px 56px rgba(30, 48, 88, 0.1);
+    }}
+    h1 {{
+      margin: 0 0 8px;
+      font-size: 28px;
+      line-height: 1.2;
+    }}
+    p {{
+      margin: 0;
+      color: #5f6f86;
+      line-height: 1.5;
+    }}
+    dl {{
+      display: grid;
+      grid-template-columns: minmax(160px, 220px) 1fr;
+      gap: 12px 18px;
+      margin: 24px 0;
+      padding: 20px;
+      border-radius: 14px;
+      background: #f8fafd;
+      border: 1px solid #e5eaf2;
+    }}
+    dt {{
+      color: #697789;
+      font-weight: 700;
+    }}
+    dd {{
+      margin: 0;
+      color: #172033;
+      font-weight: 700;
+    }}
+    .actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+    }}
+    a {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 44px;
+      padding: 0 18px;
+      border-radius: 10px;
+      color: #1f4ecf;
+      background: #edf3ff;
+      font-weight: 700;
+      text-decoration: none;
+    }}
+    a.primary {{
+      color: #ffffff;
+      background: #2f68f6;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{html.escape(state_title)}</h1>
+    <p>{html.escape(state_text)}</p>
+    <dl>
+      <dt>OAuth config</dt>
+      <dd>{html.escape(configured_text)}</dd>
+      <dt>Истекает</dt>
+      <dd>{html.escape(expires_text)}</dd>
+      <dt>Осталось</dt>
+      <dd>{html.escape(remaining_text)}</dd>
+      <dt>Refresh token</dt>
+      <dd>{html.escape(refresh_text)}</dd>
+      <dt>Порог напоминания</dt>
+      <dd>{HH_TOKEN_EXPIRY_WARNING_DAYS} дней</dd>
+      <dt>Последнее дневное напоминание</dt>
+      <dd>{html.escape(last_warning_date)}</dd>
+      <dt>Последняя ошибка</dt>
+      <dd>{html.escape(last_error)}</dd>
+    </dl>
+    <div class="actions">
+      <a class="primary" href="/hh/oauth/start">Обновить подключение HH</a>
+      <a href="/ui">Открыть панель</a>
+    </div>
+  </main>
+</body>
+</html>'''
+
+
 def _hh_oauth_public_status(data=None):
     oauth = _normalize_hh_oauth_state((data or {}).get("hh_oauth") if isinstance(data, dict) else None)
-    expires_at = int(float(oauth.get("expires_at") or 0))
+    expiry_status = _hh_token_expiry_status(data)
+    expires_at = int(expiry_status.get("expires_at") or 0)
     return {
         "configured": _hh_oauth_ready(),
         "authorized": bool(_hh_access_token_from_state(data)),
         "has_refresh_token": bool(oauth.get("refresh_token") or HH_REFRESH_TOKEN),
         "expires_at": expires_at,
+        "expires_at_text": expiry_status.get("expires_at_text") or "",
+        "remaining_seconds": int(expiry_status.get("remaining_seconds") or 0),
+        "remaining_days": int(expiry_status.get("remaining_days") or 0),
+        "expired": bool(expiry_status.get("expired")),
+        "expires_soon": bool(expiry_status.get("expires_soon")),
+        "warning_days": int(expiry_status.get("warning_days") or HH_TOKEN_EXPIRY_WARNING_DAYS),
+        "last_expiry_warning_date": oauth.get("last_expiry_warning_date") or "",
         "last_error": oauth.get("last_error") or "",
     }
 
@@ -10856,6 +11138,16 @@ if FastAPI is not None:
         if request.query_params.get("code") or request.query_params.get("error"):
             return _handle_hh_oauth_callback(request)
         return HTMLResponse(_web_ui_html())
+
+    @app.get("/token-status")
+    @app.get("/api/token-status")
+    @app.get("/hh/token-status")
+    @app.get("/api/hh/token-status")
+    def api_hh_token_status(request: Request):
+        if not _web_request_authorized(request):
+            return _web_unauthorized_response()
+        data = load_data()
+        return HTMLResponse(_hh_token_status_html(data))
 
     @app.get("/oauth-start")
     @app.get("/api/oauth-start")
