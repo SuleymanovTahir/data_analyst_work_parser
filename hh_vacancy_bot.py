@@ -497,6 +497,14 @@ def _state_saved_at(value):
         return 0.0
 
 
+def _state_readback_allowed(source_data, cached_data):
+    if not IS_VERCEL:
+        return True
+    if isinstance(cached_data, dict):
+        return True
+    return _state_saved_at(source_data) > 0
+
+
 def _result_session_cache_key(session_id):
     return f"{RESULT_SESSION_CACHE_PREFIX}{str(session_id or '').strip()}"
 
@@ -912,13 +920,18 @@ def load_data():
         active_template=normalized.get("active_template_id"),
         chat_id=normalized.get("chat_id"),
     )
+    allow_readback = _state_readback_allowed(data, cached)
     changed = _ensure_templates_ready(normalized)
     changed = _ensure_linkedin_templates_ready(normalized) or changed
     if changed:
-        save_data(normalized)
+        if allow_readback:
+            save_data(normalized)
+        else:
+            _state_local_snapshot = json.loads(json.dumps(normalized, ensure_ascii=False))
         return normalized
     _state_local_snapshot = json.loads(json.dumps(normalized, ensure_ascii=False))
-    _cache_set(STATE_CACHE_KEY, normalized, STATE_TTL_SECONDS, tags=["bot-state"])
+    if allow_readback:
+        _cache_set(STATE_CACHE_KEY, normalized, STATE_TTL_SECONDS, tags=["bot-state"])
     return normalized
 
 def save_data(data):
