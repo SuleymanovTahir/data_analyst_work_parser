@@ -10865,6 +10865,10 @@ def _web_ui_html():
     }
 
     function renderAll() {
+      if (!state.data) {
+        renderSourceChrome();
+        return;
+      }
       renderStatus();
       renderTemplateList();
       const fallbackTemplate = state.currentSource === 'linkedin'
