@@ -11022,8 +11022,6 @@ if FastAPI is not None:
                     return JSONResponse({"ok": False, "error": "LinkedIn-шаблон не найден"}, status_code=404)
             else:
                 return JSONResponse({"ok": False, "error": "Нет данных для предпросмотра"}, status_code=400)
-            _set_current_source(data, "linkedin")
-            save_data(data)
             result = _web_linkedin_search_response(data, tmpl, persist=False)
             return {
                 "ok": True,
@@ -11041,8 +11039,6 @@ if FastAPI is not None:
                 return JSONResponse({"ok": False, "error": "Шаблон не найден"}, status_code=404)
         else:
             return JSONResponse({"ok": False, "error": "Нет данных для предпросмотра"}, status_code=400)
-        _set_current_source(data, "hh")
-        save_data(data)
         result = _web_search_response(data, tmpl, persist=False)
         return {
             "ok": True,
