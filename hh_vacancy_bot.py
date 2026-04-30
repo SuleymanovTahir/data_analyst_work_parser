@@ -1780,6 +1780,11 @@ def _strip_hh_highlight(text):
     return " ".join(clean.split())
 
 
+def _web_plain_text(text):
+    clean = re.sub(r"<[^>]+>", "", str(text or ""))
+    return html.unescape(clean).strip()
+
+
 def _option_list(options_map):
     return [{"id": str(code), "label": str(label)} for code, label in options_map.items()]
 
@@ -1804,9 +1809,26 @@ def _vacancy_to_web_item(vacancy):
     }
 
 
+def _linkedin_vacancy_to_web_item(vacancy):
+    return {
+        "id": str(vacancy.get("id") or ""),
+        "name": str(vacancy.get("title") or "Без названия"),
+        "employer": str(vacancy.get("company") or "Компания не указана"),
+        "area": str(vacancy.get("location") or "Локация не указана"),
+        "experience": "",
+        "salary": "",
+        "schedule": "",
+        "work_formats": [],
+        "url": str(vacancy.get("url") or ""),
+        "published_at": str(vacancy.get("posted_at") or ""),
+        "snippet": "",
+    }
+
+
 def _template_to_web_payload(template, include_summary=True):
     tmpl = _normalize_template(template)
     payload = {
+        "source": "hh",
         "id": tmpl["id"],
         "name": tmpl["name"],
         "queries": list(tmpl.get("queries", [])),
@@ -1840,6 +1862,32 @@ def _template_to_web_payload(template, include_summary=True):
     return payload
 
 
+def _linkedin_template_to_web_payload(template, include_summary=True):
+    tmpl = _normalize_linkedin_template(template)
+    payload = {
+        "source": "linkedin",
+        "id": tmpl["id"],
+        "name": tmpl["name"],
+        "queries": list(tmpl.get("keywords", [])),
+        "keywords": list(tmpl.get("keywords", [])),
+        "location": str(tmpl.get("location") or "Worldwide"),
+        "remote_filter": str(tmpl.get("remote_filter") or ""),
+        "experience_levels": list(tmpl.get("experience_levels") or []),
+        "posted_within": str(tmpl.get("posted_within") or "r2592000"),
+        "sort_by": str(tmpl.get("sort_by") or "DD"),
+        "max_results": int(tmpl.get("max_results", 50) or 50),
+        "delivery_page_size": int(tmpl.get("delivery_page_size", 5) or 5),
+        "interval": int(tmpl.get("interval", 30) or 30),
+        "include_keywords": list(tmpl.get("include_keywords") or []),
+        "exclude_keywords": list(tmpl.get("exclude_keywords") or []),
+        "excluded_locations": list(tmpl.get("excluded_locations") or []),
+        "li_cookie_configured": bool(tmpl.get("li_cookie") or LINKEDIN_COOKIE),
+    }
+    if include_summary:
+        payload["summary_html"] = _linkedin_template_summary(tmpl, detailed=True)
+    return payload
+
+
 def _web_options_payload():
     global _web_options_cache
     if _web_options_cache is not None:
@@ -1857,6 +1905,10 @@ def _web_options_payload():
         "page_size": _option_list(PAGE_SIZE_OPTIONS),
         "interval": _option_list(INTERVAL_OPTIONS),
         "popular_areas": list(POPULAR_AREA_NAMES),
+        "linkedin_experience": _option_list(LINKEDIN_EXPERIENCE_OPTIONS),
+        "linkedin_remote": _option_list(LINKEDIN_REMOTE_OPTIONS),
+        "linkedin_period": _option_list(LINKEDIN_PERIOD_OPTIONS),
+        "linkedin_sort": _option_list(LINKEDIN_SORT_OPTIONS),
     }
     return _web_options_cache
 
@@ -1875,6 +1927,24 @@ def _upsert_template(data, template, activate=False):
     data.setdefault("sent_ids_by_template", {}).setdefault(normalized["id"], [])
     if activate:
         data["active_template_id"] = normalized["id"]
+    return normalized
+
+
+def _upsert_linkedin_template(data, template, activate=False):
+    normalized = _normalize_linkedin_template(template)
+    templates = data.setdefault("linkedin_templates", [])
+    replaced = False
+    for index, item in enumerate(templates):
+        if str(item.get("id")) == normalized["id"]:
+            templates[index] = normalized
+            replaced = True
+            break
+    if not replaced:
+        templates.append(normalized)
+    data.setdefault("linkedin_sent_ids_by_template", {}).setdefault(normalized["id"], [])
+    if activate:
+        data["linkedin_active_template_id"] = normalized["id"]
+        _set_current_source(data, "linkedin")
     return normalized
 
 
@@ -1965,16 +2035,77 @@ def _build_template_from_payload(payload):
     return _normalize_template(template), warnings
 
 
+def _build_linkedin_template_from_payload(payload):
+    payload = dict(payload or {})
+    experience_allowed = set(LINKEDIN_EXPERIENCE_OPTIONS.keys())
+    remote_allowed = set(LINKEDIN_REMOTE_OPTIONS.keys())
+    period_allowed = set(LINKEDIN_PERIOD_OPTIONS.keys())
+    sort_allowed = set(LINKEDIN_SORT_OPTIONS.keys())
+
+    keywords = _split_text_values(payload.get("keywords"))
+    if not keywords:
+        keywords = _split_text_values(payload.get("queries"))
+    if not keywords:
+        keywords = DEFAULT_LINKEDIN_QUERIES[:]
+
+    remote_filter = str(payload.get("remote_filter") or "")
+    if remote_filter not in remote_allowed:
+        remote_filter = ""
+
+    posted_within = str(payload.get("posted_within") or "r2592000")
+    if posted_within not in period_allowed:
+        posted_within = "r2592000"
+
+    sort_by = str(payload.get("sort_by") or "DD")
+    if sort_by not in sort_allowed:
+        sort_by = "DD"
+
+    template = {
+        "id": str(payload.get("id") or str(uuid.uuid4())[:8]),
+        "name": str(payload.get("name") or "LinkedIn поиск").strip()[:50] or "LinkedIn поиск",
+        "keywords": keywords,
+        "location": str(payload.get("location") or "Worldwide").strip() or "Worldwide",
+        "remote_filter": remote_filter,
+        "experience_levels": [
+            item for item in _unique_list(payload.get("experience_levels", []))
+            if item in experience_allowed
+        ],
+        "posted_within": posted_within,
+        "sort_by": sort_by,
+        "max_results": _coerce_int(payload.get("max_results"), default=50, min_value=1, max_value=500),
+        "delivery_page_size": _coerce_int(payload.get("delivery_page_size"), default=5, min_value=1, max_value=50),
+        "interval": _coerce_int(payload.get("interval"), default=30, min_value=5, max_value=1440),
+        "include_keywords": [item.lower() for item in _split_text_values(payload.get("include_keywords"))],
+        "exclude_keywords": [item.lower() for item in _split_text_values(payload.get("exclude_keywords"))],
+        "excluded_locations": _split_text_values(payload.get("excluded_locations")),
+        "li_cookie": LINKEDIN_COOKIE,
+    }
+    return _normalize_linkedin_template(template), []
+
+
 def _build_web_state(data=None):
     data = load_data() if data is None else _normalize_data(data)
     active = _active_template(data)
+    linkedin_active = _linkedin_active_template(data)
     return {
         "status": _build_runtime_status(data),
+        "current_source": _current_source(data),
         "searching": bool(data.get("searching", False)),
+        "linkedin_searching": bool(data.get("linkedin_searching", False)),
         "active_template_id": data.get("active_template_id"),
         "templates": [_template_to_web_payload(item, include_summary=True) for item in data.get("templates", [])],
         "active_template": _template_to_web_payload(active, include_summary=True) if active else None,
         "new_template": _template_to_web_payload(_new_draft()),
+        "linkedin_active_template_id": data.get("linkedin_active_template_id"),
+        "linkedin_templates": [
+            _linkedin_template_to_web_payload(item, include_summary=True)
+            for item in data.get("linkedin_templates", [])
+        ],
+        "linkedin_active_template": (
+            _linkedin_template_to_web_payload(linkedin_active, include_summary=True)
+            if linkedin_active else None
+        ),
+        "linkedin_new_template": _linkedin_template_to_web_payload(_normalize_linkedin_template({})),
         "options": _web_options_payload(),
     }
 
@@ -7753,7 +7884,7 @@ def _web_search_response(data, tmpl, persist):
     result = _execute_search_result(data, tmpl, persist=persist)
     fetched_vacancies = result["fetched_vacancies"]
     visible_vacancies = result["visible_vacancies"]
-    fetch_errors = result["errors"]
+    fetch_errors = [_web_plain_text(item) for item in (result["errors"] or []) if _web_plain_text(item)]
     friendly_error = _friendly_fetch_error_summary(fetch_errors)
 
     if result.get("hh_temporarily_blocked") and fetch_errors:
@@ -7779,6 +7910,51 @@ def _web_search_response(data, tmpl, persist):
         "friendly_error": friendly_error,
         "errors": list(fetch_errors or []),
         "vacancies": [_vacancy_to_web_item(vacancy) for vacancy in visible_vacancies],
+    }
+
+
+def _web_linkedin_search_response(data, tmpl, persist):
+    tmpl = _normalize_linkedin_template(tmpl)
+    result = fetch_linkedin_vacancies(tmpl)
+    fetched_vacancies = list(result.get("vacancies") or [])
+    errors = list(result.get("errors") or [])
+    sent_ids = _linkedin_template_sent_ids(data, tmpl["id"])
+    sent_set = set(sent_ids)
+
+    if persist:
+        latest_data = load_data()
+        visible_vacancies = []
+        for vacancy in fetched_vacancies:
+            vacancy_id = str(vacancy.get("id") or "")
+            if vacancy_id in sent_set:
+                continue
+            visible_vacancies.append(vacancy)
+            sent_set.add(vacancy_id)
+            sent_ids.append(vacancy_id)
+        latest_data["linkedin_last_check"] = time.time()
+        _set_linkedin_template_sent_ids(latest_data, tmpl["id"], sent_ids)
+        save_data(latest_data)
+    else:
+        visible_vacancies = fetched_vacancies
+
+    if visible_vacancies:
+        reason = ""
+    elif fetched_vacancies and persist:
+        reason = "По фильтрам вакансии есть, но они уже были отправлены раньше."
+    else:
+        reason = _linkedin_empty_result_message(tmpl, result)
+
+    return {
+        "template_id": tmpl["id"],
+        "template_name": tmpl["name"],
+        "persist": bool(persist),
+        "total_found": len(fetched_vacancies),
+        "shown_count": len(visible_vacancies),
+        "page_size": int(tmpl.get("delivery_page_size", 5) or 5),
+        "reason": reason,
+        "friendly_error": reason if errors and not visible_vacancies else "",
+        "errors": errors,
+        "vacancies": [_linkedin_vacancy_to_web_item(vacancy) for vacancy in visible_vacancies],
     }
 
 
@@ -8024,6 +8200,14 @@ def _web_ui_html():
       color: var(--text);
       font: inherit;
     }
+    select {
+      appearance: none;
+      padding-right: 42px;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 20 20'%3E%3Cpath fill='none' stroke='%23333' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' d='M5 7l5 5 5-5'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 14px center;
+      background-size: 14px;
+    }
     textarea {
       min-height: 96px;
       resize: vertical;
@@ -8141,6 +8325,88 @@ def _web_ui_html():
     .hidden-field {
       display: none;
     }
+    .source-picker {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .source-card {
+      display: grid;
+      gap: 6px;
+      text-align: left;
+      border: 1px solid var(--line);
+      background: #fff;
+      border-radius: 12px;
+      padding: 14px 16px;
+    }
+    .source-card.active {
+      border-color: var(--accent);
+      box-shadow: inset 0 0 0 1px rgba(53, 109, 255, 0.26);
+    }
+    .source-title {
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .source-note {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+    }
+    .dropdown-check {
+      position: relative;
+      min-width: 0;
+    }
+    .dropdown-check > button {
+      width: 100%;
+      min-height: 40px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      border: 1px solid var(--line-strong);
+      background: #fff;
+      color: var(--text);
+      padding-right: 14px;
+      text-align: left;
+    }
+    .dropdown-check > button::after {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-right: 2px solid currentColor;
+      border-bottom: 2px solid currentColor;
+      transform: rotate(45deg);
+      margin-right: 2px;
+      flex: 0 0 auto;
+    }
+    .dropdown-menu {
+      display: none;
+      position: absolute;
+      z-index: 20;
+      left: 0;
+      right: 0;
+      top: calc(100% + 6px);
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      box-shadow: var(--shadow);
+    }
+    .dropdown-check.open .dropdown-menu {
+      display: grid;
+      gap: 6px;
+    }
+    .dropdown-check .check-pill {
+      width: 100%;
+      border-radius: 8px;
+      padding: 8px 10px;
+    }
+    .source-hh .linkedin-only,
+    .source-linkedin .hh-only {
+      display: none !important;
+    }
     .result-controls {
       display: flex;
       gap: 10px;
@@ -8148,9 +8414,20 @@ def _web_ui_html():
       flex-wrap: wrap;
       justify-content: flex-end;
     }
+    .result-controls .field {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
     .result-controls select {
       width: auto;
       min-width: 110px;
+    }
+    #resultsPage {
+      min-height: 40px;
+      display: inline-flex;
+      align-items: center;
+      white-space: nowrap;
     }
     .field-row {
       display: flex;
@@ -8560,6 +8837,10 @@ def _web_ui_html():
     select {
       padding: 9px 10px;
     }
+    select {
+      padding-right: 42px;
+      background-position: right 14px center;
+    }
     textarea {
       min-height: 86px;
     }
@@ -8820,6 +9101,13 @@ def _web_ui_html():
       padding: 9px 10px;
       font-size: 14px;
     }
+    select {
+      padding-right: 42px;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 20 20'%3E%3Cpath fill='none' stroke='%23333' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' d='M5 7l5 5 5-5'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 14px center;
+      background-size: 14px;
+    }
     textarea {
       min-height: 110px;
     }
@@ -8934,7 +9222,12 @@ def _web_ui_html():
       padding-bottom: 12px;
     }
     .result-controls {
-      align-items: end;
+      align-items: center;
+      gap: 8px;
+    }
+    .result-controls .field {
+      display: flex;
+      align-items: center;
       gap: 8px;
     }
     .results-list {
@@ -9017,7 +9310,7 @@ def _web_ui_html():
     }
   </style>
 </head>
-<body>
+<body class="source-hh">
   <div class="page">
     <section class="app-header">
       <div class="app-header-main">
@@ -9034,6 +9327,17 @@ def _web_ui_html():
     </section>
 
     <div id="messageBox" class="message"></div>
+
+    <section class="source-picker" aria-label="Источник вакансий">
+      <button id="sourceHhBtn" class="source-card active" type="button" data-source="hh">
+        <span class="source-title">HH.ru</span>
+        <span class="source-note">Шаблоны, OAuth-поиск, страны и города из справочника HH.</span>
+      </button>
+      <button id="sourceLinkedinBtn" class="source-card" type="button" data-source="linkedin">
+        <span class="source-title">LinkedIn</span>
+        <span class="source-note">Отдельные шаблоны LinkedIn, ключевые слова, локация и guest-поиск.</span>
+      </button>
+    </section>
 
     <nav class="editor-tabs" aria-label="Разделы редактора">
       <button class="editor-tab active" type="button" data-panel-index="0">Основное</button>
@@ -9067,25 +9371,39 @@ def _web_ui_html():
                   Название шаблона
                   <input id="name" type="text" maxlength="50" placeholder="Например: Product / Data Analyst">
                 </label>
-                <label class="field">
+                <label class="field hh-only">
                   Где искать совпадения
-                  <select id="searchFields" multiple></select>
+                  <select id="searchFields" class="hidden-field" multiple></select>
+                  <div id="searchFieldsDropdown" class="dropdown-check"></div>
                   <small>Можно выбрать название, компанию и описание одновременно.</small>
                 </label>
               </div>
               <label class="field" style="margin-top: 14px;">
                 Запросы и синонимы
-                <textarea id="queries" placeholder="По одному на строке или через запятую"></textarea>
+                <textarea id="queries" class="hidden-field"></textarea>
+                <div id="queriesEditor" class="chip-editor"></div>
+              </label>
+              <label class="field linkedin-only" style="margin-top: 14px;">
+                Локация LinkedIn
+                <input id="linkedinLocation" type="text" placeholder="Worldwide, Georgia, Tbilisi">
               </label>
               <div class="grid-2">
-                <div class="mode-card">
+                <div class="mode-card hh-only">
                   <h3>Искать только с опытом</h3>
                   <div id="experienceGroup" class="check-grid"></div>
                 </div>
-                <div class="mode-card">
+                <div class="mode-card hh-only">
                   <h3>Исключить опыт</h3>
                   <div id="excludedExperienceGroup" class="check-grid"></div>
                 </div>
+                <div class="mode-card linkedin-only">
+                  <h3>Опыт LinkedIn</h3>
+                  <div id="linkedinExperienceGroup" class="check-grid"></div>
+                </div>
+                <label class="field linkedin-only">
+                  Формат LinkedIn
+                  <select id="linkedinRemote"></select>
+                </label>
               </div>
           </div>
         </section>
@@ -9096,7 +9414,7 @@ def _web_ui_html():
               <h2>География</h2>
             </div>
           </div>
-          <div class="grid-2">
+          <div class="grid-2 hh-only">
             <div class="mode-card">
               <h3>Искать только в странах или городах</h3>
               <textarea id="includedAreas" class="hidden-field"></textarea>
@@ -9108,6 +9426,11 @@ def _web_ui_html():
               <div id="excludedAreaEditor" class="chip-editor"></div>
             </div>
           </div>
+          <div class="mode-card linkedin-only">
+            <h3>Исключить страны или города LinkedIn</h3>
+            <textarea id="linkedinExcludedLocations" class="hidden-field"></textarea>
+            <div id="linkedinExcludedLocationsEditor" class="chip-editor"></div>
+          </div>
           <div class="summary-box" id="areaHint"></div>
         </section>
 
@@ -9117,7 +9440,7 @@ def _web_ui_html():
               <h2>Название и содержание</h2>
             </div>
           </div>
-              <div class="grid-2">
+              <div class="grid-2 hh-only">
                 <div class="mode-card">
                   <h3>Название содержит</h3>
                   <textarea id="titleIncludeKeywords" class="hidden-field"></textarea>
@@ -9141,7 +9464,7 @@ def _web_ui_html():
                   <div id="excludeKeywordEditor" class="chip-editor"></div>
                 </div>
               </div>
-              <div class="grid-2" style="margin-top: 14px;">
+              <div class="grid-2 hh-only" style="margin-top: 14px;">
                 <label class="field">
                   Где искать обязательные слова
                   <select id="includeIn">
@@ -9159,9 +9482,10 @@ def _web_ui_html():
                   </select>
                 </label>
               </div>
-              <label class="field" style="margin-top: 14px;">
+              <label class="field hh-only" style="margin-top: 14px;">
                 Исключить работодателей
-                <textarea id="excludedEmployers" placeholder="Например: lenkep recruitment"></textarea>
+                <textarea id="excludedEmployers" class="hidden-field"></textarea>
+                <div id="excludedEmployersEditor" class="chip-editor"></div>
               </label>
         </section>
 
@@ -9171,20 +9495,20 @@ def _web_ui_html():
               <h2>Формат работы и зарплата</h2>
             </div>
           </div>
-              <div class="field">
+              <div class="field hh-only">
                 Формат работы
                 <div id="workFormatsGroup" class="check-grid"></div>
               </div>
-              <label class="field" style="margin-top: 14px;">
+              <label class="field hh-only" style="margin-top: 14px;">
                 Формат по странам и городам
                 <textarea id="areaWorkFormats" placeholder="Например: Россия = удалённо&#10;Беларусь = удалённо"></textarea>
                 <small>Эти правила заменяют общий формат для выбранных стран или городов.</small>
               </label>
-              <div class="field" style="margin-top: 14px;">
+              <div class="field hh-only" style="margin-top: 14px;">
                 Тип занятости
                 <div id="employmentGroup" class="check-grid"></div>
               </div>
-              <div class="grid-2" style="margin-top: 14px;">
+              <div class="grid-2 hh-only" style="margin-top: 14px;">
                 <label class="field">
                   Минимальная зарплата
                   <input id="salaryMin" type="number" min="0" step="1000" placeholder="0">
@@ -9197,6 +9521,10 @@ def _web_ui_html():
                   </span>
                 </label>
               </div>
+              <div class="mode-card linkedin-only">
+                <h3>Формат LinkedIn</h3>
+                <div class="hint">Формат и уровень опыта LinkedIn настраиваются в разделе «Основное», потому что LinkedIn принимает их как параметры поискового запроса.</div>
+              </div>
         </section>
 
         <section class="panel filter-panel">
@@ -9206,15 +9534,23 @@ def _web_ui_html():
             </div>
           </div>
               <div class="grid-4">
-                <label class="field">
+                <label class="field hh-only">
                   Сортировка
                   <select id="sort"></select>
                 </label>
-                <label class="field">
+                <label class="field hh-only">
                   Период поиска
                   <select id="periodDays"></select>
                 </label>
-                <label class="field">
+                <label class="field linkedin-only">
+                  Сортировка LinkedIn
+                  <select id="linkedinSort"></select>
+                </label>
+                <label class="field linkedin-only">
+                  Период LinkedIn
+                  <select id="linkedinPeriod"></select>
+                </label>
+                <label class="field hh-only">
                   Страниц на запрос
                   <input id="maxPages" type="number" min="1" max="20">
                 </label>
@@ -9325,6 +9661,8 @@ def _web_ui_html():
     const state = {
       data: null,
       selectedTemplateId: '',
+      selectedLinkedinTemplateId: '',
+      currentSource: localStorage.getItem('hh_web_source') || 'hh',
       result: null,
       resultPage: 0,
       resultPageSize: Number(localStorage.getItem('hh_result_page_size') || 10),
@@ -9579,16 +9917,67 @@ def _web_ui_html():
       }).join('');
     }
 
+    function renderCheckboxDropdown(container, hiddenSelect, items, selectedValues, emptyText) {
+      const selected = new Set((selectedValues || []).map(String));
+      renderMultiSelect(hiddenSelect, items, Array.from(selected));
+      const selectedLabels = items
+        .filter((item) => selected.has(String(item.id)))
+        .map((item) => item.label);
+      container.innerHTML = (
+        '<button type="button" class="ghost dropdown-toggle">' +
+          '<span>' + escapeHtml(selectedLabels.length ? selectedLabels.join(', ') : emptyText) + '</span>' +
+        '</button>' +
+        '<div class="dropdown-menu">' +
+          items.map((item) => {
+            const checked = selected.has(String(item.id)) ? ' checked' : '';
+            return (
+              '<label class="check-pill">' +
+                '<input type="checkbox" value="' + escapeHtml(item.id) + '"' + checked + '>' +
+                '<span>' + escapeHtml(item.label) + '</span>' +
+              '</label>'
+            );
+          }).join('') +
+        '</div>'
+      );
+    }
+
+    function bindCheckboxDropdown(container, hiddenSelect, itemsGetter, emptyText) {
+      container.addEventListener('click', (event) => {
+        const items = typeof itemsGetter === 'function' ? itemsGetter() : itemsGetter;
+        const toggle = event.target.closest('.dropdown-toggle');
+        if (toggle) {
+          event.preventDefault();
+          container.classList.toggle('open');
+          return;
+        }
+        const checkbox = event.target.closest('input[type="checkbox"]');
+        if (checkbox) {
+          const values = Array.from(container.querySelectorAll('input[type="checkbox"]:checked')).map((input) => input.value);
+          renderCheckboxDropdown(container, hiddenSelect, items, values, emptyText);
+          container.classList.add('open');
+        }
+      });
+      document.addEventListener('click', (event) => {
+        if (!container.contains(event.target)) {
+          container.classList.remove('open');
+        }
+      });
+    }
+
     function readCheckedValues(container) {
       return Array.from(container.querySelectorAll('input[type="checkbox"]:checked')).map((input) => input.value);
     }
 
     function currentTemplates() {
-      return (state.data && state.data.templates) || [];
+      if (!state.data) {
+        return [];
+      }
+      return state.currentSource === 'linkedin' ? (state.data.linkedin_templates || []) : (state.data.templates || []);
     }
 
     function getSelectedTemplate() {
-      return currentTemplates().find((item) => item.id === state.selectedTemplateId) || null;
+      const selectedId = state.currentSource === 'linkedin' ? state.selectedLinkedinTemplateId : state.selectedTemplateId;
+      return currentTemplates().find((item) => item.id === selectedId) || null;
     }
 
     function renderLoadError(error) {
@@ -9611,14 +10000,24 @@ def _web_ui_html():
     function renderStatus() {
       const status = state.data.status;
       const hhOauth = status.hh_oauth || {};
-      els.statusSearch.textContent = status.searching ? 'Автопроверка включена' : 'Автопроверка на паузе';
-      els.statusTemplate.textContent = status.active_template_name || 'не выбран';
+      const isLinkedin = state.currentSource === 'linkedin';
+      const searching = isLinkedin ? status.linkedin_searching : status.searching;
+      const templateName = isLinkedin ? status.linkedin_active_template_name : status.active_template_name;
+      const lastCheck = isLinkedin ? status.linkedin_last_check : status.last_check;
+      document.body.classList.toggle('source-linkedin', isLinkedin);
+      document.body.classList.toggle('source-hh', !isLinkedin);
+      els.sourceHhBtn.classList.toggle('active', !isLinkedin);
+      els.sourceLinkedinBtn.classList.toggle('active', isLinkedin);
+      els.statusSearch.textContent = searching ? 'Автопроверка включена' : 'Автопроверка на паузе';
+      els.statusTemplate.textContent = templateName || 'не выбран';
       els.statusChat.textContent = status.chat_configured ? 'Чат подключён' : 'Чат ещё не подключён';
-      els.statusLastCheck.textContent = formatDate(status.last_check);
-      els.toggleBtn.textContent = status.searching ? 'Поставить на паузу' : 'Включить автопроверку';
+      els.statusLastCheck.textContent = formatDate(lastCheck);
+      els.toggleBtn.textContent = searching ? 'Поставить на паузу' : 'Включить автопроверку';
       els.connectHhBtn.textContent = hhOauth.authorized ? 'HH подключён' : 'Подключить HH';
-      els.connectHhBtn.disabled = !hhOauth.configured || !!hhOauth.authorized;
-      els.areaHint.textContent = '';
+      els.connectHhBtn.disabled = isLinkedin || !hhOauth.configured || !!hhOauth.authorized;
+      els.areaHint.textContent = isLinkedin
+        ? 'Для LinkedIn основная локация задаётся в поле выше, а исключения добавляются отдельными chips.'
+        : 'Начните вводить страну или город, выберите вариант из подсказок и нажмите добавить.';
     }
 
     function renderEditorPanels() {
@@ -9645,30 +10044,44 @@ def _web_ui_html():
         return;
       }
       els.templateList.innerHTML = templates.map((template) => {
-        const isActive = template.id === state.data.active_template_id;
-        const isSelected = template.id === state.selectedTemplateId;
-        const experienceLabels = (template.experience || []).map((item) => optionLabel(state.data.options.experience, item));
-        const workFormatLabels = (template.work_formats || []).map((item) => optionLabel(state.data.options.work_formats, item));
-        const areaRuleLabels = (template.area_work_format_rules || []).map((rule) => {
-          const labels = (rule.work_formats || []).map((item) => optionLabel(state.data.options.work_formats, item));
-          return (rule.area_name || rule.area_id || 'Регион') + ': ' + (labels.join(', ') || '—');
-        });
-        let geographyText = previewList(template.included_area_names || [], 'Все страны');
-        if ((template.excluded_area_names || []).length) {
-          geographyText += ' · кроме ' + previewList(template.excluded_area_names || [], '—');
+        const isLinkedin = state.currentSource === 'linkedin';
+        const isActive = isLinkedin ? template.id === state.data.linkedin_active_template_id : template.id === state.data.active_template_id;
+        const isSelected = isLinkedin ? template.id === state.selectedLinkedinTemplateId : template.id === state.selectedTemplateId;
+        let meta = [];
+        if (isLinkedin) {
+          const experienceLabels = (template.experience_levels || []).map((item) => optionLabel(state.data.options.linkedin_experience, item));
+          meta = [
+            'Что ищем: ' + ((template.queries || template.keywords || []).slice(0, 2).join(', ') || '—'),
+            'Локация: ' + (template.location || 'Worldwide'),
+            'Исключить: ' + previewList(template.excluded_locations || [], 'нет'),
+            'Опыт: ' + previewList(experienceLabels, 'Любой'),
+            'Формат: ' + optionLabel(state.data.options.linkedin_remote, template.remote_filter || ''),
+            isActive ? 'Сейчас используется как текущий LinkedIn-шаблон' : 'Сохранён как отдельный LinkedIn-шаблон'
+          ].join('\\n');
+        } else {
+          const experienceLabels = (template.experience || []).map((item) => optionLabel(state.data.options.experience, item));
+          const workFormatLabels = (template.work_formats || []).map((item) => optionLabel(state.data.options.work_formats, item));
+          const areaRuleLabels = (template.area_work_format_rules || []).map((rule) => {
+            const labels = (rule.work_formats || []).map((item) => optionLabel(state.data.options.work_formats, item));
+            return (rule.area_name || rule.area_id || 'Регион') + ': ' + (labels.join(', ') || '—');
+          });
+          let geographyText = previewList(template.included_area_names || [], 'Все страны');
+          if ((template.excluded_area_names || []).length) {
+            geographyText += ' · кроме ' + previewList(template.excluded_area_names || [], '—');
+          }
+          meta = [
+            'Что ищем: ' + ((template.queries || []).slice(0, 2).join(', ') || '—'),
+            'Где ищем: ' + geographyText,
+            'Опыт: ' + previewOrList(experienceLabels, 'Не важно'),
+            'Формат: ' + previewList(workFormatLabels, 'Любой'),
+            'Формат по регионам: ' + previewList(areaRuleLabels, 'нет'),
+            isActive ? 'Сейчас используется как текущий шаблон' : 'Сохранён как отдельный шаблон'
+          ].join('\\n');
         }
         const classes = ['template-card'];
         if (isActive || isSelected) {
           classes.push('active');
         }
-        const meta = [
-          'Что ищем: ' + ((template.queries || []).slice(0, 2).join(', ') || '—'),
-          'Где ищем: ' + geographyText,
-          'Опыт: ' + previewOrList(experienceLabels, 'Не важно'),
-          'Формат: ' + previewList(workFormatLabels, 'Любой'),
-          'Формат по регионам: ' + previewList(areaRuleLabels, 'нет'),
-          isActive ? 'Сейчас используется как текущий шаблон' : 'Сохранён как отдельный шаблон'
-        ].join('\\n');
         return (
           '<div class="' + classes.join(' ') + '">' +
             '<div>' +
@@ -9687,24 +10100,35 @@ def _web_ui_html():
 
     function fillForm(template) {
       const options = state.data.options;
-      const current = template || state.data.new_template;
-      state.selectedTemplateId = current.id || '';
+      const current = template || (state.currentSource === 'linkedin' ? state.data.linkedin_new_template : state.data.new_template);
+      if (state.currentSource === 'linkedin') {
+        state.selectedLinkedinTemplateId = current.id || '';
+      } else {
+        state.selectedTemplateId = current.id || '';
+      }
 
       els.name.value = current.name || '';
-      els.queries.value = (current.queries || []).join('\\n');
+      els.queries.value = (current.queries || current.keywords || []).join('\\n');
       renderMultiSelect(els.searchFields, options.search_fields, current.search_fields || []);
+      renderCheckboxDropdown(els.searchFieldsDropdown, els.searchFields, options.search_fields, current.search_fields || [], 'Выберите поля поиска');
       renderCheckGroup(els.experienceGroup, options.experience, current.experience || []);
       renderCheckGroup(els.excludedExperienceGroup, options.experience.filter((item) => item.id !== 'any'), current.excluded_experience || []);
       els.includedAreas.value = (current.included_area_names || []).join('\\n');
       els.excludedAreas.value = (current.excluded_area_names || []).join('\\n');
+      els.linkedinLocation.value = current.location || 'Worldwide';
+      els.linkedinExcludedLocations.value = (current.excluded_locations || []).join('\\n');
+      renderCheckGroup(els.linkedinExperienceGroup, options.linkedin_experience, current.experience_levels || []);
+      renderSelect(els.linkedinRemote, options.linkedin_remote, current.remote_filter || '');
+      renderSelect(els.linkedinSort, options.linkedin_sort, current.sort_by || 'DD');
+      renderSelect(els.linkedinPeriod, options.linkedin_period, current.posted_within || 'r2592000');
       els.includeKeywords.value = (current.include_keywords || []).join('\\n');
       els.excludeKeywords.value = (current.exclude_keywords || []).join('\\n');
       els.titleIncludeKeywords.value = (current.title_include_keywords || []).join('\\n');
       els.titleExcludeKeywords.value = (current.title_exclude_keywords || []).join('\\n');
-      Object.values(state.chipEditors).forEach((editor) => editor && editor.render && editor.render());
       els.includeIn.value = current.include_in || 'both';
       els.excludeIn.value = current.exclude_in || 'both';
       els.excludedEmployers.value = (current.excluded_employers || []).join('\\n');
+      Object.values(state.chipEditors).forEach((editor) => editor && editor.render && editor.render());
       renderCheckGroup(els.workFormatsGroup, options.work_formats, current.work_formats || []);
       els.areaWorkFormats.value = current.area_work_format_rules_text || '';
       renderCheckGroup(els.employmentGroup, options.employment_types, current.employment_types || []);
@@ -9720,7 +10144,28 @@ def _web_ui_html():
     }
 
     function gatherForm() {
+      if (state.currentSource === 'linkedin') {
+        return {
+          source: 'linkedin',
+          id: state.selectedLinkedinTemplateId || '',
+          name: els.name.value.trim(),
+          keywords: splitValues(els.queries.value),
+          queries: splitValues(els.queries.value),
+          location: els.linkedinLocation.value.trim() || 'Worldwide',
+          excluded_locations: splitValues(els.linkedinExcludedLocations.value),
+          remote_filter: els.linkedinRemote.value,
+          experience_levels: readCheckedValues(els.linkedinExperienceGroup),
+          posted_within: els.linkedinPeriod.value,
+          sort_by: els.linkedinSort.value,
+          include_keywords: splitValues(els.includeKeywords.value),
+          exclude_keywords: splitValues(els.excludeKeywords.value),
+          max_results: els.maxResults.value,
+          delivery_page_size: els.deliveryPageSize.value,
+          interval: els.interval.value
+        };
+      }
       return {
+        source: 'hh',
         id: state.selectedTemplateId || '',
         name: els.name.value.trim(),
         queries: splitValues(els.queries.value),
@@ -9825,7 +10270,10 @@ def _web_ui_html():
     function renderAll() {
       renderStatus();
       renderTemplateList();
-      fillForm(getSelectedTemplate() || state.data.active_template || state.data.new_template);
+      const fallbackTemplate = state.currentSource === 'linkedin'
+        ? (state.data.linkedin_active_template || state.data.linkedin_new_template)
+        : (state.data.active_template || state.data.new_template);
+      fillForm(getSelectedTemplate() || fallbackTemplate);
       renderResults();
       renderEditorPanels();
     }
@@ -9833,17 +10281,36 @@ def _web_ui_html():
     async function loadState(preferredTemplateId) {
       const payload = await api('/api/web-state');
       state.data = payload.state;
-      const templateIds = new Set(currentTemplates().map((item) => item.id));
-      if (preferredTemplateId && templateIds.has(preferredTemplateId)) {
-        state.selectedTemplateId = preferredTemplateId;
-      } else if (state.selectedTemplateId && templateIds.has(state.selectedTemplateId)) {
-        // keep current selection
+      if (state.currentSource !== 'linkedin' && state.currentSource !== 'hh') {
+        state.currentSource = state.data.current_source || 'hh';
+      }
+      const templateIds = new Set((state.data.templates || []).map((item) => item.id));
+      if (state.selectedTemplateId && templateIds.has(state.selectedTemplateId)) {
+        // keep current HH selection
       } else if (state.data.active_template) {
         state.selectedTemplateId = state.data.active_template.id;
-      } else if (currentTemplates()[0]) {
-        state.selectedTemplateId = currentTemplates()[0].id;
+      } else if ((state.data.templates || [])[0]) {
+        state.selectedTemplateId = state.data.templates[0].id;
       } else {
         state.selectedTemplateId = state.data.new_template.id;
+      }
+      const linkedinTemplateIds = new Set((state.data.linkedin_templates || []).map((item) => item.id));
+      if (state.selectedLinkedinTemplateId && linkedinTemplateIds.has(state.selectedLinkedinTemplateId)) {
+        // keep current LinkedIn selection
+      } else if (state.data.linkedin_active_template) {
+        state.selectedLinkedinTemplateId = state.data.linkedin_active_template.id;
+      } else if ((state.data.linkedin_templates || [])[0]) {
+        state.selectedLinkedinTemplateId = state.data.linkedin_templates[0].id;
+      } else {
+        state.selectedLinkedinTemplateId = state.data.linkedin_new_template.id;
+      }
+      if (preferredTemplateId) {
+        if (state.currentSource === 'linkedin' && linkedinTemplateIds.has(preferredTemplateId)) {
+          state.selectedLinkedinTemplateId = preferredTemplateId;
+        }
+        if (state.currentSource === 'hh' && templateIds.has(preferredTemplateId)) {
+          state.selectedTemplateId = preferredTemplateId;
+        }
       }
       renderAll();
     }
@@ -9852,6 +10319,7 @@ def _web_ui_html():
       const payload = await api('/api/web-template-save', {
         method: 'POST',
         body: JSON.stringify({
+          source: state.currentSource,
           template: gatherForm(),
           activate: !!activate
         })
@@ -9868,12 +10336,12 @@ def _web_ui_html():
     }
 
     async function activateTemplate(id) {
-      const targetId = id || state.selectedTemplateId;
+      const targetId = id || (state.currentSource === 'linkedin' ? state.selectedLinkedinTemplateId : state.selectedTemplateId);
       if (!targetId) {
         showMessage('Сначала сохраните шаблон.', 'error');
         return;
       }
-      await api('/api/web-template-activate?template_id=' + encodeURIComponent(targetId), { method: 'POST' });
+      await api('/api/web-template-activate?template_id=' + encodeURIComponent(targetId) + '&source=' + encodeURIComponent(state.currentSource), { method: 'POST' });
       state.result = null;
       state.resultPage = 0;
       await loadState(targetId);
@@ -9881,7 +10349,7 @@ def _web_ui_html():
     }
 
     async function deleteTemplate(id) {
-      const targetId = id || state.selectedTemplateId;
+      const targetId = id || (state.currentSource === 'linkedin' ? state.selectedLinkedinTemplateId : state.selectedTemplateId);
       if (!targetId) {
         showMessage('Нет выбранного шаблона для удаления.', 'error');
         return;
@@ -9889,7 +10357,7 @@ def _web_ui_html():
       if (!window.confirm('Удалить этот шаблон?')) {
         return;
       }
-      await api('/api/web-template-delete?template_id=' + encodeURIComponent(targetId), { method: 'POST' });
+      await api('/api/web-template-delete?template_id=' + encodeURIComponent(targetId) + '&source=' + encodeURIComponent(state.currentSource), { method: 'POST' });
       state.result = null;
       state.resultPage = 0;
       await loadState();
@@ -9897,21 +10365,23 @@ def _web_ui_html():
     }
 
     async function resetSent() {
-      const targetId = state.selectedTemplateId;
+      const targetId = state.currentSource === 'linkedin' ? state.selectedLinkedinTemplateId : state.selectedTemplateId;
       if (!targetId) {
         showMessage('Сначала сохраните или выберите шаблон.', 'error');
         return;
       }
-      await api('/api/web-template-reset-sent?template_id=' + encodeURIComponent(targetId), { method: 'POST' });
+      await api('/api/web-template-reset-sent?template_id=' + encodeURIComponent(targetId) + '&source=' + encodeURIComponent(state.currentSource), { method: 'POST' });
       await loadState(targetId);
       showMessage('История отправленных вакансий очищена.', 'success');
     }
 
     async function toggleSearching() {
-      const nextStatus = !state.data.status.searching;
+      const nextStatus = state.currentSource === 'linkedin'
+        ? !state.data.status.linkedin_searching
+        : !state.data.status.searching;
       await api('/api/web-searching', {
         method: 'POST',
-        body: JSON.stringify({ searching: nextStatus })
+        body: JSON.stringify({ source: state.currentSource, searching: nextStatus })
       });
       await loadState(state.selectedTemplateId);
       showMessage(nextStatus ? 'Автопроверка включена.' : 'Автопроверка поставлена на паузу.', 'success');
@@ -9927,6 +10397,7 @@ def _web_ui_html():
       const payload = await api(path, {
         method: 'POST',
         body: JSON.stringify({
+          source: state.currentSource,
           template_id: form.id || '',
           template: persist ? null : form
         })
@@ -9935,7 +10406,11 @@ def _web_ui_html():
       state.resultPage = 0;
       state.data = payload.state;
       if (payload.template && payload.template.id) {
-        state.selectedTemplateId = payload.template.id;
+        if (state.currentSource === 'linkedin') {
+          state.selectedLinkedinTemplateId = payload.template.id;
+        } else {
+          state.selectedTemplateId = payload.template.id;
+        }
       }
       renderAll();
       if (payload.result.reason) {
@@ -9948,7 +10423,11 @@ def _web_ui_html():
     function selectTemplate(id) {
       state.result = null;
       state.resultPage = 0;
-      state.selectedTemplateId = id;
+      if (state.currentSource === 'linkedin') {
+        state.selectedLinkedinTemplateId = id;
+      } else {
+        state.selectedTemplateId = id;
+      }
       renderAll();
       showMessage('', 'info');
     }
@@ -9956,15 +10435,36 @@ def _web_ui_html():
     function createNewTemplate() {
       state.result = null;
       state.resultPage = 0;
-      state.selectedTemplateId = state.data.new_template.id;
-      fillForm(state.data.new_template);
+      const draft = state.currentSource === 'linkedin' ? state.data.linkedin_new_template : state.data.new_template;
+      if (state.currentSource === 'linkedin') {
+        state.selectedLinkedinTemplateId = draft.id;
+      } else {
+        state.selectedTemplateId = draft.id;
+      }
+      fillForm(draft);
       renderTemplateList();
       renderResults();
       showMessage('Открыт новый шаблон. Заполните поля и сохраните его.', 'info');
     }
 
+    function switchSource(source) {
+      const nextSource = source === 'linkedin' ? 'linkedin' : 'hh';
+      if (state.currentSource === nextSource) {
+        return;
+      }
+      state.currentSource = nextSource;
+      localStorage.setItem('hh_web_source', nextSource);
+      state.result = null;
+      state.resultPage = 0;
+      renderAll();
+      showMessage('', 'info');
+    }
+
     function bindEvents() {
-      els.refreshBtn.addEventListener('click', () => loadState(state.selectedTemplateId).then(() => showMessage('Данные обновлены.', 'success')).catch((error) => showMessage(error.message, 'error')));
+      els.sourceHhBtn.addEventListener('click', () => switchSource('hh'));
+      els.sourceLinkedinBtn.addEventListener('click', () => switchSource('linkedin'));
+      bindCheckboxDropdown(els.searchFieldsDropdown, els.searchFields, () => state.data ? state.data.options.search_fields : [], 'Выберите поля поиска');
+      els.refreshBtn.addEventListener('click', () => loadState(state.currentSource === 'linkedin' ? state.selectedLinkedinTemplateId : state.selectedTemplateId).then(() => showMessage('Данные обновлены.', 'success')).catch((error) => showMessage(error.message, 'error')));
       els.toggleBtn.addEventListener('click', () => toggleSearching().catch((error) => showMessage(error.message, 'error')));
       els.runBtn.addEventListener('click', () => runSearch(true).catch((error) => showMessage(error.message, 'error')));
       els.previewBtn.addEventListener('click', () => runSearch(false).catch((error) => showMessage(error.message, 'error')));
@@ -10015,6 +10515,8 @@ def _web_ui_html():
       els.tokenBox = qs('tokenBox');
       els.authToken = qs('authToken');
       els.saveTokenBtn = qs('saveTokenBtn');
+      els.sourceHhBtn = qs('sourceHhBtn');
+      els.sourceLinkedinBtn = qs('sourceLinkedinBtn');
       els.statusSearch = qs('statusSearch');
       els.statusTemplate = qs('statusTemplate');
       els.statusChat = qs('statusChat');
@@ -10028,9 +10530,18 @@ def _web_ui_html():
       els.templateList = qs('templateList');
       els.name = qs('name');
       els.queries = qs('queries');
+      els.queriesEditor = qs('queriesEditor');
       els.searchFields = qs('searchFields');
+      els.searchFieldsDropdown = qs('searchFieldsDropdown');
       els.experienceGroup = qs('experienceGroup');
       els.excludedExperienceGroup = qs('excludedExperienceGroup');
+      els.linkedinLocation = qs('linkedinLocation');
+      els.linkedinExperienceGroup = qs('linkedinExperienceGroup');
+      els.linkedinRemote = qs('linkedinRemote');
+      els.linkedinSort = qs('linkedinSort');
+      els.linkedinPeriod = qs('linkedinPeriod');
+      els.linkedinExcludedLocations = qs('linkedinExcludedLocations');
+      els.linkedinExcludedLocationsEditor = qs('linkedinExcludedLocationsEditor');
       els.includedAreas = qs('includedAreas');
       els.excludedAreas = qs('excludedAreas');
       els.includedAreaEditor = qs('includedAreaEditor');
@@ -10047,6 +10558,7 @@ def _web_ui_html():
       els.includeIn = qs('includeIn');
       els.excludeIn = qs('excludeIn');
       els.excludedEmployers = qs('excludedEmployers');
+      els.excludedEmployersEditor = qs('excludedEmployersEditor');
       els.workFormatsGroup = qs('workFormatsGroup');
       els.areaWorkFormats = qs('areaWorkFormats');
       els.employmentGroup = qs('employmentGroup');
@@ -10072,15 +10584,23 @@ def _web_ui_html():
       els.resultsPageSize = qs('resultsPageSize');
       els.resultsPageSize.value = String(state.resultPageSize);
 
+      state.chipEditors.queries = createChipEditor(els.queriesEditor, els.queries, {
+        placeholder: 'Например: data analyst',
+        emptyText: 'Запросы не добавлены'
+      });
       state.chipEditors.includedAreas = createChipEditor(els.includedAreaEditor, els.includedAreas, {
         kind: 'area',
-        placeholder: 'Страна или город',
+        placeholder: 'Введите страну или город',
         emptyText: 'Все страны и города'
       });
       state.chipEditors.excludedAreas = createChipEditor(els.excludedAreaEditor, els.excludedAreas, {
         kind: 'area',
-        placeholder: 'Страна или город',
+        placeholder: 'Введите страну или город',
         emptyText: 'Нет исключений'
+      });
+      state.chipEditors.linkedinExcludedLocations = createChipEditor(els.linkedinExcludedLocationsEditor, els.linkedinExcludedLocations, {
+        placeholder: 'Страна или город',
+        emptyText: 'Нет исключений LinkedIn'
       });
       state.chipEditors.titleInclude = createChipEditor(els.titleIncludeEditor, els.titleIncludeKeywords, {
         placeholder: 'Текст в названии',
@@ -10097,6 +10617,10 @@ def _web_ui_html():
       state.chipEditors.excludeKeywords = createChipEditor(els.excludeKeywordEditor, els.excludeKeywords, {
         placeholder: 'Слово для исключения',
         emptyText: 'Нет исключений'
+      });
+      state.chipEditors.excludedEmployers = createChipEditor(els.excludedEmployersEditor, els.excludedEmployers, {
+        placeholder: 'Название работодателя',
+        emptyText: 'Нет исключённых работодателей'
       });
 
       if (TOKEN_REQUIRED) {
@@ -10317,15 +10841,26 @@ if FastAPI is not None:
             return _web_unauthorized_response()
         payload = await _read_request_json(request)
         data = load_data()
-        template, warnings = _build_template_from_payload(payload.get("template") or {})
+        source = "linkedin" if str(payload.get("source") or (payload.get("template") or {}).get("source") or "") == "linkedin" else "hh"
         activate = _coerce_bool(payload.get("activate"))
-        template = _upsert_template(data, template, activate=activate)
-        _ensure_templates_ready(data)
+        if source == "linkedin":
+            template, warnings = _build_linkedin_template_from_payload(payload.get("template") or {})
+            template = _upsert_linkedin_template(data, template, activate=activate)
+            _ensure_linkedin_templates_ready(data)
+            response_template = _linkedin_template_to_web_payload(template)
+        else:
+            template, warnings = _build_template_from_payload(payload.get("template") or {})
+            template = _upsert_template(data, template, activate=activate)
+            _ensure_templates_ready(data)
+            if activate:
+                _set_current_source(data, "hh")
+            response_template = _template_to_web_payload(template)
         save_data(data)
         return {
             "ok": True,
             "warnings": warnings,
-            "template": _template_to_web_payload(template),
+            "source": source,
+            "template": response_template,
             "state": _build_web_state(data),
         }
 
@@ -10335,11 +10870,22 @@ if FastAPI is not None:
         if not _web_request_authorized(request):
             return _web_unauthorized_response()
         data = load_data()
+        source = "linkedin" if str(request.query_params.get("source") or "") == "linkedin" else "hh"
+        if source == "linkedin":
+            tmpl = next((item for item in data.get("linkedin_templates", []) if item.get("id") == template_id), None)
+            if not tmpl:
+                return JSONResponse({"ok": False, "error": "LinkedIn-шаблон не найден"}, status_code=404)
+            data["linkedin_active_template_id"] = template_id
+            data.setdefault("linkedin_sent_ids_by_template", {}).setdefault(str(template_id), [])
+            _set_current_source(data, "linkedin")
+            save_data(data)
+            return {"ok": True, "state": _build_web_state(data)}
         tmpl = next((item for item in data.get("templates", []) if item.get("id") == template_id), None)
         if not tmpl:
             return JSONResponse({"ok": False, "error": "Шаблон не найден"}, status_code=404)
         data["active_template_id"] = template_id
         data.setdefault("sent_ids_by_template", {}).setdefault(str(template_id), [])
+        _set_current_source(data, "hh")
         save_data(data)
         return {"ok": True, "state": _build_web_state(data)}
 
@@ -10349,6 +10895,14 @@ if FastAPI is not None:
         if not _web_request_authorized(request):
             return _web_unauthorized_response()
         data = load_data()
+        source = "linkedin" if str(request.query_params.get("source") or "") == "linkedin" else "hh"
+        if source == "linkedin":
+            tmpl = next((item for item in data.get("linkedin_templates", []) if item.get("id") == template_id), None)
+            if not tmpl:
+                return JSONResponse({"ok": False, "error": "LinkedIn-шаблон не найден"}, status_code=404)
+            _set_linkedin_template_sent_ids(data, template_id, [])
+            save_data(data)
+            return {"ok": True, "state": _build_web_state(data)}
         tmpl = next((item for item in data.get("templates", []) if item.get("id") == template_id), None)
         if not tmpl:
             return JSONResponse({"ok": False, "error": "Шаблон не найден"}, status_code=404)
@@ -10362,6 +10916,19 @@ if FastAPI is not None:
         if not _web_request_authorized(request):
             return _web_unauthorized_response()
         data = load_data()
+        source = "linkedin" if str(request.query_params.get("source") or "") == "linkedin" else "hh"
+        if source == "linkedin":
+            before = len(data.get("linkedin_templates", []))
+            data["linkedin_templates"] = [item for item in data.get("linkedin_templates", []) if item.get("id") != template_id]
+            if len(data["linkedin_templates"]) == before:
+                return JSONResponse({"ok": False, "error": "LinkedIn-шаблон не найден"}, status_code=404)
+            data.get("linkedin_sent_ids_by_template", {}).pop(str(template_id), None)
+            if data.get("linkedin_active_template_id") == template_id:
+                data["linkedin_active_template_id"] = data["linkedin_templates"][0]["id"] if data["linkedin_templates"] else None
+                data["linkedin_searching"] = False
+            _ensure_linkedin_templates_ready(data)
+            save_data(data)
+            return {"ok": True, "state": _build_web_state(data)}
         before = len(data.get("templates", []))
         data["templates"] = [item for item in data.get("templates", []) if item.get("id") != template_id]
         if len(data["templates"]) == before:
@@ -10381,9 +10948,18 @@ if FastAPI is not None:
             return _web_unauthorized_response()
         payload = await _read_request_json(request)
         data = load_data()
+        source = "linkedin" if str(payload.get("source") or "") == "linkedin" else "hh"
+        if source == "linkedin":
+            if not _linkedin_active_template(data):
+                return JSONResponse({"ok": False, "error": "Нет текущего LinkedIn-шаблона"}, status_code=400)
+            data["linkedin_searching"] = _coerce_bool(payload.get("searching"))
+            _set_current_source(data, "linkedin")
+            save_data(data)
+            return {"ok": True, "state": _build_web_state(data)}
         if not _active_template(data):
             return JSONResponse({"ok": False, "error": "Нет текущего шаблона"}, status_code=400)
         data["searching"] = _coerce_bool(payload.get("searching"))
+        _set_current_source(data, "hh")
         save_data(data)
         return {"ok": True, "state": _build_web_state(data)}
 
@@ -10395,16 +10971,35 @@ if FastAPI is not None:
         payload = await _read_request_json(request)
         data = load_data()
         template_id = str(payload.get("template_id") or "").strip()
+        source = "linkedin" if str(payload.get("source") or "") == "linkedin" else "hh"
+        if source == "linkedin":
+            tmpl = next((item for item in data.get("linkedin_templates", []) if item.get("id") == template_id), None)
+            if not tmpl:
+                return JSONResponse({"ok": False, "error": "Сначала сохраните LinkedIn-шаблон, потом запускайте обычный режим"}, status_code=400)
+            _set_current_source(data, "linkedin")
+            save_data(data)
+            result = _web_linkedin_search_response(data, tmpl, persist=True)
+            latest_data = load_data()
+            return {
+                "ok": True,
+                "source": source,
+                "template": _linkedin_template_to_web_payload(tmpl),
+                "result": result,
+                "state": _build_web_state(latest_data),
+            }
         tmpl = next((item for item in data.get("templates", []) if item.get("id") == template_id), None)
         if not tmpl:
             return JSONResponse({"ok": False, "error": "Сначала сохраните шаблон, потом запускайте обычный режим"}, status_code=400)
-        result = _web_search_response(data, tmpl, persist=True)
+        _set_current_source(data, "hh")
         save_data(data)
+        result = _web_search_response(data, tmpl, persist=True)
+        latest_data = load_data()
         return {
             "ok": True,
+            "source": source,
             "template": _template_to_web_payload(tmpl),
             "result": result,
-            "state": _build_web_state(data),
+            "state": _build_web_state(latest_data),
         }
 
     @app.post("/api/web/search/preview")
@@ -10416,7 +11011,28 @@ if FastAPI is not None:
         data = load_data()
         template_payload = payload.get("template") or {}
         template_id = str(payload.get("template_id") or "").strip()
+        source = "linkedin" if str(payload.get("source") or (template_payload or {}).get("source") or "") == "linkedin" else "hh"
         warnings = []
+        if source == "linkedin":
+            if template_payload:
+                tmpl, warnings = _build_linkedin_template_from_payload(template_payload)
+            elif template_id:
+                tmpl = next((item for item in data.get("linkedin_templates", []) if item.get("id") == template_id), None)
+                if tmpl is None:
+                    return JSONResponse({"ok": False, "error": "LinkedIn-шаблон не найден"}, status_code=404)
+            else:
+                return JSONResponse({"ok": False, "error": "Нет данных для предпросмотра"}, status_code=400)
+            _set_current_source(data, "linkedin")
+            save_data(data)
+            result = _web_linkedin_search_response(data, tmpl, persist=False)
+            return {
+                "ok": True,
+                "source": source,
+                "warnings": warnings,
+                "template": _linkedin_template_to_web_payload(tmpl),
+                "result": result,
+                "state": _build_web_state(load_data()),
+            }
         if template_payload:
             tmpl, warnings = _build_template_from_payload(template_payload)
         elif template_id:
@@ -10425,13 +11041,16 @@ if FastAPI is not None:
                 return JSONResponse({"ok": False, "error": "Шаблон не найден"}, status_code=404)
         else:
             return JSONResponse({"ok": False, "error": "Нет данных для предпросмотра"}, status_code=400)
+        _set_current_source(data, "hh")
+        save_data(data)
         result = _web_search_response(data, tmpl, persist=False)
         return {
             "ok": True,
+            "source": source,
             "warnings": warnings,
             "template": _template_to_web_payload(tmpl),
             "result": result,
-            "state": _build_web_state(data),
+            "state": _build_web_state(load_data()),
         }
 
     @app.get("/webhook-info")
