@@ -9926,6 +9926,53 @@ def _web_ui_html():
         grid-template-columns: 1fr;
       }
     }
+    .sidebar-column > .editor-tabs {
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+      margin: 0;
+      padding: 8px;
+      border: 1px solid #d8e0eb;
+      border-radius: 14px;
+      background: #f8fafc;
+      overflow: hidden;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.75);
+    }
+    .sidebar-column > .editor-tabs .editor-tab {
+      min-width: 0;
+      width: 100%;
+      min-height: 40px;
+      border-radius: 10px;
+      padding: 8px 9px;
+      text-align: center;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    @media (max-width: 820px) {
+      .sidebar-column > .editor-tabs {
+        position: sticky;
+        top: 0;
+        z-index: 30;
+        display: flex;
+        flex-wrap: nowrap;
+        gap: 8px;
+        overflow-x: auto;
+        overflow-y: hidden;
+        margin: 0;
+        padding: 8px;
+        scrollbar-gutter: stable;
+        -webkit-overflow-scrolling: touch;
+      }
+      .sidebar-column > .editor-tabs .editor-tab {
+        flex: 0 0 auto;
+        width: auto;
+        min-width: 112px;
+      }
+    }
   </style>
 </head>
 <body class="source-hh">
@@ -9959,16 +10006,15 @@ def _web_ui_html():
       </button>
     </section>
 
-    <nav class="editor-tabs" aria-label="Разделы редактора">
-      <button class="editor-tab active" type="button" data-panel-index="0">Основное</button>
-      <button class="editor-tab" type="button" data-panel-index="1">География</button>
-      <button class="editor-tab" type="button" data-panel-index="2">Слова</button>
-      <button class="editor-tab" type="button" data-panel-index="3">Формат</button>
-      <button class="editor-tab" type="button" data-panel-index="4">Выдача</button>
-    </nav>
-
     <section class="workspace">
       <aside class="sidebar-column">
+        <nav class="editor-tabs" aria-label="Разделы редактора">
+          <button class="editor-tab active" type="button" data-panel-index="0">Основное</button>
+          <button class="editor-tab" type="button" data-panel-index="1">География</button>
+          <button class="editor-tab" type="button" data-panel-index="2">Слова</button>
+          <button class="editor-tab" type="button" data-panel-index="3">Формат</button>
+          <button class="editor-tab" type="button" data-panel-index="4">Выдача</button>
+        </nav>
         <section id="scenarioPanel" class="panel scenario-panel">
         <div class="sidebar-head">
           <button id="templatesToggleBtn" class="templates-toggle" type="button" aria-expanded="true">
