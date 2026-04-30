@@ -8429,6 +8429,40 @@ def _web_ui_html():
       align-items: center;
       white-space: nowrap;
     }
+    .result-pagination {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+    }
+    .page-buttons {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .page-button {
+      min-width: 38px;
+      min-height: 38px;
+      padding: 8px 11px;
+      border: 1px solid var(--line-strong);
+      background: #fff;
+    }
+    .page-button.active {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #fff;
+    }
+    .page-ellipsis {
+      min-width: 24px;
+      color: var(--muted);
+      text-align: center;
+      font-weight: 700;
+    }
     .field-row {
       display: flex;
       flex-wrap: wrap;
@@ -9230,6 +9264,9 @@ def _web_ui_html():
       align-items: center;
       gap: 8px;
     }
+    .result-pagination {
+      align-items: center;
+    }
     .results-list {
       gap: 12px;
     }
@@ -9651,6 +9688,7 @@ def _web_ui_html():
               Здесь появятся найденные вакансии после нажатия на «Проверить сейчас» или «Предпросмотр».
             </div>
           </div>
+          <div id="resultsPagerBottom" class="result-pagination"></div>
         </section>
       </main>
     </section>
@@ -10195,6 +10233,55 @@ def _web_ui_html():
       };
     }
 
+    function paginationItems(pageIndex, pageCount) {
+      if (pageCount <= 7) {
+        return Array.from({ length: pageCount }, (_, index) => index);
+      }
+      const current = Math.max(0, Math.min(pageIndex, pageCount - 1));
+      const pages = new Set([0, pageCount - 1, current]);
+      for (let index = current - 2; index <= current + 2; index += 1) {
+        if (index > 0 && index < pageCount - 1) {
+          pages.add(index);
+        }
+      }
+      const sorted = Array.from(pages).sort((a, b) => a - b);
+      const items = [];
+      sorted.forEach((page, index) => {
+        if (index > 0 && page - sorted[index - 1] > 1) {
+          items.push('ellipsis-' + index);
+        }
+        items.push(page);
+      });
+      return items;
+    }
+
+    function renderBottomPager(pageCount, totalCount) {
+      if (!els.resultsPagerBottom) {
+        return;
+      }
+      if (!state.result || !totalCount) {
+        els.resultsPagerBottom.innerHTML = '';
+        return;
+      }
+      const currentPage = state.resultPage + 1;
+      const buttons = paginationItems(state.resultPage, pageCount).map((item) => {
+        if (typeof item === 'string') {
+          return '<span class="page-ellipsis">...</span>';
+        }
+        const active = item === state.resultPage ? ' active' : '';
+        const label = String(item + 1);
+        return '<button class="page-button' + active + '" type="button" data-result-page="' + item + '">' + label + '</button>';
+      }).join('');
+      els.resultsPagerBottom.innerHTML = (
+        '<div class="hint">Страница ' + currentPage + ' из ' + pageCount + '</div>' +
+        '<div class="page-buttons">' +
+          '<button class="ghost" type="button" data-result-step="-1"' + (state.resultPage <= 0 ? ' disabled' : '') + '>Назад</button>' +
+          buttons +
+          '<button class="ghost" type="button" data-result-step="1"' + (state.resultPage >= pageCount - 1 ? ' disabled' : '') + '>Далее</button>' +
+        '</div>'
+      );
+    }
+
     function renderResults() {
       const result = state.result;
       if (!result) {
@@ -10203,6 +10290,7 @@ def _web_ui_html():
         els.resultsPage.textContent = '';
         els.resultsPrev.disabled = true;
         els.resultsNext.disabled = true;
+        renderBottomPager(1, 0);
         return;
       }
 
@@ -10265,6 +10353,7 @@ def _web_ui_html():
       els.resultsPage.textContent = 'Страница ' + (state.resultPage + 1) + ' из ' + pageCount;
       els.resultsPrev.disabled = state.resultPage <= 0;
       els.resultsNext.disabled = state.resultPage >= pageCount - 1;
+      renderBottomPager(pageCount, vacancies.length);
     }
 
     function renderAll() {
@@ -10485,6 +10574,19 @@ def _web_ui_html():
         state.resultPage += 1;
         renderResults();
       });
+      els.resultsPagerBottom.addEventListener('click', (event) => {
+        const pageButton = event.target.closest('button[data-result-page]');
+        const stepButton = event.target.closest('button[data-result-step]');
+        if (pageButton) {
+          state.resultPage = Number(pageButton.dataset.resultPage || 0);
+          renderResults();
+          return;
+        }
+        if (stepButton) {
+          state.resultPage += Number(stepButton.dataset.resultStep || 0);
+          renderResults();
+        }
+      });
       els.resultsPageSize.addEventListener('change', () => {
         state.resultPageSize = Math.max(1, Number(els.resultsPageSize.value || 10));
         localStorage.setItem('hh_result_page_size', String(state.resultPageSize));
@@ -10581,6 +10683,7 @@ def _web_ui_html():
       els.resultsPrev = qs('resultsPrev');
       els.resultsNext = qs('resultsNext');
       els.resultsPage = qs('resultsPage');
+      els.resultsPagerBottom = qs('resultsPagerBottom');
       els.resultsPageSize = qs('resultsPageSize');
       els.resultsPageSize.value = String(state.resultPageSize);
 
