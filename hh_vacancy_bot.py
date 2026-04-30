@@ -8136,8 +8136,8 @@ def _web_ui_html():
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>HH</title>
-  <link id="appFavicon" rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Ccircle%20cx='32'%20cy='32'%20r='32'%20fill='%23e1011c'/%3E%3Ctext%20x='32'%20y='39'%20font-size='22'%20font-family='Arial,sans-serif'%20font-weight='700'%20text-anchor='middle'%20fill='white'%3EHH%3C/text%3E%3C/svg%3E">
+  <title>hh bot</title>
+  <link id="appFavicon" rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Ccircle%20cx='32'%20cy='32'%20r='32'%20fill='%23e1011c'/%3E%3Ctext%20x='32'%20y='39'%20font-size='22'%20font-family='Arial,sans-serif'%20font-weight='700'%20text-anchor='middle'%20fill='white'%3Ehh%3C/text%3E%3C/svg%3E">
   <style>
     :root {
       --bg: #f5f7fb;
@@ -8205,7 +8205,7 @@ def _web_ui_html():
       height: 46px;
       flex: 0 0 46px;
       color: #fff;
-      font: 800 18px/1 Arial, sans-serif;
+      font: 800 17px/1 Arial, sans-serif;
       letter-spacing: 0;
       overflow: hidden;
       user-select: none;
@@ -9752,8 +9752,10 @@ def _web_ui_html():
         gap: 8px;
         overflow-x: auto;
         overflow-y: hidden;
-        margin: 0 -16px 14px;
-        padding: 8px 16px 12px;
+        max-width: 100%;
+        margin: 0 0 14px;
+        padding: 8px 10px 14px;
+        border-radius: 14px;
         background: #f4f6f9;
         scrollbar-gutter: stable;
         -webkit-overflow-scrolling: touch;
@@ -9780,8 +9782,8 @@ def _web_ui_html():
     <section class="app-header">
       <div class="app-header-main">
         <div class="brand-row">
-          <span id="appLogo" class="brand-logo" aria-label="HH">HH</span>
-          <h1 id="appTitle">Шаблоны HH</h1>
+          <span id="appLogo" class="brand-logo" aria-label="hh">hh</span>
+          <h1 id="appTitle">Шаблоны hh</h1>
         </div>
       </div>
       <div class="app-header-side">
@@ -9797,8 +9799,8 @@ def _web_ui_html():
 
     <section class="source-picker" aria-label="Источник вакансий">
       <button id="sourceHhBtn" class="source-card active" type="button" data-source="hh">
-        <span class="source-title">HH</span>
-        <span class="source-note">Шаблоны, OAuth-поиск, страны и города из справочника HH.</span>
+        <span class="source-title">hh</span>
+        <span class="source-note">Шаблоны, OAuth-поиск, страны и города из справочника hh.</span>
       </button>
       <button id="sourceLinkedinBtn" class="source-card" type="button" data-source="linkedin">
         <span class="source-title">LinkedIn</span>
@@ -10083,7 +10085,7 @@ def _web_ui_html():
             <button id="toggleBtn" class="secondary" type="button">Пауза автопроверки</button>
             <button id="runBtn" class="primary" type="button">Проверить сейчас</button>
             <button id="previewBtn" class="ghost" type="button">Предпросмотр</button>
-            <button id="connectHhBtn" class="ghost" type="button">Подключить HH</button>
+            <button id="connectHhBtn" class="ghost" type="button">Подключить hh</button>
           </div>
           <div class="summary-shell">
             <div class="summary-title">Сводка шаблона</div>
@@ -10144,18 +10146,18 @@ def _web_ui_html():
     const els = {};
     const SOURCE_CHROME = {
       hh: {
-        title: 'HH',
-        heading: 'Шаблоны HH',
-        logoText: 'HH',
-        logoLabel: 'HH',
+        title: 'hh bot',
+        heading: 'Шаблоны hh',
+        logoText: 'hh',
+        logoLabel: 'hh',
         faviconShape: 'circle',
-        faviconText: 'HH',
+        faviconText: 'hh',
         faviconBg: '#e1011c',
         faviconDy: '39',
         faviconFontSize: '22'
       },
       linkedin: {
-        title: 'LinkedIn',
+        title: 'LinkedIn bot',
         heading: 'Шаблоны LinkedIn',
         logoText: 'in',
         logoLabel: 'LinkedIn',
@@ -10544,7 +10546,7 @@ def _web_ui_html():
       els.statusChat.textContent = status.chat_configured ? 'Чат подключён' : 'Чат ещё не подключён';
       els.statusLastCheck.textContent = formatDate(lastCheck);
       els.toggleBtn.textContent = searching ? 'Поставить на паузу' : 'Включить автопроверку';
-      els.connectHhBtn.textContent = hhOauth.authorized ? 'Статус HH token' : 'Подключить HH';
+      els.connectHhBtn.textContent = hhOauth.authorized ? 'Статус hh token' : 'Подключить hh';
       els.connectHhBtn.disabled = isLinkedin || (!hhOauth.configured && !hhOauth.authorized);
       els.areaHint.textContent = isLinkedin
         ? 'Для LinkedIn основная локация задаётся в поле выше, а исключения добавляются отдельными chips.'
