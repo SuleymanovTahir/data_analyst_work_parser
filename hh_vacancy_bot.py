@@ -686,6 +686,7 @@ def _apply_hh_token_payload(data, payload):
         "oauth_state_expires_at": 0,
     })
     data["hh_oauth"] = token_data
+    _hh_clear_temporary_block(data)
     save_data(data)
     return token_data
 
@@ -747,6 +748,8 @@ def _ensure_hh_oauth_token_fresh(data):
     token_data = _normalize_hh_oauth_state(data.get("hh_oauth"))
     data["hh_oauth"] = token_data
     if HH_ACCESS_TOKEN:
+        if _hh_clear_temporary_block(data):
+            save_data(data)
         return False
     expires_at = float(token_data.get("expires_at") or 0)
     if not token_data.get("access_token"):
@@ -757,6 +760,8 @@ def _ensure_hh_oauth_token_fresh(data):
             print(f"⚠️ Не удалось получить HH application token: {e}")
             return False
     if not expires_at or expires_at > time.time() + 60:
+        if _hh_clear_temporary_block(data):
+            save_data(data)
         return False
     try:
         return _refresh_hh_oauth_token(data)
@@ -1564,6 +1569,8 @@ def _set_run_in_progress(data, value, mode=""):
 
 
 def _hh_block_remaining_seconds(data):
+    if _hh_access_token_from_state(data):
+        return 0
     try:
         block_until = float((data or {}).get("hh_block_until", 0) or 0)
     except Exception:
@@ -1586,6 +1593,7 @@ def _hh_clear_temporary_block(data):
 
 def _hh_is_temporarily_blocked(data):
     if _hh_access_token_from_state(data):
+        _hh_clear_temporary_block(data)
         return False
     remaining = _hh_block_remaining_seconds(data)
     if remaining > 0:
@@ -1612,6 +1620,9 @@ def _hh_set_temporary_block(data, reason="", seconds=HH_BLOCK_FORBIDDEN_SECONDS)
 
 
 def _hh_block_message(data):
+    if _hh_access_token_from_state(data):
+        _hh_clear_temporary_block(data)
+        return ""
     remaining = _hh_block_remaining_seconds(data)
     if remaining <= 0:
         return ""
@@ -2825,7 +2836,7 @@ def _fetch_vacancy_batch(
             except requests.HTTPError as e:
                 status_code = int((e.response.status_code if e.response is not None else 0) or 0)
                 is_retryable = status_code in (403, 429, 500, 502, 503, 504)
-                if is_retryable and attempt < HH_REQUEST_RETRIES:
+                if not unrestricted_hh_token_search and is_retryable and attempt < HH_REQUEST_RETRIES:
                     delay = HH_RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
                     if status_code == 403:
                         delay = max(delay, HH_403_COOLDOWN_SECONDS)
@@ -5198,6 +5209,8 @@ def _set_current_source(data, source):
 def _execute_search_result(data, tmpl, persist=True):
     _ensure_hh_oauth_token_fresh(data)
     hh_access_token = _hh_access_token_from_state(data)
+    if hh_access_token and _hh_clear_temporary_block(data):
+        save_data(data)
 
     runtime_options = _hh_runtime_options(data, tmpl, advance_cursor=bool(persist))
     runtime_options["auth_data"] = data
@@ -5266,6 +5279,8 @@ def _execute_search_result(data, tmpl, persist=True):
 def _run_search_live(chat_id, data, tmpl):
     _ensure_hh_oauth_token_fresh(data)
     hh_access_token = _hh_access_token_from_state(data)
+    if hh_access_token and _hh_clear_temporary_block(data):
+        save_data(data)
     if not hh_access_token:
         oauth = _normalize_hh_oauth_state(data.get("hh_oauth"))
         detail = oauth.get("last_error") or "HH access token недоступен."
@@ -5573,15 +5588,18 @@ def _build_runtime_status(data=None):
     tmpl = _active_template(data)
     linkedin_tmpl = _linkedin_active_template(data)
     run_in_progress = _is_run_in_progress(data)
+    hh_blocked = _hh_is_temporarily_blocked(data)
+    hh_block_until = int(float(data.get("hh_block_until", 0) or 0))
+    hh_block_reason = str(data.get("hh_block_reason") or "")
     return {
         "service": "hh-vacancy-bot",
         "platform": "vercel" if IS_VERCEL else "local",
         "current_source": _current_source(data),
         "searching": bool(data.get("searching", False)),
         "linkedin_searching": bool(data.get("linkedin_searching", False)),
-        "hh_block_until": int(float(data.get("hh_block_until", 0) or 0)),
-        "hh_blocked": _hh_is_temporarily_blocked(data),
-        "hh_block_reason": str(data.get("hh_block_reason") or ""),
+        "hh_block_until": hh_block_until,
+        "hh_blocked": hh_blocked,
+        "hh_block_reason": hh_block_reason,
         "hh_oauth": _hh_oauth_public_status(data),
         "run_in_progress": run_in_progress,
         "chat_configured": bool(data.get("chat_id")),
