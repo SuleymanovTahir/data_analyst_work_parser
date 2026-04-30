@@ -8136,7 +8136,8 @@ def _web_ui_html():
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>HH Vacancy Bot</title>
+  <title>HH</title>
+  <link id="appFavicon" rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Ccircle%20cx='32'%20cy='32'%20r='32'%20fill='%23e1011c'/%3E%3Ctext%20x='32'%20y='39'%20font-size='22'%20font-family='Arial,sans-serif'%20font-weight='700'%20text-anchor='middle'%20fill='white'%3EHH%3C/text%3E%3C/svg%3E">
   <style>
     :root {
       --bg: #f5f7fb;
@@ -8185,23 +8186,39 @@ def _web_ui_html():
       grid-template-columns: minmax(0, 1.45fr) minmax(320px, 0.85fr);
       align-items: start;
     }
-    .eyebrow {
-      display: inline-flex;
-      align-items: center;
-      width: fit-content;
-      border-radius: 999px;
-      background: var(--accent-soft);
-      color: var(--accent-2);
-      font-size: 12px;
-      font-weight: 700;
-      padding: 6px 10px;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-    }
     .app-header-main {
       display: grid;
       gap: 10px;
       min-width: 0;
+    }
+    .brand-row {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-width: 0;
+    }
+    .brand-logo {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 46px;
+      height: 46px;
+      flex: 0 0 46px;
+      color: #fff;
+      font: 800 18px/1 Arial, sans-serif;
+      letter-spacing: 0;
+      overflow: hidden;
+      user-select: none;
+    }
+    .source-hh .brand-logo {
+      background: #e1011c;
+      border-radius: 50%;
+    }
+    .source-linkedin .brand-logo {
+      background: #0a66c2;
+      border-radius: 9px;
+      font-size: 22px;
+      font-weight: 800;
     }
     .app-header-side {
       display: grid;
@@ -8226,6 +8243,8 @@ def _web_ui_html():
       font-size: 32px;
       line-height: 1.12;
       letter-spacing: -0.03em;
+      min-width: 0;
+      overflow-wrap: anywhere;
     }
     .app-header p {
       margin: 0;
@@ -9760,8 +9779,10 @@ def _web_ui_html():
   <div class="page">
     <section class="app-header">
       <div class="app-header-main">
-        <span class="eyebrow">HH</span>
-        <h1>Шаблоны поиска</h1>
+        <div class="brand-row">
+          <span id="appLogo" class="brand-logo" aria-label="HH">HH</span>
+          <h1 id="appTitle">Шаблоны HH</h1>
+        </div>
       </div>
       <div class="app-header-side">
         <div id="tokenBox" class="token-box">
@@ -10121,9 +10142,73 @@ def _web_ui_html():
     };
 
     const els = {};
+    const SOURCE_CHROME = {
+      hh: {
+        title: 'HH',
+        heading: 'Шаблоны HH',
+        logoText: 'HH',
+        logoLabel: 'HH',
+        faviconShape: 'circle',
+        faviconText: 'HH',
+        faviconBg: '#e1011c',
+        faviconDy: '39',
+        faviconFontSize: '22'
+      },
+      linkedin: {
+        title: 'LinkedIn',
+        heading: 'Шаблоны LinkedIn',
+        logoText: 'in',
+        logoLabel: 'LinkedIn',
+        faviconShape: 'rect',
+        faviconText: 'in',
+        faviconBg: '#0a66c2',
+        faviconDy: '42',
+        faviconFontSize: '26'
+      }
+    };
 
     function qs(id) {
       return document.getElementById(id);
+    }
+
+    function sourceChrome() {
+      return SOURCE_CHROME[state.currentSource === 'linkedin' ? 'linkedin' : 'hh'];
+    }
+
+    function sourceFaviconHref(chrome) {
+      const shape = chrome.faviconShape === 'rect'
+        ? '<rect x="0" y="0" width="64" height="64" rx="10" fill="' + chrome.faviconBg + '"/>'
+        : '<circle cx="32" cy="32" r="32" fill="' + chrome.faviconBg + '"/>';
+      const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+        + shape
+        + '<text x="32" y="' + chrome.faviconDy + '" font-size="' + chrome.faviconFontSize + '" font-family="Arial,sans-serif" font-weight="800" text-anchor="middle" fill="white">'
+        + chrome.faviconText
+        + '</text></svg>';
+      return 'data:image/svg+xml,' + encodeURIComponent(svg);
+    }
+
+    function renderSourceChrome() {
+      const chrome = sourceChrome();
+      const isLinkedin = state.currentSource === 'linkedin';
+      document.title = chrome.title;
+      document.body.classList.toggle('source-linkedin', isLinkedin);
+      document.body.classList.toggle('source-hh', !isLinkedin);
+      if (els.appTitle) {
+        els.appTitle.textContent = chrome.heading;
+      }
+      if (els.appLogo) {
+        els.appLogo.textContent = chrome.logoText;
+        els.appLogo.setAttribute('aria-label', chrome.logoLabel);
+      }
+      if (els.appFavicon) {
+        els.appFavicon.setAttribute('href', sourceFaviconHref(chrome));
+      }
+      if (els.sourceHhBtn) {
+        els.sourceHhBtn.classList.toggle('active', !isLinkedin);
+      }
+      if (els.sourceLinkedinBtn) {
+        els.sourceLinkedinBtn.classList.toggle('active', isLinkedin);
+      }
     }
 
     function splitValues(value) {
@@ -10453,10 +10538,7 @@ def _web_ui_html():
       const searching = isLinkedin ? status.linkedin_searching : status.searching;
       const templateName = isLinkedin ? status.linkedin_active_template_name : status.active_template_name;
       const lastCheck = isLinkedin ? status.linkedin_last_check : status.last_check;
-      document.body.classList.toggle('source-linkedin', isLinkedin);
-      document.body.classList.toggle('source-hh', !isLinkedin);
-      els.sourceHhBtn.classList.toggle('active', !isLinkedin);
-      els.sourceLinkedinBtn.classList.toggle('active', isLinkedin);
+      renderSourceChrome();
       els.statusSearch.textContent = searching ? 'Автопроверка включена' : 'Автопроверка на паузе';
       els.statusTemplate.textContent = templateName || 'не выбран';
       els.statusChat.textContent = status.chat_configured ? 'Чат подключён' : 'Чат ещё не подключён';
@@ -11049,6 +11131,9 @@ def _web_ui_html():
     }
 
     async function init() {
+      els.appFavicon = qs('appFavicon');
+      els.appLogo = qs('appLogo');
+      els.appTitle = qs('appTitle');
       els.messageBox = qs('messageBox');
       els.tokenBox = qs('tokenBox');
       els.authToken = qs('authToken');
@@ -11124,6 +11209,7 @@ def _web_ui_html():
       els.resultsPagerBottom = qs('resultsPagerBottom');
       els.resultsPageSize = qs('resultsPageSize');
       els.resultsPageSize.value = String(state.resultPageSize);
+      renderSourceChrome();
 
       state.chipEditors.queries = createChipEditor(els.queriesEditor, els.queries, {
         placeholder: 'Например: data analyst',
