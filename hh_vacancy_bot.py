@@ -9926,7 +9926,8 @@ def _web_ui_html():
         grid-template-columns: 1fr;
       }
     }
-    .sidebar-column > .editor-tabs {
+    .workspace > .editor-tabs {
+      grid-column: 1 / -1;
       width: 100%;
       max-width: 100%;
       min-width: 0;
@@ -9941,7 +9942,7 @@ def _web_ui_html():
       overflow: hidden;
       box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.75);
     }
-    .sidebar-column > .editor-tabs .editor-tab {
+    .workspace > .editor-tabs .editor-tab {
       min-width: 0;
       width: 100%;
       min-height: 40px;
@@ -9953,7 +9954,8 @@ def _web_ui_html():
       text-overflow: ellipsis;
     }
     @media (max-width: 820px) {
-      .sidebar-column > .editor-tabs {
+      .workspace > .editor-tabs {
+        grid-column: auto;
         position: sticky;
         top: 0;
         z-index: 30;
@@ -9967,11 +9969,17 @@ def _web_ui_html():
         scrollbar-gutter: stable;
         -webkit-overflow-scrolling: touch;
       }
-      .sidebar-column > .editor-tabs .editor-tab {
+      .workspace > .editor-tabs .editor-tab {
         flex: 0 0 auto;
         width: auto;
         min-width: 112px;
       }
+    }
+    .workspace > .editor-tabs .editor-tab.hidden-field {
+      display: none;
+    }
+    .source-linkedin .workspace > .editor-tabs {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
     }
     .overview-panel .quick-actions {
       display: grid;
@@ -10018,6 +10026,109 @@ def _web_ui_html():
       border-color: #b9c9ff;
       box-shadow: inset 0 0 0 1px rgba(53, 109, 255, 0.12);
     }
+    .chip-summary {
+      width: 100%;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      padding: 10px 12px;
+      border: 1px solid #dfe7f2;
+      border-radius: 12px;
+      background: #f8fafc;
+    }
+    .chip-summary strong,
+    .chip-summary span {
+      display: block;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .chip-summary strong {
+      color: #1f2737;
+      font-size: 13px;
+    }
+    .chip-summary span {
+      margin-top: 3px;
+      color: #697588;
+      font-size: 12px;
+    }
+    .chip-collapse {
+      flex: 1 0 100%;
+      width: 100%;
+      min-height: 34px;
+    }
+    .template-primary-action {
+      display: grid;
+    }
+    .template-more {
+      display: grid;
+      gap: 8px;
+    }
+    .template-more summary {
+      cursor: pointer;
+      color: #516074;
+      font-weight: 700;
+    }
+    .template-meta-extra {
+      margin-top: 4px;
+      padding-top: 8px;
+      border-top: 1px solid #edf1f6;
+    }
+    .overview-panel .summary-shell {
+      display: grid;
+      padding: 0 24px 16px;
+    }
+    .overview-panel .summary-box {
+      border: 0;
+      padding: 0;
+      background: transparent;
+    }
+    .summary-metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+      gap: 8px;
+    }
+    .summary-metric {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-width: 0;
+      padding: 9px 11px;
+      border: 1px solid #e3e9f2;
+      border-radius: 11px;
+      background: #f8fafc;
+    }
+    .summary-metric strong {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: #697588;
+      font-size: 12px;
+    }
+    .summary-metric b {
+      color: #1f2737;
+      font-size: 14px;
+    }
+    .status-grid {
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    }
+    .status-action {
+      cursor: pointer;
+      transition: border-color 0.12s ease, background 0.12s ease;
+    }
+    .status-action:hover,
+    .status-action:focus-visible {
+      border-color: #b9c9ff;
+      background: #f8fbff;
+      outline: none;
+    }
+    .result-controls.hidden-field {
+      display: none;
+    }
     @media (max-width: 640px) {
       .overview-panel .quick-actions {
         padding: 14px 16px 18px;
@@ -10025,6 +10136,9 @@ def _web_ui_html():
       .quick-action-primary,
       .quick-action-secondary {
         grid-template-columns: 1fr;
+      }
+      .overview-panel .summary-shell {
+        padding: 0 16px 14px;
       }
     }
   </style>
@@ -10061,14 +10175,14 @@ def _web_ui_html():
     </section>
 
     <section class="workspace">
+      <nav class="editor-tabs" aria-label="Разделы редактора">
+        <button class="editor-tab active" type="button" data-panel-index="0">Основное</button>
+        <button class="editor-tab" type="button" data-panel-index="1">География</button>
+        <button class="editor-tab" type="button" data-panel-index="2">Слова</button>
+        <button class="editor-tab" type="button" data-panel-index="3" data-hide-source="linkedin">Формат</button>
+        <button class="editor-tab" type="button" data-panel-index="4">Выдача</button>
+      </nav>
       <aside class="sidebar-column">
-        <nav class="editor-tabs" aria-label="Разделы редактора">
-          <button class="editor-tab active" type="button" data-panel-index="0">Основное</button>
-          <button class="editor-tab" type="button" data-panel-index="1">География</button>
-          <button class="editor-tab" type="button" data-panel-index="2">Слова</button>
-          <button class="editor-tab" type="button" data-panel-index="3">Формат</button>
-          <button class="editor-tab" type="button" data-panel-index="4">Выдача</button>
-        </nav>
         <section id="scenarioPanel" class="panel scenario-panel">
         <div class="sidebar-head">
           <button id="templatesToggleBtn" class="templates-toggle" type="button" aria-expanded="true">
@@ -10310,26 +10424,8 @@ def _web_ui_html():
         <section class="panel overview-panel">
           <div class="section-head">
             <div>
-              <h2>Текущий шаблон и автопроверка</h2>
+              <h2>Запуск поиска</h2>
             </div>
-          </div>
-          <div class="status-grid">
-            <article class="stat-card">
-              <strong>Автопроверка</strong>
-              <div id="statusSearch" class="stat-value">Загрузка...</div>
-            </article>
-            <article class="stat-card">
-              <strong>Текущий шаблон</strong>
-              <div id="statusTemplate" class="stat-value">Загрузка...</div>
-            </article>
-            <article class="stat-card">
-              <strong>Telegram</strong>
-              <div id="statusChat" class="stat-value">Загрузка...</div>
-            </article>
-            <article class="stat-card">
-              <strong>Последняя проверка</strong>
-              <div id="statusLastCheck" class="stat-value">Загрузка...</div>
-            </article>
           </div>
           <div class="quick-actions">
             <div class="quick-action-primary">
@@ -10343,8 +10439,26 @@ def _web_ui_html():
             </div>
           </div>
           <div class="summary-shell">
-            <div class="summary-title">Сводка шаблона</div>
+            <div class="summary-title">Коротко</div>
             <div id="currentSummary" class="summary-box"></div>
+          </div>
+          <div id="statusGrid" class="status-grid">
+            <article id="statusSearchCard" class="stat-card status-action" role="button" tabindex="0" data-status-action="toggle">
+              <strong>Автопроверка</strong>
+              <div id="statusSearch" class="stat-value">Загрузка...</div>
+            </article>
+            <article id="statusTemplateCard" class="stat-card status-action" role="button" tabindex="0" data-status-action="template">
+              <strong>Текущий шаблон</strong>
+              <div id="statusTemplate" class="stat-value">Загрузка...</div>
+            </article>
+            <article id="statusChatCard" class="stat-card status-action" role="button" tabindex="0" data-status-action="telegram">
+              <strong>Telegram</strong>
+              <div id="statusChat" class="stat-value">Загрузка...</div>
+            </article>
+            <article id="statusLastCheckCard" class="stat-card status-action" role="button" tabindex="0" data-status-action="refresh">
+              <strong>Последняя проверка</strong>
+              <div id="statusLastCheck" class="stat-value">Загрузка...</div>
+            </article>
           </div>
         </section>
 
@@ -10354,7 +10468,7 @@ def _web_ui_html():
               <h2>Результаты поиска</h2>
               <div id="resultsMeta" class="hint">Результатов пока нет.</div>
             </div>
-            <div class="result-controls">
+            <div id="resultControls" class="result-controls">
               <label class="field">
                 На странице
                 <select id="resultsPageSize">
@@ -10393,9 +10507,10 @@ def _web_ui_html():
       resultPage: 0,
       resultPageSize: Number(localStorage.getItem('hh_result_page_size') || 10),
       activeEditorPanel: Number(localStorage.getItem('hh_active_editor_panel') || 0),
-      templatesCollapsed: localStorage.getItem('hh_templates_collapsed') === '1',
+      templatesCollapsed: localStorage.getItem('hh_templates_collapsed') !== '0',
       authToken: localStorage.getItem('hh_web_admin_token') || '',
       chipEditors: {},
+      expandedChipEditors: {},
     };
 
     const els = {};
@@ -10528,7 +10643,28 @@ def _web_ui_html():
           listEl.innerHTML = '<span class="hint">' + escapeHtml(options.emptyText || 'Ничего не выбрано') + '</span>';
           return;
         }
-        listEl.innerHTML = current.map((value) => (
+        const collapseAfter = Number(options.collapseAfter || 8);
+        const editorKey = editorEl.id || hiddenEl.id || options.key || '';
+        const isLong = current.length > collapseAfter;
+        const isExpanded = !isLong || !!state.expandedChipEditors[editorKey];
+        if (isLong && !isExpanded) {
+          const preview = current.slice(0, 3).join(', ');
+          const label = options.summaryLabel || 'Выбрано';
+          listEl.innerHTML = (
+            '<div class="chip-summary">' +
+              '<div>' +
+                '<strong>' + escapeHtml(label) + ': ' + current.length + '</strong>' +
+                '<span>' + escapeHtml(preview + (current.length > 3 ? ' +' + (current.length - 3) : '')) + '</span>' +
+              '</div>' +
+              '<button type="button" class="ghost" data-chip-toggle="show">Показать</button>' +
+            '</div>'
+          );
+          return;
+        }
+        const collapseControl = isLong
+          ? '<button type="button" class="ghost chip-collapse" data-chip-toggle="hide">Свернуть список</button>'
+          : '';
+        listEl.innerHTML = collapseControl + current.map((value) => (
           '<span class="chip">' +
             '<span>' + escapeHtml(value) + '</span>' +
             '<button type="button" aria-label="Удалить" data-value="' + escapeHtml(value) + '">x</button>' +
@@ -10581,6 +10717,13 @@ def _web_ui_html():
       });
       input.addEventListener('input', searchAreas);
       listEl.addEventListener('click', (event) => {
+        const toggle = event.target.closest('button[data-chip-toggle]');
+        if (toggle) {
+          const editorKey = editorEl.id || hiddenEl.id || options.key || '';
+          state.expandedChipEditors[editorKey] = toggle.dataset.chipToggle === 'show';
+          render();
+          return;
+        }
         const button = event.target.closest('button[data-value]');
         if (button) {
           removeValue(button.dataset.value);
@@ -10633,6 +10776,34 @@ def _web_ui_html():
         return shown + ' +' + (items.length - limit);
       }
       return shown;
+    }
+
+    function compactTemplateSummary(template) {
+      const current = template || {};
+      const queries = current.queries || current.keywords || [];
+      const excludedAreas = state.currentSource === 'linkedin'
+        ? (current.excluded_locations || [])
+        : (current.excluded_area_names || []);
+      const excludedWords = []
+        .concat(current.exclude_keywords || [])
+        .concat(current.title_exclude_keywords || [])
+        .concat(current.excluded_employers || []);
+      const includedWords = []
+        .concat(current.include_keywords || [])
+        .concat(current.title_include_keywords || []);
+      const chips = [
+        ['Запросов', queries.length],
+        [state.currentSource === 'linkedin' ? 'Исключено локаций' : 'Исключено стран/городов', excludedAreas.length],
+        ['Исключено слов', excludedWords.length],
+        ['Обязательных слов', includedWords.length]
+      ];
+      return (
+        '<div class="summary-metrics">' +
+          chips.map((item) => (
+            '<span class="summary-metric"><strong>' + escapeHtml(item[0]) + '</strong><b>' + item[1] + '</b></span>'
+          )).join('') +
+        '</div>'
+      );
     }
 
     function formatDate(ts) {
@@ -10786,6 +10957,7 @@ def _web_ui_html():
       els.currentSummary.innerHTML = '';
       els.resultsMeta.textContent = 'Данные не загружены.';
       els.resultsList.innerHTML = '<div class="empty-results">После исправления ошибки нажмите «Обновить данные».</div>';
+      els.resultControls.classList.add('hidden-field');
       els.resultsPage.textContent = '';
       els.resultsPrev.disabled = true;
       els.resultsNext.disabled = true;
@@ -10793,16 +10965,18 @@ def _web_ui_html():
     }
 
     function renderStatus() {
-      const status = state.data.status;
+      const status = state.data && state.data.status ? state.data.status : {};
       const hhOauth = status.hh_oauth || {};
       const isLinkedin = state.currentSource === 'linkedin';
-      const searching = isLinkedin ? status.linkedin_searching : status.searching;
+      const searching = isLinkedin ? !!status.linkedin_searching : !!status.searching;
       const templateName = isLinkedin ? status.linkedin_active_template_name : status.active_template_name;
       const lastCheck = isLinkedin ? status.linkedin_last_check : status.last_check;
+      const chatConfigured = !!status.chat_configured;
       renderSourceChrome();
       els.statusSearch.textContent = searching ? 'Автопроверка включена' : 'Автопроверка на паузе';
       els.statusTemplate.textContent = templateName || 'не выбран';
-      els.statusChat.textContent = status.chat_configured ? 'Чат подключён' : 'Чат ещё не подключён';
+      els.statusChat.textContent = chatConfigured ? 'Чат подключён' : 'Чат ещё не подключён';
+      els.statusChatCard.classList.toggle('hidden-field', !chatConfigured);
       els.statusLastCheck.textContent = formatDate(lastCheck);
       els.toggleBtn.textContent = searching ? 'Поставить на паузу' : 'Включить автопроверку';
       els.connectHhBtn.classList.toggle('hidden-field', isLinkedin);
@@ -10830,11 +11004,21 @@ def _web_ui_html():
       if (!panels.length) {
         return;
       }
+      const isLinkedin = state.currentSource === 'linkedin';
+      tabs.forEach((tab) => {
+        tab.classList.toggle('hidden-field', isLinkedin && tab.dataset.hideSource === 'linkedin');
+      });
+      if (isLinkedin && state.activeEditorPanel === 3) {
+        state.activeEditorPanel = 0;
+        localStorage.setItem('hh_active_editor_panel', String(state.activeEditorPanel));
+      }
       if (state.activeEditorPanel < 0 || state.activeEditorPanel >= panels.length) {
         state.activeEditorPanel = 0;
       }
       panels.forEach((panel, index) => {
-        panel.classList.toggle('active-panel', index === state.activeEditorPanel);
+        const panelHidden = isLinkedin && index === 3;
+        panel.classList.toggle('hidden-field', panelHidden);
+        panel.classList.toggle('active-panel', !panelHidden && index === state.activeEditorPanel);
       });
       tabs.forEach((tab) => {
         tab.classList.toggle('active', Number(tab.dataset.panelIndex) === state.activeEditorPanel);
@@ -10848,6 +11032,35 @@ def _web_ui_html():
       els.scenarioPanel.classList.toggle('collapsed', !!state.templatesCollapsed);
       els.templatesToggleBtn.setAttribute('aria-expanded', state.templatesCollapsed ? 'false' : 'true');
       els.templatesToggleBtn.setAttribute('title', state.templatesCollapsed ? 'Показать мои шаблоны' : 'Свернуть мои шаблоны');
+    }
+
+    function openTemplatesPanel() {
+      state.templatesCollapsed = false;
+      localStorage.setItem('hh_templates_collapsed', '0');
+      renderTemplatesPanelState();
+      if (els.scenarioPanel) {
+        els.scenarioPanel.scrollIntoView({ block: 'start', behavior: 'smooth' });
+      }
+    }
+
+    function handleStatusAction(action) {
+      if (action === 'toggle') {
+        toggleSearching().catch((error) => showMessage(error.message, 'error'));
+        return;
+      }
+      if (action === 'template') {
+        openTemplatesPanel();
+        return;
+      }
+      if (action === 'refresh') {
+        loadState(state.currentSource === 'linkedin' ? state.selectedLinkedinTemplateId : state.selectedTemplateId)
+          .then(() => showMessage('Данные обновлены.', 'success'))
+          .catch((error) => showMessage(error.message, 'error'));
+        return;
+      }
+      if (action === 'telegram') {
+        showMessage('Telegram-статус обновляется через данные панели.', 'info');
+      }
     }
 
     function persistTemplateSelection() {
@@ -10876,7 +11089,7 @@ def _web_ui_html():
             'Опыт: ' + previewList(experienceLabels, 'Любой'),
             'Формат: ' + optionLabel(state.data.options.linkedin_remote, template.remote_filter || ''),
             isActive ? 'Сейчас используется как текущий LinkedIn-шаблон' : 'Сохранён как отдельный LinkedIn-шаблон'
-          ].join('\\n');
+          ];
         } else {
           const experienceLabels = (template.experience || []).map((item) => optionLabel(state.data.options.experience, item));
           const workFormatLabels = (template.work_formats || []).map((item) => optionLabel(state.data.options.work_formats, item));
@@ -10895,23 +11108,31 @@ def _web_ui_html():
             'Формат: ' + previewList(workFormatLabels, 'Любой'),
             'Формат по регионам: ' + previewList(areaRuleLabels, 'нет'),
             isActive ? 'Сейчас используется как текущий шаблон' : 'Сохранён как отдельный шаблон'
-          ].join('\\n');
+          ];
         }
         const classes = ['template-card'];
         if (isActive || isSelected) {
           classes.push('active');
         }
+        const visibleMeta = meta.slice(0, 2).join('\\n');
+        const detailsMeta = meta.slice(2).join('\\n');
         return (
           '<div class="' + classes.join(' ') + '">' +
             '<div>' +
               '<h4>' + escapeHtml(template.name) + '</h4>' +
-              '<div class="template-meta">' + escapeHtml(meta) + '</div>' +
+              '<div class="template-meta">' + escapeHtml(visibleMeta) + '</div>' +
             '</div>' +
-            '<div class="actions">' +
+            '<div class="template-primary-action">' +
               '<button class="ghost" type="button" onclick="selectTemplate(\\'' + template.id + '\\')">Открыть</button>' +
-              '<button class="ghost" type="button" onclick="activateTemplate(\\'' + template.id + '\\')">' + (isActive ? 'Текущий шаблон' : 'Сделать текущим') + '</button>' +
-              '<button class="danger" type="button" onclick="deleteTemplate(\\'' + template.id + '\\')">Удалить</button>' +
             '</div>' +
+            '<details class="template-more">' +
+              '<summary>Ещё действия</summary>' +
+              (detailsMeta ? '<div class="template-meta template-meta-extra">' + escapeHtml(detailsMeta) + '</div>' : '') +
+              '<div class="actions">' +
+                '<button class="ghost" type="button" onclick="activateTemplate(\\'' + template.id + '\\')">' + (isActive ? 'Текущий шаблон' : 'Сделать текущим') + '</button>' +
+                '<button class="danger" type="button" onclick="deleteTemplate(\\'' + template.id + '\\')">Удалить</button>' +
+              '</div>' +
+            '</details>' +
           '</div>'
         );
       }).join('');
@@ -10959,7 +11180,7 @@ def _web_ui_html():
       els.maxResults.value = current.max_results || 50;
       els.deliveryPageSize.value = current.delivery_page_size || 5;
       els.interval.value = current.interval || 30;
-      els.currentSummary.innerHTML = current.summary_html || '';
+      els.currentSummary.innerHTML = compactTemplateSummary(current);
     }
 
     function gatherForm() {
@@ -11071,12 +11292,14 @@ def _web_ui_html():
         els.resultsPage.textContent = '';
         els.resultsPrev.disabled = true;
         els.resultsNext.disabled = true;
+        els.resultControls.classList.add('hidden-field');
         renderBottomPager(1, 0);
         return;
       }
 
       const pageSize = Math.max(1, Number(state.resultPageSize || result.page_size || 10));
       const vacancies = result.vacancies || [];
+      els.resultControls.classList.toggle('hidden-field', !vacancies.length);
       const pageCount = Math.max(1, Math.ceil(vacancies.length / pageSize));
       if (state.resultPage >= pageCount) {
         state.resultPage = pageCount - 1;
@@ -11408,6 +11631,22 @@ def _web_ui_html():
         state.resultPage = 0;
         renderResults();
       });
+      els.statusGrid.addEventListener('click', (event) => {
+        const card = event.target.closest('.status-action[data-status-action]');
+        if (card) {
+          handleStatusAction(card.dataset.statusAction);
+        }
+      });
+      els.statusGrid.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') {
+          return;
+        }
+        const card = event.target.closest('.status-action[data-status-action]');
+        if (card) {
+          event.preventDefault();
+          handleStatusAction(card.dataset.statusAction);
+        }
+      });
       els.saveTokenBtn.addEventListener('click', async () => {
         state.authToken = els.authToken.value.trim();
         localStorage.setItem('hh_web_admin_token', state.authToken);
@@ -11441,6 +11680,8 @@ def _web_ui_html():
       els.statusTemplate = qs('statusTemplate');
       els.statusChat = qs('statusChat');
       els.statusLastCheck = qs('statusLastCheck');
+      els.statusGrid = qs('statusGrid');
+      els.statusChatCard = qs('statusChatCard');
       els.toggleBtn = qs('toggleBtn');
       els.refreshBtn = qs('refreshBtn');
       els.runBtn = qs('runBtn');
@@ -11501,6 +11742,7 @@ def _web_ui_html():
       els.resultsMeta = qs('resultsMeta');
       els.resultsPanel = qs('resultsPanel');
       els.resultsList = qs('resultsList');
+      els.resultControls = qs('resultControls');
       els.resultsPrev = qs('resultsPrev');
       els.resultsNext = qs('resultsNext');
       els.resultsPage = qs('resultsPage');
@@ -11511,41 +11753,59 @@ def _web_ui_html():
 
       state.chipEditors.queries = createChipEditor(els.queriesEditor, els.queries, {
         placeholder: 'Например: data analyst',
-        emptyText: 'Запросы не добавлены'
+        emptyText: 'Запросы не добавлены',
+        summaryLabel: 'Запросов',
+        collapseAfter: 10
       });
       state.chipEditors.includedAreas = createChipEditor(els.includedAreaEditor, els.includedAreas, {
         kind: 'area',
         placeholder: 'Введите страну или город',
-        emptyText: 'Все страны и города'
+        emptyText: 'Все страны и города',
+        summaryLabel: 'Выбрано стран/городов',
+        collapseAfter: 6
       });
       state.chipEditors.excludedAreas = createChipEditor(els.excludedAreaEditor, els.excludedAreas, {
         kind: 'area',
         placeholder: 'Введите страну или город',
-        emptyText: 'Нет исключений'
+        emptyText: 'Нет исключений',
+        summaryLabel: 'Исключено стран/городов',
+        collapseAfter: 6
       });
       state.chipEditors.linkedinExcludedLocations = createChipEditor(els.linkedinExcludedLocationsEditor, els.linkedinExcludedLocations, {
         placeholder: 'Страна или город',
-        emptyText: 'Нет исключений LinkedIn'
+        emptyText: 'Нет исключений LinkedIn',
+        summaryLabel: 'Исключено локаций',
+        collapseAfter: 6
       });
       state.chipEditors.titleInclude = createChipEditor(els.titleIncludeEditor, els.titleIncludeKeywords, {
         placeholder: 'Текст в названии',
-        emptyText: 'Нет обязательного текста'
+        emptyText: 'Нет обязательного текста',
+        summaryLabel: 'Условий в названии',
+        collapseAfter: 6
       });
       state.chipEditors.titleExclude = createChipEditor(els.titleExcludeEditor, els.titleExcludeKeywords, {
         placeholder: 'Текст в названии',
-        emptyText: 'Нет исключений'
+        emptyText: 'Нет исключений',
+        summaryLabel: 'Исключено из названия',
+        collapseAfter: 6
       });
       state.chipEditors.includeKeywords = createChipEditor(els.includeKeywordEditor, els.includeKeywords, {
         placeholder: 'Навык или слово',
-        emptyText: 'Нет обязательных слов'
+        emptyText: 'Нет обязательных слов',
+        summaryLabel: 'Обязательных слов',
+        collapseAfter: 8
       });
       state.chipEditors.excludeKeywords = createChipEditor(els.excludeKeywordEditor, els.excludeKeywords, {
         placeholder: 'Слово для исключения',
-        emptyText: 'Нет исключений'
+        emptyText: 'Нет исключений',
+        summaryLabel: 'Исключено слов',
+        collapseAfter: 8
       });
       state.chipEditors.excludedEmployers = createChipEditor(els.excludedEmployersEditor, els.excludedEmployers, {
         placeholder: 'Название работодателя',
-        emptyText: 'Нет исключённых работодателей'
+        emptyText: 'Нет исключённых работодателей',
+        summaryLabel: 'Исключено работодателей',
+        collapseAfter: 6
       });
 
       if (TOKEN_REQUIRED) {
