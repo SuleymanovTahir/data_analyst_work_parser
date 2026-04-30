@@ -10112,6 +10112,7 @@ def _web_ui_html():
     .summary-metric b {
       color: #1f2737;
       font-size: 14px;
+      white-space: nowrap;
     }
     .status-grid {
       grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -10793,7 +10794,7 @@ def _web_ui_html():
         .concat(current.title_include_keywords || []);
       const chips = [
         ['Запросов', queries.length],
-        [state.currentSource === 'linkedin' ? 'Исключено локаций' : 'Исключено стран/городов', excludedAreas.length],
+        ['Исключено локаций', excludedAreas.length],
         ['Исключено слов', excludedWords.length],
         ['Обязательных слов', includedWords.length]
       ];
