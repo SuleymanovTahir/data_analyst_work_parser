@@ -1,0 +1,224 @@
+══════════════════════════════════════════════════
+  HH Vacancy Bot — Деплой на Vercel
+══════════════════════════════════════════════════
+
+ЭТА ИНСТРУКЦИЯ ИМЕННО ДЛЯ ЭТОГО ПРОЕКТА:
+  /Users/tahir/Desktop/data_analyst_work
+
+ТЕКУЩИЙ ПРОД-ДОМЕН:
+  https://data-analyst-work-parser.vercel.app
+
+══════════════════════════════════════════════════
+  1. ЧТО НУЖНО ПЕРЕД ДЕПЛОЕМ
+══════════════════════════════════════════════════
+
+  • Аккаунт Vercel
+  • Подключённый Git-репозиторий или локальный Vercel CLI
+  • Telegram bot token
+  • Production URL, на который Telegram будет слать webhook
+
+Этот проект уже адаптирован под Vercel:
+  • backend работает из Python-файла hh_vacancy_bot.py
+  • маршруты описаны в vercel.json
+  • Telegram работает через webhook
+
+══════════════════════════════════════════════════
+  2. ОБЯЗАТЕЛЬНЫЕ ENV ПЕРЕМЕННЫЕ В VERCEL
+══════════════════════════════════════════════════
+
+Добавьте в Project Settings → Environment Variables:
+
+  HH_TELEGRAM_BOT_TOKEN
+    токен вашего Telegram-бота
+
+  HH_TELEGRAM_WEBHOOK_URL
+    production URL проекта без завершающего /
+    пример:
+    https://data-analyst-work-parser.vercel.app
+
+  CRON_SECRET
+    любой длинный секрет для защищённого /cron и /run-now
+
+Необязательные:
+
+  HH_WEB_ADMIN_TOKEN
+    если хотите закрыть web-панель токеном
+
+  HH_SEARCH_WORKERS
+    число параллельных воркеров поиска
+
+  HH_HTTP_POOL_SIZE
+    размер HTTP connection pool
+
+  HH_REQUEST_RETRIES
+    число повторов при ошибках HH
+
+══════════════════════════════════════════════════
+  3. ДЕПЛОЙ ЧЕРЕЗ VERCEL CLI
+══════════════════════════════════════════════════
+
+Если терминал уже открыт в корне проекта:
+
+  npx vercel deploy --prod --yes
+
+Если терминал открыт в домашней папке `~`, используйте отдельную команду:
+
+  cd /Users/tahir/Desktop/data_analyst_work && npx vercel deploy --prod --yes
+
+Не запускайте `npx vercel deploy --prod --yes` отдельно из `~`: Vercel будет пытаться деплоить домашнюю папку `/Users/tahir`, а не этот проект.
+
+Если проект ещё не linked:
+
+  cd /Users/tahir/Desktop/data_analyst_work
+  npx vercel
+
+Потом для production:
+
+  npx vercel deploy --prod --yes
+
+══════════════════════════════════════════════════
+  4. ЧТО СДЕЛАТЬ ПОСЛЕ ДЕПЛОЯ
+══════════════════════════════════════════════════
+
+После успешного деплоя:
+
+  1. Откройте:
+     /webhook-register
+
+     Полный пример:
+     https://data-analyst-work-parser.vercel.app/webhook-register
+
+  2. Проверьте:
+     /webhook-info
+
+     Полный пример:
+     https://data-analyst-work-parser.vercel.app/webhook-info
+
+  3. Откройте бота в Telegram и отправьте:
+     /start
+
+  4. Потом проверьте:
+     /menu
+     или
+     /run
+
+══════════════════════════════════════════════════
+  5. ОСНОВНЫЕ ENDPOINTS
+══════════════════════════════════════════════════
+
+  /                      — web-панель
+  /status                — статус бота
+  /health                — health-check
+  /webhook-info          — текущий webhook Telegram
+  /webhook-register      — регистрация webhook
+  /telegram-webhook      — endpoint для Telegram
+  /cron                  — защищённый endpoint планового запуска
+  /run-now               — защищённый endpoint немедленного HTTP-запуска
+  /api/web-state         — состояние шаблонов и панели
+  /api/web-search-run    — обычный поиск из web-панели
+  /api/web-search-preview — предпросмотр из web-панели
+
+══════════════════════════════════════════════════
+  6. КАК ПРОВЕРИТЬ, ЧТО ВСЁ РАБОТАЕТ
+══════════════════════════════════════════════════
+
+Проверка 1. Статус:
+  откройте /status
+
+Ожидаемо увидеть JSON со статусом сервиса.
+
+Проверка 2. Webhook:
+  откройте /webhook-info
+
+Ожидаемо:
+  • webhook установлен
+  • target указывает на ваш production URL
+
+Проверка 3. Telegram:
+  отправьте боту /start
+  потом /menu
+
+Проверка 4. Web-панель:
+  откройте /
+
+Ожидаемо:
+  • загрузится интерфейс
+  • появится текущий шаблон
+  • кнопки поиска и шаблонов будут работать
+
+══════════════════════════════════════════════════
+  7. КАК РАБОТАЕТ АВТОПРОВЕРКА НА БЕСПЛАТНОМ ПЛАНЕ
+══════════════════════════════════════════════════
+
+На Vercel Hobby не стоит рассчитывать только на внутренний cron.
+
+Для этого проекта уже предусмотрен внешний scheduler:
+  .github/workflows/hh-search-scheduler.yml
+
+Он вызывает endpoint:
+  https://data-analyst-work-parser.vercel.app/cron
+
+Для GitHub нужно добавить:
+
+  Repository Secret:
+    HH_CRON_SECRET
+
+  Repository Variable:
+    HH_CRON_URL
+
+Значения:
+  HH_CRON_SECRET = то же, что CRON_SECRET в Vercel
+  HH_CRON_URL    = https://data-analyst-work-parser.vercel.app/cron
+
+══════════════════════════════════════════════════
+  8. ЕСЛИ TELEGRAM НЕ ОТВЕЧАЕТ
+══════════════════════════════════════════════════
+
+Проверьте по порядку:
+
+  1. В Vercel заданы env:
+     HH_TELEGRAM_BOT_TOKEN
+     HH_TELEGRAM_WEBHOOK_URL
+
+  2. Выполнен /webhook-register
+
+  3. В /webhook-info нет ошибок доставки
+
+  4. Вы отправили боту /start после деплоя
+
+  5. Production URL именно тот, который указан в HH_TELEGRAM_WEBHOOK_URL
+
+══════════════════════════════════════════════════
+  9. ЕСЛИ ПОИСК СТАЛ МЕДЛЕННЫМ
+══════════════════════════════════════════════════
+
+Чаще всего причина не в Vercel, а в самом шаблоне:
+  • слишком много запросов
+  • слишком много страниц на запрос
+  • HH временно режет часть запросов 403
+
+Для ускорения:
+  • уменьшайте число страниц
+  • разбивайте огромный шаблон на несколько шаблонов
+  • не делайте слишком широкий поиск одним прогоном
+
+══════════════════════════════════════════════════
+  10. ПОВТОРНЫЙ PROD-ДЕПЛОЙ
+══════════════════════════════════════════════════
+
+Обычный цикл обновления:
+
+  1. меняете код
+  2. деплой из корня проекта:
+     npx vercel deploy --prod --yes
+
+     или отдельная команда из `~`:
+     cd /Users/tahir/Desktop/data_analyst_work && npx vercel deploy --prod --yes
+
+  3. проверяете:
+     /status
+     /api/web-state
+     /webhook-info
+  4. тестируете в Telegram и в web-панели
+
+══════════════════════════════════════════════════

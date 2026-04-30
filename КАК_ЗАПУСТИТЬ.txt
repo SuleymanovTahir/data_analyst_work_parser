@@ -53,7 +53,7 @@
   cd /Users/tahir/Desktop/data_analyst_work
   npx vercel deploy --prod --yes
 
-То же самое одной строкой:
+Отдельная команда, если терминал открыт в домашней папке `~`:
   cd /Users/tahir/Desktop/data_analyst_work && npx vercel deploy --prod --yes
 
 Если запустить `npx vercel deploy --prod --yes` из `~`, Vercel будет пытаться деплоить домашнюю папку и может упасть на служебных файлах вроде `/Users/tahir/.viminfo`.
