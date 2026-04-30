@@ -9490,6 +9490,96 @@ def _web_ui_html():
       padding: 18px 20px;
       background: #f9fafc;
     }
+    .editor-tabs {
+      flex-wrap: wrap;
+      align-items: stretch;
+      overflow: visible;
+      padding-bottom: 0;
+    }
+    .editor-tab {
+      flex: 1 1 132px;
+      white-space: normal;
+      line-height: 1.2;
+      text-align: center;
+    }
+    .template-list,
+    .chip-list,
+    .summary-box,
+    .suggestions,
+    .content-column {
+      scrollbar-gutter: stable;
+    }
+    .template-list,
+    .chip-list,
+    .summary-box,
+    .suggestions {
+      padding-right: 8px;
+      padding-bottom: 6px;
+    }
+    .template-list::-webkit-scrollbar,
+    .chip-list::-webkit-scrollbar,
+    .summary-box::-webkit-scrollbar,
+    .suggestions::-webkit-scrollbar,
+    .editor-tabs::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+    .template-list::-webkit-scrollbar-track,
+    .chip-list::-webkit-scrollbar-track,
+    .summary-box::-webkit-scrollbar-track,
+    .suggestions::-webkit-scrollbar-track,
+    .editor-tabs::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    .template-list::-webkit-scrollbar-thumb,
+    .chip-list::-webkit-scrollbar-thumb,
+    .summary-box::-webkit-scrollbar-thumb,
+    .suggestions::-webkit-scrollbar-thumb,
+    .editor-tabs::-webkit-scrollbar-thumb {
+      background: #c8d0dc;
+      border-radius: 999px;
+    }
+    .chip > span {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+    .quick-actions {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      align-items: stretch;
+    }
+    .quick-actions button {
+      width: 100%;
+      min-height: 40px;
+    }
+    .results-toolbar {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: start;
+    }
+    .result-controls {
+      display: grid;
+      grid-template-columns: auto auto auto;
+      align-items: end;
+      justify-content: end;
+      gap: 10px;
+    }
+    .result-controls .field {
+      display: grid;
+      gap: 6px;
+      align-items: start;
+      min-width: 124px;
+    }
+    .result-controls .actions {
+      flex-wrap: nowrap;
+    }
+    .result-controls .actions button {
+      min-width: 76px;
+    }
+    #resultsPage {
+      justify-content: center;
+      min-height: 38px;
+    }
     @media (max-width: 1180px) {
       .page {
         max-width: none;
@@ -9498,18 +9588,89 @@ def _web_ui_html():
         grid-template-columns: 300px minmax(0, 1fr);
       }
       .editor-tabs {
-        overflow-x: auto;
+        overflow: visible;
       }
     }
     @media (max-width: 820px) {
+      .source-picker {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+        margin-bottom: 12px;
+      }
+      .source-card {
+        min-height: 58px;
+        padding: 11px 12px;
+      }
+      .source-note {
+        display: none;
+      }
+      .source-title {
+        font-size: 15px;
+      }
+      .editor-tabs {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+      }
+      .editor-tab {
+        width: 100%;
+        min-height: 40px;
+        border-radius: 10px;
+        padding: 9px 10px;
+      }
       .workspace {
         grid-template-columns: 1fr;
       }
       .sidebar-column {
         position: static;
+        order: 1;
+      }
+      .content-column {
+        order: 2;
       }
       .status-grid {
         grid-template-columns: 1fr;
+      }
+      .quick-actions {
+        grid-template-columns: 1fr;
+      }
+      .results-toolbar {
+        grid-template-columns: 1fr;
+        gap: 12px;
+      }
+      .result-controls {
+        width: 100%;
+        grid-template-columns: 1fr;
+        justify-content: stretch;
+        gap: 10px;
+      }
+      .result-controls .field {
+        grid-template-columns: 1fr minmax(96px, 120px);
+        align-items: center;
+        min-width: 0;
+      }
+      .result-controls select {
+        width: 100%;
+        min-width: 0;
+      }
+      .result-controls .actions {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        width: 100%;
+      }
+      .result-controls .actions button {
+        min-width: 0;
+        min-height: 42px;
+      }
+      #resultsPage {
+        min-height: 0;
+      }
+      .result-pagination {
+        display: grid;
+        justify-content: stretch;
+      }
+      .page-buttons {
+        justify-content: center;
       }
       .result-top {
         grid-template-columns: 1fr;
@@ -11065,6 +11226,37 @@ def _hh_token_status_html(data):
     a.primary {{
       color: #ffffff;
       background: #2f68f6;
+    }}
+    @media (max-width: 620px) {{
+      body {{
+        place-items: start;
+        padding: 16px;
+      }}
+      main {{
+        width: 100%;
+        padding: 22px;
+        border-radius: 14px;
+      }}
+      h1 {{
+        font-size: 24px;
+      }}
+      dl {{
+        grid-template-columns: 1fr;
+        gap: 6px;
+        padding: 16px;
+      }}
+      dt {{
+        margin-top: 8px;
+      }}
+      dt:first-child {{
+        margin-top: 0;
+      }}
+      .actions {{
+        display: grid;
+      }}
+      a {{
+        width: 100%;
+      }}
     }}
   </style>
 </head>
